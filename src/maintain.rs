@@ -8,11 +8,10 @@
 //! The [`start_maintenance`] function spawns a tokio task that runs two
 //! interval-driven loops concurrently:
 //!
-//! 1. **Renewal loop** -- periodically checks all managed certificates in the
-//!    cache and invokes a caller-supplied renewal callback for any that are
-//!    due for renewal.
-//! 2. **OCSP loop** -- periodically refreshes OCSP staples for all cached
-//!    certificates whose staples are stale or missing.
+//! 1. **Renewal loop** -- periodically checks all managed certificates in the cache and invokes a
+//!    caller-supplied renewal callback for any that are due for renewal.
+//! 2. **OCSP loop** -- periodically refreshes OCSP staples for all cached certificates whose
+//!    staples are stale or missing.
 //!
 //! Both loops respect the [`CertCache`] stop signal: when the cache is
 //! stopped (via [`CertCache::stop`]), the maintenance task exits gracefully.
@@ -96,8 +95,7 @@ impl std::fmt::Debug for MaintenanceConfig {
 ///
 /// Given a domain name, the function should attempt to renew the certificate
 /// for that domain. It returns `Ok(())` on success or an error on failure.
-pub type RenewFn =
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
+pub type RenewFn = dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
 
 // ---------------------------------------------------------------------------
 // start_maintenance
@@ -125,7 +123,8 @@ pub fn start_maintenance(
     config: MaintenanceConfig,
     renew_func: Arc<RenewFn>,
 ) -> JoinHandle<()> {
-    let renew_interval = normalize_interval(config.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
+    let renew_interval =
+        normalize_interval(config.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
     let ocsp_interval = normalize_interval(config.ocsp_check_interval, DEFAULT_OCSP_CHECK_INTERVAL);
 
     info!(
@@ -135,14 +134,8 @@ pub fn start_maintenance(
     );
 
     tokio::spawn(async move {
-        maintenance_loop_with_recovery(
-            cache,
-            config,
-            renew_func,
-            renew_interval,
-            ocsp_interval,
-        )
-        .await;
+        maintenance_loop_with_recovery(cache, config, renew_func, renew_interval, ocsp_interval)
+            .await;
     })
 }
 
@@ -193,10 +186,7 @@ async fn maintenance_loop_with_recovery(
                     }
                     // Continue the loop to restart maintenance_loop.
                 } else {
-                    error!(
-                        "maintenance: loop task cancelled: {}",
-                        join_error,
-                    );
+                    error!("maintenance: loop task cancelled: {}", join_error,);
                     break;
                 }
             }
@@ -483,7 +473,10 @@ async fn update_ocsp_staples(
                     // staple_ocsp returns Ok(false) when status is Revoked
                     // OR when stapling is not available. We detect revocation
                     // by checking if an OCSP response was actually set.
-                    if updated_cert.ocsp_response.is_some() && config.replace_revoked && cert.managed {
+                    if updated_cert.ocsp_response.is_some()
+                        && config.replace_revoked
+                        && cert.managed
+                    {
                         warn!(
                             name = %first_name,
                             hash = %old_hash,
@@ -599,7 +592,7 @@ impl Default for CleanStorageOptions {
     fn default() -> Self {
         Self {
             expired_cert_grace_period: Duration::from_secs(24 * 60 * 60), // 24 hours
-            ocsp_max_age: Duration::from_secs(14 * 24 * 60 * 60),        // 14 days
+            ocsp_max_age: Duration::from_secs(14 * 24 * 60 * 60),         // 14 days
         }
     }
 }
@@ -624,8 +617,8 @@ pub struct CleanStorageResult {
 /// For certificates:
 /// - Lists all certificate PEM files (`.crt`) under `certificates/`.
 /// - Parses each to check its `notAfter` date.
-/// - Deletes certificates (plus their `.key` and `.json` sidecars) whose
-///   `notAfter` plus `expired_cert_grace_period` is in the past.
+/// - Deletes certificates (plus their `.key` and `.json` sidecars) whose `notAfter` plus
+///   `expired_cert_grace_period` is in the past.
 ///
 /// For OCSP staples:
 /// - Lists all entries under `ocsp/`.
@@ -779,11 +772,13 @@ fn normalize_interval(interval: Duration, default: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::{Duration as ChronoDuration, Utc};
+
     use super::*;
     use crate::cache::CacheOptions;
     use crate::certificates::{Certificate, PrivateKeyKind};
-    use chrono::{Duration as ChronoDuration, Utc};
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Helper: build a minimal managed test certificate.
     fn make_managed_cert(names: &[&str], hash: &str, days_remaining: i64) -> Certificate {
@@ -846,7 +841,14 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(&cache, DEFAULT_RENEWAL_WINDOW_RATIO, renew_func.as_ref(), &DummyStorage, &job_queue).await;
+        check_renewals(
+            &cache,
+            DEFAULT_RENEWAL_WINDOW_RATIO,
+            renew_func.as_ref(),
+            &DummyStorage,
+            &job_queue,
+        )
+        .await;
         // Wait for any background jobs to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
@@ -872,7 +874,14 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(&cache, DEFAULT_RENEWAL_WINDOW_RATIO, renew_func.as_ref(), &DummyStorage, &job_queue).await;
+        check_renewals(
+            &cache,
+            DEFAULT_RENEWAL_WINDOW_RATIO,
+            renew_func.as_ref(),
+            &DummyStorage,
+            &job_queue,
+        )
+        .await;
         // Wait for any background jobs to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(call_count.load(Ordering::SeqCst), 0);
@@ -898,7 +907,14 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(&cache, DEFAULT_RENEWAL_WINDOW_RATIO, renew_func.as_ref(), &DummyStorage, &job_queue).await;
+        check_renewals(
+            &cache,
+            DEFAULT_RENEWAL_WINDOW_RATIO,
+            renew_func.as_ref(),
+            &DummyStorage,
+            &job_queue,
+        )
+        .await;
         // Wait for any background jobs to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -923,7 +939,14 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(&cache, DEFAULT_RENEWAL_WINDOW_RATIO, renew_func.as_ref(), &DummyStorage, &job_queue).await;
+        check_renewals(
+            &cache,
+            DEFAULT_RENEWAL_WINDOW_RATIO,
+            renew_func.as_ref(),
+            &DummyStorage,
+            &job_queue,
+        )
+        .await;
         // Wait for any background jobs to complete.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -935,9 +958,7 @@ mod tests {
 
         let cache = CertCache::new(CacheOptions::default());
         let temp_dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn Storage> = Arc::new(
-            FileStorage::new(temp_dir.path().to_path_buf()),
-        );
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(temp_dir.path().to_path_buf()));
 
         let config = MaintenanceConfig {
             renew_check_interval: Duration::from_millis(50),
@@ -946,9 +967,7 @@ mod tests {
             storage,
         };
 
-        let renew_func: Arc<RenewFn> = Arc::new(|_domain: String| {
-            Box::pin(async { Ok(()) })
-        });
+        let renew_func: Arc<RenewFn> = Arc::new(|_domain: String| Box::pin(async { Ok(()) }));
 
         let handle = start_maintenance(Arc::clone(&cache), config, renew_func);
 

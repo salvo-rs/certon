@@ -31,7 +31,7 @@ use rcgen::{
 };
 use ring::rand::SystemRandom;
 use ring::signature::{
-    EcdsaKeyPair, Ed25519KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING,
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, Ed25519KeyPair,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use serde::{Deserialize, Serialize};
@@ -151,9 +151,7 @@ impl PrivateKey {
                 // Use from_pkcs8_pem or from_pkcs8_der which auto-detects the algo.
                 RcgenKeyPair::try_from(&pkcs8)
             }
-            KeyType::Ed25519 => {
-                RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519)
-            }
+            KeyType::Ed25519 => RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519),
             KeyType::Rsa2048 | KeyType::Rsa4096 | KeyType::Rsa8192 => {
                 RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_RSA_SHA256)
             }
@@ -170,15 +168,16 @@ mod base64_serde {
     use base64::prelude::*;
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, ser: S) -> std::result::Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(
+        bytes: &Vec<u8>,
+        ser: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         ser.serialize_str(&BASE64_STANDARD.encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> std::result::Result<Vec<u8>, D::Error> {
         let s = String::deserialize(de)?;
-        BASE64_STANDARD
-            .decode(&s)
-            .map_err(serde::de::Error::custom)
+        BASE64_STANDARD.decode(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -230,8 +229,8 @@ pub fn generate_private_key(key_type: KeyType) -> Result<PrivateKey> {
 /// `ring` does not expose RSA key generation, so we delegate to the
 /// `rsa` crate and then serialise via `pkcs8`.
 fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
-    use rsa::pkcs8::EncodePrivateKey;
     use rsa::RsaPrivateKey;
+    use rsa::pkcs8::EncodePrivateKey;
 
     let mut rng = rsa::rand_core::OsRng;
     let key = RsaPrivateKey::new(&mut rng, bits)
@@ -356,8 +355,7 @@ fn extract_rsa_private_key_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
 ///
 /// The function recognises the following PEM tags:
 ///
-/// - `EC PRIVATE KEY` -- interpreted as SEC 1 ECDSA (P-256 or P-384, detected
-///   from the curve OID).
+/// - `EC PRIVATE KEY` -- interpreted as SEC 1 ECDSA (P-256 or P-384, detected from the curve OID).
 /// - `RSA PRIVATE KEY` -- PKCS#1 RSA key (size detected from modulus length).
 /// - `PRIVATE KEY` -- PKCS#8 (algorithm auto-detected).
 /// - Any tag ending with `PRIVATE KEY` is also accepted.
@@ -452,9 +450,7 @@ fn wrap_ec_sec1_in_pkcs8(sec1_der: &[u8], key_type: KeyType) -> Result<Vec<u8>> 
         KeyType::EcdsaP384 => OID_P384,
         KeyType::EcdsaP521 => OID_P521,
         _ => {
-            return Err(
-                CryptoError::PemDecode("cannot wrap non-EC key as EC PKCS#8".into()).into(),
-            )
+            return Err(CryptoError::PemDecode("cannot wrap non-EC key as EC PKCS#8".into()).into());
         }
     };
 
@@ -530,10 +526,10 @@ fn validate_ec_key(pkcs8_der: &[u8], key_type: KeyType) -> Result<()> {
 
 /// Decode a PKCS#1 RSA private key and convert to PKCS#8 for internal storage.
 fn decode_rsa_private_key(pkcs1_der: &[u8]) -> Result<PrivateKey> {
+    use rsa::RsaPrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::EncodePrivateKey;
     use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
 
     let rsa_key = RsaPrivateKey::from_pkcs1_der(pkcs1_der)
         .map_err(|e| CryptoError::PemDecode(format!("invalid PKCS#1 RSA key: {e}")))?;
@@ -598,9 +594,9 @@ fn decode_pkcs8_private_key(pkcs8_der: &[u8]) -> Result<PrivateKey> {
 
     // Try RSA.
     {
+        use rsa::RsaPrivateKey;
         use rsa::pkcs8::DecodePrivateKey;
         use rsa::traits::PublicKeyParts;
-        use rsa::RsaPrivateKey;
 
         if let Ok(rsa_key) = RsaPrivateKey::from_pkcs8_der(pkcs8_der) {
             let bits = rsa_key.n().bits();
@@ -745,13 +741,11 @@ pub fn generate_csr(key: &PrivateKey, domains: &[String], must_staple: bool) -> 
         if let Ok(ip) = domain.parse::<IpAddr>() {
             params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
         } else if let Some(email) = domain.strip_prefix("mailto:") {
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::Rfc822Name(email.to_string().try_into().map_err(
-                    |e: rcgen::Error| {
-                        CryptoError::Signing(format!("invalid email SAN '{email}': {e}"))
-                    },
-                )?));
+            params.subject_alt_names.push(rcgen::SanType::Rfc822Name(
+                email.to_string().try_into().map_err(|e: rcgen::Error| {
+                    CryptoError::Signing(format!("invalid email SAN '{email}': {e}"))
+                })?,
+            ));
         } else if domain.starts_with("http:") || domain.starts_with("https:") {
             params
                 .subject_alt_names
@@ -761,13 +755,11 @@ pub fn generate_csr(key: &PrivateKey, domains: &[String], must_staple: bool) -> 
                     },
                 )?));
         } else {
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::DnsName(domain.clone().try_into().map_err(
-                    |e: rcgen::Error| {
-                        CryptoError::Signing(format!("invalid DNS name '{domain}': {e}"))
-                    },
-                )?));
+            params.subject_alt_names.push(rcgen::SanType::DnsName(
+                domain.clone().try_into().map_err(|e: rcgen::Error| {
+                    CryptoError::Signing(format!("invalid DNS name '{domain}': {e}"))
+                })?,
+            ));
         }
     }
 
@@ -984,9 +976,8 @@ mod tests {
 
     #[test]
     fn test_parse_certs_empty_bundle() {
-        let result = parse_certs_from_pem_bundle(
-            "-----BEGIN SOMETHING-----\n-----END SOMETHING-----\n",
-        );
+        let result =
+            parse_certs_from_pem_bundle("-----BEGIN SOMETHING-----\n-----END SOMETHING-----\n");
         assert!(result.is_err());
     }
 }

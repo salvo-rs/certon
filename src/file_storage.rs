@@ -2,16 +2,13 @@
 //!
 //! This module implements [`Storage`] using the local file system.  Highlights:
 //!
-//! * **Atomic writes** — data is first written to a temporary file in the same
-//!   directory, then renamed into place so that readers never see a partial
-//!   write.
-//! * **Distributed locking** — lock files containing a JSON timestamp are
-//!   created atomically.  A background keepalive task periodically updates the
-//!   timestamp; stale locks whose timestamp exceeds twice the freshness
-//!   interval are automatically removed.
-//! * **Platform-aware defaults** — the default storage path follows OS
-//!   conventions (`~/.local/share/certon` on Linux,
-//!   `~/Library/Application Support/certon` on macOS,
+//! * **Atomic writes** — data is first written to a temporary file in the same directory, then
+//!   renamed into place so that readers never see a partial write.
+//! * **Distributed locking** — lock files containing a JSON timestamp are created atomically.  A
+//!   background keepalive task periodically updates the timestamp; stale locks whose timestamp
+//!   exceeds twice the freshness interval are automatically removed.
+//! * **Platform-aware defaults** — the default storage path follows OS conventions
+//!   (`~/.local/share/certon` on Linux, `~/Library/Application Support/certon` on macOS,
 //!   `%APPDATA%/certon` on Windows).
 
 use std::collections::HashMap;
@@ -26,7 +23,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::error::{Error, Result, StorageError};
-use crate::storage::{safe_key, track_lock, untrack_lock, KeyInfo, Storage};
+use crate::storage::{KeyInfo, Storage, safe_key, track_lock, untrack_lock};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -154,9 +151,7 @@ impl FileStorage {
         // Build a temp file name in the same directory.
         let temp_name = format!(
             "{}.tmp.{}",
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
+            path.file_name().unwrap_or_default().to_string_lossy(),
             rand::random::<u64>(),
         );
         let temp_path = path.with_file_name(temp_name);
@@ -248,9 +243,8 @@ impl FileStorage {
                 if bytes.is_empty() {
                     return Ok(None);
                 }
-                let meta: LockMeta = serde_json::from_slice(&bytes).map_err(|e| {
-                    std::io::Error::new(ErrorKind::InvalidData, e)
-                })?;
+                let meta: LockMeta = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
                 Ok(Some(meta))
             }
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
@@ -263,8 +257,9 @@ impl FileStorage {
         let ref_time = meta.updated;
         let elapsed = chrono::Utc::now().signed_duration_since(ref_time);
         // Grace period: twice the freshness interval.
-        elapsed > chrono::Duration::from_std(LOCK_FRESHNESS_INTERVAL * 2)
-            .unwrap_or(chrono::Duration::MAX)
+        elapsed
+            > chrono::Duration::from_std(LOCK_FRESHNESS_INTERVAL * 2)
+                .unwrap_or(chrono::Duration::MAX)
     }
 
     /// Update the `updated` timestamp in the lock file.
@@ -272,7 +267,11 @@ impl FileStorage {
         let path = filename.to_path_buf();
         tokio::task::spawn_blocking(move || {
             // Open for read + write.
-            let file = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
+            let file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
                 Ok(f) => f,
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true), // lock released
                 Err(e) => return Err(e),
@@ -307,8 +306,8 @@ impl FileStorage {
             loop {
                 tokio::time::sleep(LOCK_FRESHNESS_INTERVAL).await;
                 match Self::update_lock_freshness(&filename).await {
-                    Ok(true) => return,  // lock was released
-                    Ok(false) => {}      // keep refreshing
+                    Ok(true) => return, // lock was released
+                    Ok(false) => {}     // keep refreshing
                     Err(e) => {
                         error!(
                             lockfile = %filename.display(),
@@ -343,10 +342,7 @@ impl FileStorage {
                     // Lock file already exists — fall through to staleness check.
                 }
                 Err(e) => {
-                    return Err(StorageError::LockFailed(format!(
-                        "creating lock file: {e}"
-                    ))
-                    .into());
+                    return Err(StorageError::LockFailed(format!("creating lock file: {e}")).into());
                 }
             }
 
@@ -394,10 +390,9 @@ impl FileStorage {
                     continue;
                 }
                 Err(e) => {
-                    return Err(StorageError::LockFailed(format!(
-                        "accessing lock file: {e}"
-                    ))
-                    .into());
+                    return Err(
+                        StorageError::LockFailed(format!("accessing lock file: {e}")).into(),
+                    );
                 }
             }
         }
@@ -431,10 +426,7 @@ impl FileStorage {
                     // Lock file already exists -- fall through to staleness check.
                 }
                 Err(e) => {
-                    return Err(StorageError::LockFailed(format!(
-                        "creating lock file: {e}"
-                    ))
-                    .into());
+                    return Err(StorageError::LockFailed(format!("creating lock file: {e}")).into());
                 }
             }
 
@@ -477,10 +469,9 @@ impl FileStorage {
                     continue;
                 }
                 Err(e) => {
-                    return Err(StorageError::LockFailed(format!(
-                        "accessing lock file: {e}"
-                    ))
-                    .into());
+                    return Err(
+                        StorageError::LockFailed(format!("accessing lock file: {e}")).into(),
+                    );
                 }
             }
         }
@@ -601,9 +592,7 @@ impl Storage for FileStorage {
 
                 // Build the storage key by taking the suffix relative to
                 // walk_prefix and joining it to the original prefix.
-                let suffix = entry_path
-                    .strip_prefix(&walk_prefix)
-                    .unwrap_or(&entry_path);
+                let suffix = entry_path.strip_prefix(&walk_prefix).unwrap_or(&entry_path);
                 // Normalise to forward slashes.
                 let suffix_str = suffix
                     .components()
@@ -640,10 +629,7 @@ impl Storage for FileStorage {
             }
         })?;
 
-        let modified: DateTime<Utc> = metadata
-            .modified()
-            .unwrap_or(SystemTime::UNIX_EPOCH)
-            .into();
+        let modified: DateTime<Utc> = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
 
         Ok(KeyInfo {
             key: key.to_string(),
@@ -689,12 +675,10 @@ impl Storage for FileStorage {
         // if the calling task is cancelled (e.g. via tokio::select! or
         // task abort).
         let filename = self.lock_filename(name);
-        let result = tokio::task::spawn_blocking(move || {
-            match std::fs::remove_file(&filename) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Error::from(StorageError::Io(e))),
-            }
+        let result = tokio::task::spawn_blocking(move || match std::fs::remove_file(&filename) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::from(StorageError::Io(e))),
         })
         .await
         .map_err(|e| Error::Other(format!("unlock spawn_blocking failed: {e}")))?;
@@ -760,9 +744,7 @@ fn home_dir() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if let (Ok(drive), Ok(path)) =
-            (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH"))
-        {
+        if let (Ok(drive), Ok(path)) = (std::env::var("HOMEDRIVE"), std::env::var("HOMEPATH")) {
             return Some(PathBuf::from(format!("{drive}{path}")));
         }
         std::env::var("USERPROFILE").ok().map(PathBuf::from)

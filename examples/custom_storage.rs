@@ -15,10 +15,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use certon::{CertResolver, Config, KeyInfo, Result, Storage};
 use chrono::Utc;
 use tokio::sync::RwLock;
-
-use certon::{CertResolver, Config, KeyInfo, Result, Storage};
 
 // ---------------------------------------------------------------------------
 // In-memory Storage implementation
@@ -52,13 +51,11 @@ impl Storage for MemoryStorage {
 
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
         let data = self.data.read().await;
-        data.get(key)
-            .cloned()
-            .ok_or_else(|| {
-                certon::Error::Storage(certon::error::StorageError::NotFound(
-                    format!("key not found: {key}"),
-                ))
-            })
+        data.get(key).cloned().ok_or_else(|| {
+            certon::Error::Storage(certon::error::StorageError::NotFound(format!(
+                "key not found: {key}"
+            )))
+        })
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -155,9 +152,7 @@ async fn main() -> Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
     // -- Build the Config with our custom storage ------------------------------
-    let config = Config::builder()
-        .storage(storage)
-        .build();
+    let config = Config::builder().storage(storage).build();
 
     // -- Manage certificates ---------------------------------------------------
     let domains = vec!["example.com".into()];

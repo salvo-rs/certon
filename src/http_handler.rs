@@ -10,7 +10,6 @@
 //! to fall through to its normal request handling logic.
 //!
 //! Also includes a helper for constructing HTTPS redirect URLs.
-//!
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,11 +112,10 @@ impl HttpChallengeHandler {
     /// the challenge domain.
     ///
     /// - Only responds to GET requests; returns `None` for other methods.
-    /// - Validates the Host header against the challenge domain (DNS rebinding
-    ///   protection). If the host does not match any pending challenge domain,
-    ///   `None` is returned.
-    /// - Returns `Some((status_code, body))` for challenge paths, or `None`
-    ///   for non-challenge paths.
+    /// - Validates the Host header against the challenge domain (DNS rebinding protection). If the
+    ///   host does not match any pending challenge domain, `None` is returned.
+    /// - Returns `Some((status_code, body))` for challenge paths, or `None` for non-challenge
+    ///   paths.
     ///
     /// # Arguments
     ///
@@ -341,10 +339,7 @@ impl std::fmt::Debug for HttpChallengeHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpChallengeHandler")
             .field("has_storage", &self.storage.is_some())
-            .field(
-                "storage_key_issuer_prefix",
-                &self.storage_key_issuer_prefix,
-            )
+            .field("storage_key_issuer_prefix", &self.storage_key_issuer_prefix)
             .finish()
     }
 }
@@ -376,10 +371,7 @@ pub fn is_challenge_request(path: &str) -> bool {
 ///     extract_challenge_token("/.well-known/acme-challenge/abc123"),
 ///     Some("abc123"),
 /// );
-/// assert_eq!(
-///     extract_challenge_token("/other/path"),
-///     None,
-/// );
+/// assert_eq!(extract_challenge_token("/other/path"), None,);
 /// ```
 pub fn extract_challenge_token(path: &str) -> Option<&str> {
     let token = path.strip_prefix(ACME_CHALLENGE_PATH_PREFIX)?;

@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use certon::{
-    AcmeIssuer, CertResolver, Config, FileStorage, KeyType, OcspConfig, Result, Storage,
-    LETS_ENCRYPT_STAGING,
+    AcmeIssuer, CertResolver, Config, FileStorage, KeyType, LETS_ENCRYPT_STAGING, OcspConfig,
+    Result, Storage,
 };
 
 #[tokio::main]

@@ -23,18 +23,18 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::acme_issuer::CertIssuer;
-use crate::async_jobs::{do_with_retry, JobQueue, RetryConfig};
+use crate::async_jobs::{JobQueue, RetryConfig, do_with_retry};
 use crate::cache::CertCache;
-use crate::certificates::{subject_qualifies_for_cert, Certificate};
+use crate::certificates::{Certificate, subject_qualifies_for_cert};
 use crate::crypto::{
-    decode_private_key_pem, encode_private_key_pem, generate_csr, generate_private_key, KeyType,
+    KeyType, decode_private_key_pem, encode_private_key_pem, generate_csr, generate_private_key,
 };
 use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
-use crate::ocsp::{staple_ocsp, OcspConfig, OcspStatus};
+use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::storage::{
-    load_certificate, site_cert_key, site_meta_key, site_private_key, store_certificate,
-    CertificateResource, Storage,
+    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
+    store_certificate,
 };
 
 // ---------------------------------------------------------------------------
@@ -234,8 +234,14 @@ impl std::fmt::Debug for Config {
             .field("issuers_count", &self.issuers.len())
             .field("on_demand", &self.on_demand.as_ref().map(|_| "..."))
             .field("on_event", &self.on_event.as_ref().map(|_| "..."))
-            .field("subject_transformer", &self.subject_transformer.as_ref().map(|_| "..."))
-            .field("cert_selection", &self.cert_selection.as_ref().map(|_| "..."))
+            .field(
+                "subject_transformer",
+                &self.subject_transformer.as_ref().map(|_| "..."),
+            )
+            .field(
+                "cert_selection",
+                &self.cert_selection.as_ref().map(|_| "..."),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -528,10 +534,7 @@ impl Config {
 
     /// Load a certificate resource from storage, trying all configured
     /// issuers in order. Returns the first successfully loaded resource.
-    async fn load_cert_resource_any_issuer(
-        &self,
-        domain: &str,
-    ) -> Result<CertificateResource> {
+    async fn load_cert_resource_any_issuer(&self, domain: &str) -> Result<CertificateResource> {
         let mut last_err = None;
 
         for issuer in &self.issuers {
@@ -579,13 +582,11 @@ impl Config {
     /// certificates, and the private key PEM is decoded into raw key bytes.
     /// If OCSP stapling is not disabled, the function fetches and attaches
     /// an OCSP response (using the storage cache when possible).
-    ///
     pub async fn make_certificate_with_ocsp(
         &self,
         cert_res: &CertificateResource,
     ) -> Result<Certificate> {
-        let mut cert =
-            Certificate::from_pem(&cert_res.certificate_pem, &cert_res.private_key_pem)?;
+        let mut cert = Certificate::from_pem(&cert_res.certificate_pem, &cert_res.private_key_pem)?;
 
         // Apply OCSP stapling unless disabled.
         if !self.ocsp.disable_stapling {
@@ -623,10 +624,8 @@ impl Config {
     ///
     /// 1. Check if already managed in cache -- skip if so.
     /// 2. Try loading from storage -- add to cache if found.
-    /// 3. If not found in storage -- obtain a new certificate from the
-    ///    configured issuers.
-    /// 4. If loaded from storage, check if renewal is needed and renew
-    ///    if so.
+    /// 3. If not found in storage -- obtain a new certificate from the configured issuers.
+    /// 4. If loaded from storage, check if renewal is needed and renew if so.
     ///
     /// "Synchronously" means that certificate operations are performed in
     /// the foreground without background retries. Use [`Config::manage_async`]
@@ -682,37 +681,39 @@ impl Config {
             let cert_selection = self.cert_selection.clone();
             let domain_owned = domain.clone();
 
-            self.job_queue.submit(job_name, move || async move {
-                // Reconstruct a minimal Config for background work.
-                let cfg = Config {
-                    renewal_window_ratio: renewal_ratio,
-                    on_demand,
-                    issuers,
-                    storage,
-                    key_type,
-                    ocsp,
-                    cache,
-                    on_event,
-                    interactive,
-                    must_staple,
-                    reuse_private_keys,
-                    subject_transformer,
-                    default_server_name,
-                    fallback_server_name,
-                    disable_storage_check,
-                    issuer_policy,
-                    disable_ari,
-                    cert_selection,
-                    job_queue: Arc::new(JobQueue::new("bg_manage")),
-                };
-                if let Err(e) = cfg.manage_one(&domain_owned, true).await {
-                    error!(
-                        domain = %domain_owned,
-                        error = %e,
-                        "background certificate management failed"
-                    );
-                }
-            }).await;
+            self.job_queue
+                .submit(job_name, move || async move {
+                    // Reconstruct a minimal Config for background work.
+                    let cfg = Config {
+                        renewal_window_ratio: renewal_ratio,
+                        on_demand,
+                        issuers,
+                        storage,
+                        key_type,
+                        ocsp,
+                        cache,
+                        on_event,
+                        interactive,
+                        must_staple,
+                        reuse_private_keys,
+                        subject_transformer,
+                        default_server_name,
+                        fallback_server_name,
+                        disable_storage_check,
+                        issuer_policy,
+                        disable_ari,
+                        cert_selection,
+                        job_queue: Arc::new(JobQueue::new("bg_manage")),
+                    };
+                    if let Err(e) = cfg.manage_one(&domain_owned, true).await {
+                        error!(
+                            domain = %domain_owned,
+                            error = %e,
+                            "background certificate management failed"
+                        );
+                    }
+                })
+                .await;
         }
         Ok(())
     }
@@ -769,9 +770,7 @@ impl Config {
                 // Check if it is a "not found" error.
                 let is_not_found = matches!(&e, Error::Storage(StorageError::NotFound(_)));
                 if !is_not_found {
-                    return Err(Error::Other(format!(
-                        "{domain}: caching certificate: {e}"
-                    )));
+                    return Err(Error::Other(format!("{domain}: caching certificate: {e}")));
                 }
 
                 // Not in storage -- obtain a new certificate.
@@ -786,7 +785,6 @@ impl Config {
 
     /// Load a managed certificate from storage and add it to the in-memory
     /// cache.
-    ///
     pub async fn cache_managed_certificate(&self, domain: &str) -> Result<Certificate> {
         let cert = self.load_managed_certificate(domain).await?;
         self.cache.add(cert.clone()).await;
@@ -812,10 +810,7 @@ impl Config {
     /// Tries all configured issuers in order and returns the first
     /// successfully loaded certificate. Returns `Some(Certificate)` if
     /// found, `None` if not in storage for any issuer.
-    pub async fn load_cert_from_storage(
-        &self,
-        domain: &str,
-    ) -> Result<Option<Certificate>> {
+    pub async fn load_cert_from_storage(&self, domain: &str) -> Result<Option<Certificate>> {
         match self.load_managed_certificate(domain).await {
             Ok(cert) => Ok(Some(cert)),
             Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
@@ -1024,11 +1019,8 @@ impl Config {
             }),
         );
 
-        Err(last_err.unwrap_or_else(|| {
-            Error::Config(format!(
-                "[{domain}] obtain: all issuers failed"
-            ))
-        }))
+        Err(last_err
+            .unwrap_or_else(|| Error::Config(format!("[{domain}] obtain: all issuers failed"))))
     }
 
     /// Try to load an existing private key from storage for reuse, or
@@ -1248,11 +1240,8 @@ impl Config {
             }),
         );
 
-        Err(last_err.unwrap_or_else(|| {
-            Error::Config(format!(
-                "[{domain}] renew: all issuers failed"
-            ))
-        }))
+        Err(last_err
+            .unwrap_or_else(|| Error::Config(format!("[{domain}] renew: all issuers failed"))))
     }
 }
 
@@ -1272,11 +1261,10 @@ impl Config {
             let ik = issuer.issuer_key();
 
             // Try to load the certificate resource for this issuer.
-            let cert_res =
-                match load_certificate(self.storage.as_ref(), &ik, domain).await {
-                    Ok(res) => res,
-                    Err(_) => continue,
-                };
+            let cert_res = match load_certificate(self.storage.as_ref(), &ik, domain).await {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
 
             // We need to check if the private key exists.
             let pk_key = site_private_key(&ik, domain);
@@ -1444,9 +1432,7 @@ impl Config {
         let cert_chain = cert.cert_chain.clone();
 
         let pk_bytes = cert.private_key_der.as_ref().ok_or_else(|| {
-            Error::Config(format!(
-                "certificate for '{domain}' has no private key"
-            ))
+            Error::Config(format!("certificate for '{domain}' has no private key"))
         })?;
 
         if pk_bytes.is_empty() {
@@ -1455,12 +1441,19 @@ impl Config {
             )));
         }
 
+        use rustls::pki_types::{
+            PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+        };
+
         use crate::certificates::PrivateKeyKind;
-        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
 
         let pk_der = match cert.private_key_kind {
-            PrivateKeyKind::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pk_bytes.clone())),
-            PrivateKeyKind::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(pk_bytes.clone())),
+            PrivateKeyKind::Pkcs8 => {
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pk_bytes.clone()))
+            }
+            PrivateKeyKind::Pkcs1 => {
+                PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(pk_bytes.clone()))
+            }
             PrivateKeyKind::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(pk_bytes.clone())),
             PrivateKeyKind::None => {
                 return Err(Error::Config(format!(
@@ -1482,10 +1475,7 @@ impl Config {
     ///
     /// Returns an error if no suitable certificate is found or if TLS
     /// configuration fails.
-    pub async fn client_tls_config(
-        &self,
-        domain: &str,
-    ) -> Result<rustls::ClientConfig> {
+    pub async fn client_tls_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
         let (cert_chain, pk_der) = self.client_credentials(domain).await?;
 
         let config = rustls::ClientConfig::builder()
@@ -1503,12 +1493,14 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use chrono::Utc;
+    use tokio::sync::RwLock;
+
     use super::*;
     use crate::cache::CacheOptions;
     use crate::storage::KeyInfo;
-    use chrono::Utc;
-    use std::collections::HashMap;
-    use tokio::sync::RwLock;
 
     // -----------------------------------------------------------------------
     // Minimal in-memory storage for tests
@@ -1744,9 +1736,7 @@ mod tests {
 
         // With no issuers and nothing in storage, manage_sync should fail
         // because it tries to obtain a cert but has no issuers.
-        let result = config
-            .manage_sync(&["example.com".to_string()])
-            .await;
+        let result = config.manage_sync(&["example.com".to_string()]).await;
         assert!(result.is_err());
     }
 
@@ -1774,10 +1764,7 @@ mod tests {
             .await
             .unwrap();
         storage
-            .store(
-                "certificates/test/example.com/example.com.json",
-                b"meta",
-            )
+            .store("certificates/test/example.com/example.com.json", b"meta")
             .await
             .unwrap();
 

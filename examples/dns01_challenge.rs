@@ -17,12 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
-
 use certon::{
-    AcmeIssuer, CertResolver, Config, Dns01Solver, DnsProvider, FileStorage, KeyType, Result,
-    Storage, LETS_ENCRYPT_STAGING,
+    AcmeIssuer, CertResolver, Config, Dns01Solver, DnsProvider, FileStorage, KeyType,
+    LETS_ENCRYPT_STAGING, Result, Storage,
 };
+use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Custom DNS provider implementation
@@ -124,7 +123,10 @@ async fn main() -> Result<()> {
     // -- Obtain wildcard certificate -------------------------------------------
     // DNS-01 is the only challenge type that supports wildcard domains.
     let domains = vec!["*.example.com".into(), "example.com".into()];
-    println!("Obtaining wildcard certificate for {:?} via DNS-01...", domains);
+    println!(
+        "Obtaining wildcard certificate for {:?} via DNS-01...",
+        domains
+    );
     config.manage_sync(&domains).await?;
     println!("Certificate obtained successfully!");
 

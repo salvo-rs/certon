@@ -5,9 +5,8 @@
 //! handshakes. It supports:
 //!
 //! - Fast SNI-based lookup from the certificate cache.
-//! - On-demand TLS: when a matching certificate is not cached, the resolver
-//!   can trigger background certificate acquisition so that subsequent
-//!   handshakes succeed.
+//! - On-demand TLS: when a matching certificate is not cached, the resolver can trigger background
+//!   certificate acquisition so that subsequent handshakes succeed.
 //! - Fallback to a configurable default certificate when no match is found.
 //!
 //!
@@ -76,7 +75,9 @@ pub struct OnDemandConfig {
     /// This function is spawned in the background (via `tokio::spawn`) when
     /// a certificate is needed but not cached. The obtained certificate is
     /// expected to be placed into the [`CertCache`] by the callback.
-    pub obtain_func: Option<Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>>,
+    pub obtain_func: Option<
+        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>,
+    >,
 }
 
 impl fmt::Debug for OnDemandConfig {
@@ -96,8 +97,7 @@ impl OnDemandConfig {
     /// The check order is:
     /// 1. If `decision_func` is set, its result is authoritative.
     /// 2. If `host_allowlist` is set, the name must be present in the set.
-    /// 3. If neither is set, the name is **rejected** (fail-closed) to prevent
-    ///    unbounded issuance.
+    /// 3. If neither is set, the name is **rejected** (fail-closed) to prevent unbounded issuance.
     fn is_allowed(&self, name: &str) -> bool {
         let lower = name.to_lowercase();
 
@@ -176,7 +176,8 @@ pub struct CertResolver {
     /// Optional callback that triggers a background OCSP staple refresh
     /// for a given domain. This is spawned as a background task to avoid
     /// blocking the TLS handshake.
-    pub ocsp_refresh_func: Option<Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>>,
+    pub ocsp_refresh_func:
+        Option<Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>>,
 }
 
 impl fmt::Debug for CertResolver {
@@ -442,9 +443,7 @@ impl CertResolver {
         // that we can safely block on async operations. This requires a
         // multi-threaded runtime; on a current-thread runtime it will panic.
         // For production TLS servers a multi-threaded runtime is expected.
-        let result = tokio::task::block_in_place(|| {
-            handle.block_on(self.cache.get_by_name(name))
-        });
+        let result = tokio::task::block_in_place(|| handle.block_on(self.cache.get_by_name(name)));
 
         result
     }
@@ -542,9 +541,9 @@ impl CertResolver {
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // Check for TLS-ALPN-01 ACME challenge first.
-        let is_acme_tls_alpn = client_hello.alpn().map_or(false, |mut alpn| {
-            alpn.any(|proto| proto == b"acme-tls/1")
-        });
+        let is_acme_tls_alpn = client_hello
+            .alpn()
+            .map_or(false, |mut alpn| alpn.any(|proto| proto == b"acme-tls/1"));
 
         if is_acme_tls_alpn {
             if let Some(sni) = client_hello.server_name() {
@@ -603,16 +602,14 @@ pub fn cert_to_certified_key(cert: &Certificate) -> Result<Arc<CertifiedKey>> {
     let key_der = reconstruct_private_key_der(cert)?;
 
     // Convert to a rustls signing key.
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
-        .map_err(|e| CryptoError::InvalidKey(format!(
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der).map_err(|e| {
+        CryptoError::InvalidKey(format!(
             "failed to create signing key from private key: {e}"
-        )))?;
+        ))
+    })?;
 
     // Build the CertifiedKey.
-    let mut certified_key = CertifiedKey::new(
-        cert.cert_chain.clone(),
-        signing_key,
-    );
+    let mut certified_key = CertifiedKey::new(cert.cert_chain.clone(), signing_key);
 
     // Attach OCSP response if available.
     if let Some(ref ocsp) = cert.ocsp_response {
@@ -625,28 +622,23 @@ pub fn cert_to_certified_key(cert: &Certificate) -> Result<Arc<CertifiedKey>> {
 /// Reconstruct a [`PrivateKeyDer`] from a [`Certificate`]'s raw key bytes
 /// and kind tag.
 fn reconstruct_private_key_der(cert: &Certificate) -> Result<PrivateKeyDer<'static>> {
-    let raw = cert.private_key_der.as_ref().ok_or_else(|| {
-        CryptoError::InvalidKey("certificate has no private key".into())
-    })?;
+    let raw = cert
+        .private_key_der
+        .as_ref()
+        .ok_or_else(|| CryptoError::InvalidKey("certificate has no private key".into()))?;
 
     if raw.is_empty() {
         return Err(CryptoError::InvalidKey("private key bytes are empty".into()).into());
     }
 
     let key_der = match cert.private_key_kind {
-        PrivateKeyKind::Pkcs8 => {
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(raw.clone()))
-        }
-        PrivateKeyKind::Pkcs1 => {
-            PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(raw.clone()))
-        }
-        PrivateKeyKind::Sec1 => {
-            PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(raw.clone()))
-        }
+        PrivateKeyKind::Pkcs8 => PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(raw.clone())),
+        PrivateKeyKind::Pkcs1 => PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(raw.clone())),
+        PrivateKeyKind::Sec1 => PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(raw.clone())),
         PrivateKeyKind::None => {
-            return Err(CryptoError::InvalidKey(
-                "certificate private key kind is None".into(),
-            ).into());
+            return Err(
+                CryptoError::InvalidKey("certificate private key kind is None".into()).into(),
+            );
         }
     };
 
@@ -659,9 +651,10 @@ fn reconstruct_private_key_der(cert: &Certificate) -> Result<PrivateKeyDer<'stat
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration as ChronoDuration, Utc};
+
     use super::*;
     use crate::cache::CacheOptions;
-    use chrono::{Duration as ChronoDuration, Utc};
     /// Helper: build a minimal test certificate (no real crypto material).
     fn make_test_cert(names: &[&str], hash: &str) -> Certificate {
         let now = Utc::now();

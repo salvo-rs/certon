@@ -12,8 +12,7 @@
 //! 1. Create a cache with [`CertCache::new`].
 //! 2. Add certificates with [`CertCache::add`].
 //! 3. Look up certificates during TLS handshakes with [`CertCache::get_by_name`].
-//! 4. When shutting down, call [`CertCache::stop`] to signal any background
-//!    maintenance tasks.
+//! 4. When shutting down, call [`CertCache::stop`] to signal any background maintenance tasks.
 //!
 //! # Certificate selection
 //!
@@ -21,8 +20,8 @@
 //! automatically:
 //! - Non-expired certificates are preferred over expired ones.
 //! - Managed certificates are preferred over unmanaged ones.
-//! - Among otherwise-equal certs, the one with the longest remaining lifetime
-//!   (latest `not_after`) wins.
+//! - Among otherwise-equal certs, the one with the longest remaining lifetime (latest `not_after`)
+//!   wins.
 //!
 //! # Usage
 //!
@@ -41,7 +40,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use rand::Rng;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock, watch};
 use tracing::{debug, info};
 
 use crate::certificates::Certificate;
@@ -241,8 +240,8 @@ impl CertCache {
     ///
     /// The returned cache is wrapped in an `Arc` for shared ownership.
     /// A background maintenance task is **not** started automatically; call
-    /// [`start_maintenance`](crate::maintain::start_maintenance) if periodic renewal/OCSP checking is
-    /// desired.
+    /// [`start_maintenance`](crate::maintain::start_maintenance) if periodic renewal/OCSP checking
+    /// is desired.
     pub fn new(options: CacheOptions) -> Arc<Self> {
         let opts = normalize_options(options);
         let (stop_tx, _stop_rx) = watch::channel(false);
@@ -415,10 +414,7 @@ impl CertCache {
         // Update the name index.
         for name in &cert.names {
             let lower = name.to_lowercase();
-            index
-                .entry(lower)
-                .or_default()
-                .push(cert_hash.clone());
+            index.entry(lower).or_default().push(cert_hash.clone());
         }
 
         let event_names = cert.names.clone();
@@ -598,13 +594,12 @@ impl CertCache {
     ///
     /// The lookup follows this strategy:
     /// 1. Exact match on the lowercase name.
-    /// 2. Wildcard match: replace the first label with `*` and try again
-    ///    (e.g. `sub.example.com` -> `*.example.com`).
+    /// 2. Wildcard match: replace the first label with `*` and try again (e.g. `sub.example.com` ->
+    ///    `*.example.com`).
     ///
     /// When multiple certificates match, the best one is selected:
     /// - Non-expired certificates are preferred over expired ones.
-    /// - Among non-expired certs, the one with the longest remaining lifetime
-    ///   wins.
+    /// - Among non-expired certs, the one with the longest remaining lifetime wins.
     /// - Managed certificates are preferred over unmanaged ones.
     pub async fn get_by_name(&self, name: &str) -> Option<Certificate> {
         let candidates = self.all_matching_certificates(name).await;
@@ -672,11 +667,7 @@ impl CertCache {
     /// Return all managed certificates in the cache.
     pub async fn get_managed_certificates(&self) -> Vec<Certificate> {
         let cache = self.cache.read().await;
-        cache
-            .values()
-            .filter(|c| c.managed)
-            .cloned()
-            .collect()
+        cache.values().filter(|c| c.managed).cloned().collect()
     }
 
     // -----------------------------------------------------------------------
@@ -790,8 +781,8 @@ impl CertCache {
 /// Selection criteria (in order of priority):
 /// 1. Non-expired certificates are preferred over expired ones.
 /// 2. Managed certificates are preferred over unmanaged ones.
-/// 3. Among otherwise-equal certs, the one with the longest remaining
-///    lifetime (latest `not_after`) wins.
+/// 3. Among otherwise-equal certs, the one with the longest remaining lifetime (latest `not_after`)
+///    wins.
 fn select_best_certificate(mut candidates: Vec<Certificate>) -> Option<Certificate> {
     if candidates.is_empty() {
         return None;
@@ -848,8 +839,9 @@ fn normalize_options(mut opts: CacheOptions) -> CacheOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::{Duration as ChronoDuration, Utc};
+
+    use super::*;
 
     /// Helper: build a minimal test certificate.
     fn make_cert(names: &[&str], hash: &str, managed: bool) -> Certificate {
@@ -1167,9 +1159,7 @@ mod tests {
     async fn test_all_matching_certificates() {
         let cache = CertCache::new(CacheOptions::default());
         cache.add(make_cert(&["example.com"], "h1", true)).await;
-        cache
-            .add(make_cert(&["*.example.com"], "h2", true))
-            .await;
+        cache.add(make_cert(&["*.example.com"], "h2", true)).await;
 
         // "sub.example.com" should match the wildcard cert.
         let certs = cache.all_matching_certificates("sub.example.com").await;
@@ -1222,7 +1212,10 @@ mod tests {
             ..Default::default()
         };
         let normalized = normalize_options(opts);
-        assert_eq!(normalized.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
+        assert_eq!(
+            normalized.renew_check_interval,
+            DEFAULT_RENEW_CHECK_INTERVAL
+        );
         assert_eq!(normalized.ocsp_check_interval, DEFAULT_OCSP_CHECK_INTERVAL);
     }
 

@@ -2,15 +2,14 @@
 //!
 //! This module defines a hierarchy of error types used throughout certon:
 //!
-//! - [`AcmeError`] -- failures during ACME protocol interactions (directory
-//!   fetch, account management, orders, authorizations, challenges).
+//! - [`AcmeError`] -- failures during ACME protocol interactions (directory fetch, account
+//!   management, orders, authorizations, challenges).
 //! - [`StorageError`] -- failures reading from or writing to persistent storage.
-//! - [`CryptoError`] -- failures in key generation, signing, or PEM
-//!   encoding/decoding.
-//! - [`CertError`] -- certificate-specific validation issues (expiration,
-//!   revocation, domain validation).
-//! - [`enum@Error`] -- the top-level error that wraps all of the above, plus
-//!   general-purpose `Config`, `Timeout`, and `Other` variants.
+//! - [`CryptoError`] -- failures in key generation, signing, or PEM encoding/decoding.
+//! - [`CertError`] -- certificate-specific validation issues (expiration, revocation, domain
+//!   validation).
+//! - [`enum@Error`] -- the top-level error that wraps all of the above, plus general-purpose
+//!   `Config`, `Timeout`, and `Other` variants.
 //!
 //! A convenience [`Result<T>`] type alias is also provided.
 

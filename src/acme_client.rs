@@ -11,12 +11,12 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderValue;
 use ring::rand::SystemRandom;
-use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{self, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -414,20 +414,14 @@ struct JwsBody {
 /// format is 65 bytes: `0x04 || x (32 bytes) || y (32 bytes)`.
 fn jwk_from_key(key: &PrivateKey) -> Result<Jwk> {
     let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_FIXED_SIGNING,
-        key.pkcs8_der(),
-        &rng,
-    )
-    .map_err(|e| AcmeError::Account(format!("failed to load ECDSA key pair: {e}")))?;
+    let key_pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der(), &rng)
+            .map_err(|e| AcmeError::Account(format!("failed to load ECDSA key pair: {e}")))?;
 
     let public_key = signature::KeyPair::public_key(&key_pair).as_ref();
     // Uncompressed point: 0x04 || x || y
     if public_key.len() != 65 || public_key[0] != 0x04 {
-        return Err(AcmeError::Account(
-            "unexpected ECDSA P-256 public key format".into(),
-        )
-        .into());
+        return Err(AcmeError::Account("unexpected ECDSA P-256 public key format".into()).into());
     }
     let (x, y) = public_key[1..].split_at(32);
 
@@ -498,12 +492,10 @@ pub fn key_authorization_sha256(token: &str, account_key: &PrivateKey) -> Result
 /// signature.
 fn sign_with_key(key: &PrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let rng = SystemRandom::new();
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_FIXED_SIGNING,
-        key.pkcs8_der(),
-        &rng,
-    )
-    .map_err(|e| AcmeError::Account(format!("failed to load ECDSA key pair for signing: {e}")))?;
+    let key_pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der(), &rng).map_err(
+            |e| AcmeError::Account(format!("failed to load ECDSA key pair for signing: {e}")),
+        )?;
 
     let sig = key_pair
         .sign(&rng, data)
@@ -643,11 +635,9 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Directory(format!("failed to fetch directory: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(AcmeError::Directory(format!(
-                "directory returned HTTP {}",
-                resp.status()
-            ))
-            .into());
+            return Err(
+                AcmeError::Directory(format!("directory returned HTTP {}", resp.status())).into(),
+            );
         }
 
         let directory: AcmeDirectory = resp
@@ -723,8 +713,7 @@ impl AcmeClient {
     /// Send a signed ACME POST request. Returns the response.
     ///
     /// - If `kid` is `Some`, the JWS uses `kid` in the protected header.
-    /// - If `kid` is `None`, the JWS includes the full JWK (used for
-    ///   newAccount).
+    /// - If `kid` is `None`, the JWS includes the full JWK (used for newAccount).
     /// - If `payload` is `None`, an empty payload is sent (POST-as-GET).
     async fn acme_post(
         &self,
@@ -745,9 +734,7 @@ impl AcmeClient {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| {
-                    AcmeError::Order(format!("ACME POST to {url} failed: {e}"))
-                })?;
+                .map_err(|e| AcmeError::Order(format!("ACME POST to {url} failed: {e}")))?;
 
             // Always cache the nonce from the response.
             self.cache_nonce(&resp).await;
@@ -853,7 +840,11 @@ impl AcmeClient {
         }
 
         let eab_value = match eab {
-            Some(eab_creds) => Some(build_eab_jws(account_key, &eab_creds, &self.directory.new_account)?),
+            Some(eab_creds) => Some(build_eab_jws(
+                account_key,
+                &eab_creds,
+                &self.directory.new_account,
+            )?),
             None => None,
         };
 
@@ -867,7 +858,12 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Account(format!("failed to serialize account request: {e}")))?;
 
         let (acct_resp, location): (AccountResponse, _) = self
-            .acme_post_json(account_key, None, &self.directory.new_account, Some(&payload))
+            .acme_post_json(
+                account_key,
+                None,
+                &self.directory.new_account,
+                Some(&payload),
+            )
             .await?;
 
         let account_url = location.ok_or_else(|| {
@@ -907,7 +903,13 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Account(format!("failed to serialize find request: {e}")))?;
 
         let nonce = self.get_nonce().await?;
-        let body = build_jws_body(account_key, None, &nonce, &self.directory.new_account, Some(&payload))?;
+        let body = build_jws_body(
+            account_key,
+            None,
+            &nonce,
+            &self.directory.new_account,
+            Some(&payload),
+        )?;
 
         let resp = self
             .http
@@ -928,13 +930,11 @@ impl AcmeClient {
                     return Ok(None);
                 }
             }
-            return Err(
-                AcmeError::Account(format!(
-                    "account lookup returned HTTP 400: {}",
-                    String::from_utf8_lossy(&body_bytes)
-                ))
-                .into(),
-            );
+            return Err(AcmeError::Account(format!(
+                "account lookup returned HTTP 400: {}",
+                String::from_utf8_lossy(&body_bytes)
+            ))
+            .into());
         }
 
         if !resp.status().is_success() {
@@ -961,10 +961,9 @@ impl AcmeClient {
 
         match account_url {
             Some(url) => Ok(Some((acct_resp, url))),
-            None => Err(AcmeError::Account(
-                "no Location header in account lookup response".into(),
-            )
-            .into()),
+            None => Err(
+                AcmeError::Account("no Location header in account lookup response".into()).into(),
+            ),
         }
     }
 
@@ -1063,12 +1062,7 @@ impl AcmeClient {
         // POST an empty JSON object `{}` to signal readiness.
         let payload = "{}";
         let (challenge, _): (AcmeChallenge, _) = self
-            .acme_post_json(
-                account_key,
-                Some(account_url),
-                challenge_url,
-                Some(payload),
-            )
+            .acme_post_json(account_key, Some(account_url), challenge_url, Some(payload))
             .await?;
 
         debug!(
@@ -1170,12 +1164,7 @@ impl AcmeClient {
             .map_err(|e| AcmeError::Order(format!("failed to serialize finalize request: {e}")))?;
 
         let (order, _): (AcmeOrder, _) = self
-            .acme_post_json(
-                account_key,
-                Some(account_url),
-                finalize_url,
-                Some(&payload),
-            )
+            .acme_post_json(account_key, Some(account_url), finalize_url, Some(&payload))
             .await?;
 
         debug!(status = %order.status, "order finalized");
@@ -1215,9 +1204,7 @@ impl AcmeClient {
                         .as_ref()
                         .map(|p| format!("{p}"))
                         .unwrap_or_else(|| "unknown".into());
-                    return Err(
-                        AcmeError::Order(format!("order failed: {detail}")).into()
-                    );
+                    return Err(AcmeError::Order(format!("order failed: {detail}")).into());
                 }
                 _ => {
                     // "pending", "ready", "processing" — keep polling.
@@ -1266,11 +1253,7 @@ impl AcmeClient {
             .await
             .map_err(|e| AcmeError::Certificate(format!("failed to read certificate body: {e}")))?;
 
-        debug!(
-            cert_url,
-            len = body.len(),
-            "certificate downloaded"
-        );
+        debug!(cert_url, len = body.len(), "certificate downloaded");
 
         Ok(body)
     }
@@ -1303,8 +1286,9 @@ impl AcmeClient {
             certificate: URL_SAFE_NO_PAD.encode(cert_der),
             reason,
         };
-        let payload = serde_json::to_string(&req)
-            .map_err(|e| AcmeError::Certificate(format!("failed to serialize revoke request: {e}")))?;
+        let payload = serde_json::to_string(&req).map_err(|e| {
+            AcmeError::Certificate(format!("failed to serialize revoke request: {e}"))
+        })?;
 
         let resp = self
             .acme_post(
@@ -1378,18 +1362,15 @@ impl AcmeClient {
             return Ok(RenewalInfo::default());
         }
 
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| AcmeError::Certificate(format!("failed to read ARI response body: {e}")))?;
+        let body = resp.bytes().await.map_err(|e| {
+            AcmeError::Certificate(format!("failed to read ARI response body: {e}"))
+        })?;
 
-        let info: RenewalInfo = serde_json::from_slice(&body)
-            .map_err(|e| AcmeError::Certificate(format!("failed to parse ARI response JSON: {e}")))?;
+        let info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
+            AcmeError::Certificate(format!("failed to parse ARI response JSON: {e}"))
+        })?;
 
-        debug!(
-            ?info,
-            "ACME Renewal Information fetched"
-        );
+        debug!(?info, "ACME Renewal Information fetched");
 
         Ok(info)
     }
@@ -1421,8 +1402,9 @@ pub fn ari_cert_id(cert_der: &[u8]) -> Result<String> {
     use x509_parser::extensions::ParsedExtension;
     use x509_parser::prelude::*;
 
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| AcmeError::Certificate(format!("failed to parse certificate for ARI ID: {e}")))?;
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+        AcmeError::Certificate(format!("failed to parse certificate for ARI ID: {e}"))
+    })?;
 
     // Extract the Authority Key Identifier (AKI) extension by walking
     // all extensions.
@@ -1436,8 +1418,11 @@ pub fn ari_cert_id(cert_der: &[u8]) -> Result<String> {
         }
     }
 
-    let aki_bytes = aki_bytes
-        .ok_or_else(|| AcmeError::Certificate("certificate has no Authority Key Identifier extension with keyIdentifier".into()))?;
+    let aki_bytes = aki_bytes.ok_or_else(|| {
+        AcmeError::Certificate(
+            "certificate has no Authority Key Identifier extension with keyIdentifier".into(),
+        )
+    })?;
 
     // Extract serial number bytes. `x509_parser` gives us the serial as a
     // BigUint; we want the raw unsigned big-endian bytes.
@@ -1531,7 +1516,7 @@ fn extract_nonce(resp: &reqwest::Response) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{generate_private_key, KeyType};
+    use crate::crypto::{KeyType, generate_private_key};
 
     #[test]
     fn test_jwk_from_key() {
@@ -1599,8 +1584,14 @@ mod tests {
     #[test]
     fn test_build_jws_body_with_jwk() {
         let key = generate_private_key(KeyType::EcdsaP256).unwrap();
-        let body = build_jws_body(&key, None, "nonce123", "https://example.com/new-acct", Some("{}"))
-            .unwrap();
+        let body = build_jws_body(
+            &key,
+            None,
+            "nonce123",
+            "https://example.com/new-acct",
+            Some("{}"),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(parsed.get("protected").is_some());
         assert!(parsed.get("payload").is_some());

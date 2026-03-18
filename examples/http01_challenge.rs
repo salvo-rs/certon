@@ -13,14 +13,13 @@
 
 use std::sync::Arc;
 
+use certon::{
+    AcmeIssuer, CertResolver, Config, FileStorage, Http01Solver, KeyType, LETS_ENCRYPT_STAGING,
+    Result, Storage,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-
-use certon::{
-    AcmeIssuer, CertResolver, Config, FileStorage, Http01Solver, KeyType, Result, Storage,
-    LETS_ENCRYPT_STAGING,
-};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,7 +56,10 @@ async fn main() -> Result<()> {
 
     // -- Obtain certificates ---------------------------------------------------
     let domains = vec!["example.com".into()];
-    println!("Obtaining certificate for {:?} via HTTP-01 challenge...", domains);
+    println!(
+        "Obtaining certificate for {:?} via HTTP-01 challenge...",
+        domains
+    );
     config.manage_sync(&domains).await?;
     println!("Certificate obtained successfully!");
 
@@ -69,9 +71,9 @@ async fn main() -> Result<()> {
 
     // -- Start HTTPS server on port 443 ----------------------------------------
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let listener = TcpListener::bind("0.0.0.0:443").await.map_err(|e| {
-        certon::Error::Other(format!("failed to bind HTTPS listener: {e}"))
-    })?;
+    let listener = TcpListener::bind("0.0.0.0:443")
+        .await
+        .map_err(|e| certon::Error::Other(format!("failed to bind HTTPS listener: {e}")))?;
 
     println!("HTTPS server listening on 0.0.0.0:443");
 
@@ -79,9 +81,10 @@ async fn main() -> Result<()> {
     let _maintenance = certon::start_maintenance(&config);
 
     loop {
-        let (stream, peer_addr) = listener.accept().await.map_err(|e| {
-            certon::Error::Other(format!("accept error: {e}"))
-        })?;
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .map_err(|e| certon::Error::Other(format!("accept error: {e}")))?;
 
         let acceptor = acceptor.clone();
         tokio::spawn(async move {

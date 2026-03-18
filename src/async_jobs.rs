@@ -2,14 +2,11 @@
 //!
 //! This module provides:
 //!
-//! - [`RetryConfig`] — configurable retry intervals, maximum duration, and
-//!   maximum retry count.
-//! - [`do_with_retry`] — execute an async closure with automatic retries and
-//!   exponential-ish backoff.
+//! - [`RetryConfig`] — configurable retry intervals, maximum duration, and maximum retry count.
+//! - [`do_with_retry`] — execute an async closure with automatic retries and exponential-ish
+//!   backoff.
 //! - [`JobQueue`] — a lightweight manager for background tasks (backed by
-//!   [`tokio::task::JoinHandle`]) that deduplicates by name and supports
-//!   cancellation.
-//!
+//!   [`tokio::task::JoinHandle`]) that deduplicates by name and supports cancellation.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -35,31 +32,31 @@ use crate::error::{AcmeError, Error, Result};
 /// Once all intervals have been exhausted the **last** interval is repeated
 /// until `max_duration` elapses.
 pub const DEFAULT_RETRY_INTERVALS: &[Duration] = &[
-    Duration::from_secs(60),        // 1m
-    Duration::from_secs(120),       // 2m
-    Duration::from_secs(120),       // 2m
-    Duration::from_secs(300),       // 5m
-    Duration::from_secs(600),       // 10m
-    Duration::from_secs(600),       // 10m
-    Duration::from_secs(600),       // 10m
-    Duration::from_secs(1200),      // 20m
-    Duration::from_secs(1200),      // 20m
-    Duration::from_secs(1200),      // 20m
-    Duration::from_secs(1200),      // 20m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(1800),      // 30m
-    Duration::from_secs(3600),      // 1h
-    Duration::from_secs(3600),      // 1h
-    Duration::from_secs(3600),      // 1h
-    Duration::from_secs(7200),      // 2h
-    Duration::from_secs(7200),      // 2h
-    Duration::from_secs(10800),     // 3h
-    Duration::from_secs(10800),     // 3h
-    Duration::from_secs(21600),     // 6h
+    Duration::from_secs(60),    // 1m
+    Duration::from_secs(120),   // 2m
+    Duration::from_secs(120),   // 2m
+    Duration::from_secs(300),   // 5m
+    Duration::from_secs(600),   // 10m
+    Duration::from_secs(600),   // 10m
+    Duration::from_secs(600),   // 10m
+    Duration::from_secs(1200),  // 20m
+    Duration::from_secs(1200),  // 20m
+    Duration::from_secs(1200),  // 20m
+    Duration::from_secs(1200),  // 20m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(1800),  // 30m
+    Duration::from_secs(3600),  // 1h
+    Duration::from_secs(3600),  // 1h
+    Duration::from_secs(3600),  // 1h
+    Duration::from_secs(7200),  // 2h
+    Duration::from_secs(7200),  // 2h
+    Duration::from_secs(10800), // 3h
+    Duration::from_secs(10800), // 3h
+    Duration::from_secs(21600), // 6h
 ];
 
 /// Default maximum total duration for retries (30 days).
@@ -242,8 +239,7 @@ where
                     interval_index += 1;
                 }
 
-                let next_wait = config.intervals
-                    [interval_index.max(0) as usize];
+                let next_wait = config.intervals[interval_index.max(0) as usize];
 
                 tracing::error!(
                     %err,
@@ -346,11 +342,7 @@ impl JobQueue {
         let handle = tokio::spawn(async move {
             // Acquire a semaphore permit if concurrency limiting is enabled.
             let _permit = match &semaphore {
-                Some(sem) => Some(
-                    sem.acquire()
-                        .await
-                        .expect("semaphore should not be closed"),
-                ),
+                Some(sem) => Some(sem.acquire().await.expect("semaphore should not be closed")),
                 None => None,
             };
 
@@ -432,8 +424,9 @@ impl JobQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     #[test]
     fn default_retry_config() {

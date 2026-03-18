@@ -58,7 +58,9 @@ impl HttpsRedirectHandler {
     /// until the handle is dropped or aborted.
     pub async fn start(&self, bind_addr: &str) -> Result<JoinHandle<()>> {
         let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
-            Error::Other(format!("failed to bind HTTP redirect listener on {bind_addr}: {e}"))
+            Error::Other(format!(
+                "failed to bind HTTP redirect listener on {bind_addr}: {e}"
+            ))
         })?;
 
         let https_port = self.https_port;
@@ -104,10 +106,7 @@ impl HttpsRedirectHandler {
 
 /// Handle a single HTTP connection: parse enough of the request to extract
 /// the Host header and path, then send back a 301 redirect to HTTPS.
-async fn handle_redirect_connection(
-    mut stream: tokio::net::TcpStream,
-    https_port: u16,
-) {
+async fn handle_redirect_connection(mut stream: tokio::net::TcpStream, https_port: u16) {
     let mut buf = vec![0u8; 4096];
     let n = match stream.read(&mut buf).await {
         Ok(0) => return,

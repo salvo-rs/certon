@@ -4,7 +4,6 @@
 //! [`AcmeIssuer`], which coordinates the full ACME challenge/finalize flow
 //! to obtain TLS certificates from an ACME-compatible Certificate Authority
 //! such as Let's Encrypt.
-//!
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,19 +35,17 @@ fn get_ca_rate_limiter(ca_url: &str, email: &str) -> Arc<RateLimiter> {
         .clone()
 }
 
-use crate::account::{
-    delete_account_locally, get_or_create_account, save_account, AcmeAccount,
-};
+use crate::account::{AcmeAccount, delete_account_locally, get_or_create_account, save_account};
 use crate::acme_client::{
     AcmeClient, ExternalAccountBinding, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
 };
 use crate::crypto::{
-    encode_private_key_pem, generate_csr, generate_private_key, parse_certs_from_pem_bundle,
-    KeyType,
+    KeyType, encode_private_key_pem, generate_csr, generate_private_key,
+    parse_certs_from_pem_bundle,
 };
 use crate::error::{AcmeError, Error, Result};
 use crate::solvers::{DistributedSolver, Solver};
-use crate::storage::{issuer_key, Storage};
+use crate::storage::{Storage, issuer_key};
 
 // ---------------------------------------------------------------------------
 // Well-known CA constants (re-exported for convenience)
@@ -503,10 +500,7 @@ impl AcmeIssuerBuilder {
     }
 
     /// Set a callback invoked on newly created accounts before CA registration.
-    pub fn new_account_func(
-        mut self,
-        func: Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>,
-    ) -> Self {
+    pub fn new_account_func(mut self, func: Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>) -> Self {
         self.new_account_func = Some(func);
         self
     }
@@ -541,9 +535,9 @@ impl AcmeIssuerBuilder {
     ///
     /// Panics if no `storage` has been provided.
     pub fn build(self) -> AcmeIssuer {
-        let storage = self
-            .storage
-            .expect("AcmeIssuer requires a Storage implementation — call .storage() on the builder");
+        let storage = self.storage.expect(
+            "AcmeIssuer requires a Storage implementation — call .storage() on the builder",
+        );
 
         AcmeIssuer {
             ca: self.ca,
@@ -678,11 +672,7 @@ impl AcmeIssuer {
     /// If no account exists in storage, a new one is created and registered
     /// with the CA. A distributed lock is used to avoid duplicate
     /// registration in clustered deployments.
-    async fn get_account(
-        &self,
-        client: &AcmeClient,
-        use_test: bool,
-    ) -> Result<AcmeAccount> {
+    async fn get_account(&self, client: &AcmeClient, use_test: bool) -> Result<AcmeAccount> {
         let ca_url = if use_test { &self.test_ca } else { &self.ca };
         let mutex = if use_test {
             &self.test_account
@@ -702,9 +692,7 @@ impl AcmeIssuer {
         let lock_key = format!("acme_account_{}", issuer_key(ca_url));
         self.storage.lock(&lock_key).await?;
 
-        let result = self
-            .get_account_inner(client, ca_url)
-            .await;
+        let result = self.get_account_inner(client, ca_url).await;
 
         self.storage.unlock(&lock_key).await?;
 
@@ -718,11 +706,7 @@ impl AcmeIssuer {
     }
 
     /// Inner account initialisation logic (called under the distributed lock).
-    async fn get_account_inner(
-        &self,
-        client: &AcmeClient,
-        ca_url: &str,
-    ) -> Result<AcmeAccount> {
+    async fn get_account_inner(&self, client: &AcmeClient, ca_url: &str) -> Result<AcmeAccount> {
         let (mut acct, is_new) = get_or_create_account(
             self.storage.as_ref(),
             ca_url,
@@ -751,12 +735,7 @@ impl AcmeIssuer {
                 .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
             let (resp, location) = client
-                .new_account(
-                    &private_key,
-                    &acct.contact,
-                    self.agreed,
-                    eab,
-                )
+                .new_account(&private_key, &acct.contact, self.agreed, eab)
                 .await?;
 
             acct.status = resp.status;
@@ -848,21 +827,14 @@ impl AcmeIssuer {
             CHALLENGE_TYPE_DNS01 => self.dns01_solver.clone().ok_or_else(|| {
                 Error::Config("dns-01 challenge selected but no DNS solver is configured".into())
             }),
-            CHALLENGE_TYPE_HTTP01 => {
-                self.http01_solver.clone().ok_or_else(|| {
-                    Error::Config(
-                        "http-01 challenge selected but no HTTP solver is configured".into(),
-                    )
-                })
-            }
-            CHALLENGE_TYPE_TLSALPN01 => {
-                self.tlsalpn01_solver.clone().ok_or_else(|| {
-                    Error::Config(
-                        "tls-alpn-01 challenge selected but no TLS-ALPN solver is configured"
-                            .into(),
-                    )
-                })
-            }
+            CHALLENGE_TYPE_HTTP01 => self.http01_solver.clone().ok_or_else(|| {
+                Error::Config("http-01 challenge selected but no HTTP solver is configured".into())
+            }),
+            CHALLENGE_TYPE_TLSALPN01 => self.tlsalpn01_solver.clone().ok_or_else(|| {
+                Error::Config(
+                    "tls-alpn-01 challenge selected but no TLS-ALPN solver is configured".into(),
+                )
+            }),
             other => Err(Error::Config(format!(
                 "unsupported challenge type: {other}"
             ))),
@@ -884,11 +856,7 @@ impl AcmeIssuer {
         use_test_ca: bool,
         attempt: usize,
     ) -> Result<(IssuedCertificate, bool)> {
-        let ca_url = if use_test_ca {
-            &self.test_ca
-        } else {
-            &self.ca
-        };
+        let ca_url = if use_test_ca { &self.test_ca } else { &self.ca };
         let is_test = self.using_test_ca(ca_url);
 
         debug!(
@@ -937,12 +905,15 @@ impl AcmeIssuer {
                     ca = %ca_url,
                     "account does not exist on CA, deleting local account and retrying"
                 );
-                self.delete_account_and_clear_cache(ca_url, &acct, use_test_ca).await?;
+                self.delete_account_and_clear_cache(ca_url, &acct, use_test_ca)
+                    .await?;
 
                 // Re-obtain account (will create a new one).
                 let new_acct = self.get_account(&client, use_test_ca).await?;
-                let new_account_key = crate::crypto::decode_private_key_pem(&new_acct.private_key_pem)
-                    .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
+                let new_account_key = crate::crypto::decode_private_key_pem(
+                    &new_acct.private_key_pem,
+                )
+                .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
                 // Retry order creation with the new account.
                 client
@@ -984,8 +955,7 @@ impl AcmeIssuer {
             );
 
             // Compute key authorization.
-            let key_auth =
-                crate::acme_client::key_authorization(&challenge.token, &account_key)?;
+            let key_auth = crate::acme_client::key_authorization(&challenge.token, &account_key)?;
 
             // Get the solver, optionally wrapping in DistributedSolver.
             let solver = self.solver_for(&challenge.challenge_type)?;
@@ -1004,11 +974,9 @@ impl AcmeIssuer {
             solver
                 .present(&authz.identifier.value, &challenge.token, &key_auth)
                 .await
-                .map_err(|e| {
-                    AcmeError::Challenge {
-                        challenge_type: challenge.challenge_type.clone(),
-                        message: format!("failed to present challenge: {e}"),
-                    }
+                .map_err(|e| AcmeError::Challenge {
+                    challenge_type: challenge.challenge_type.clone(),
+                    message: format!("failed to present challenge: {e}"),
                 })?;
 
             // Wait for the solver to be ready (e.g. DNS propagation).
@@ -1065,12 +1033,7 @@ impl AcmeIssuer {
 
         // Step 5: finalize the order with the CSR.
         let finalized = client
-            .finalize_order(
-                &account_key,
-                &acct.location,
-                &order.finalize,
-                csr_der,
-            )
+            .finalize_order(&account_key, &acct.location, &order.finalize, csr_der)
             .await?;
 
         debug!(
@@ -1242,7 +1205,10 @@ impl AcmeIssuer {
                 "applied chain size sorting preference"
             );
 
-            return chains.into_iter().next().unwrap_or_else(|| cert_pem.to_owned());
+            return chains
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| cert_pem.to_owned());
         }
 
         // No preference matched — return the original chain.
@@ -1309,9 +1275,7 @@ impl CertIssuer for AcmeIssuer {
                     info!(attempt = attempt, "retrying with test CA");
                     match self.do_issue(csr_der, domains, true, attempt).await {
                         Ok((_test_cert, _)) => {
-                            info!(
-                                "test CA issuance succeeded; retrying production CA once more"
-                            );
+                            info!("test CA issuance succeeded; retrying production CA once more");
                             // Test CA worked, so our setup is valid.
                             // Retry production CA once more.
                             attempt += 1;

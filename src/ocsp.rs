@@ -10,10 +10,9 @@
 //! from having to contact the CA's OCSP responder themselves.
 //!
 //! The workflow is:
-//! 1. Extract the OCSP responder URL from the certificate's Authority
-//!    Information Access (AIA) extension.
-//! 2. Build an OCSP request containing the certificate's serial number
-//!    and issuer information.
+//! 1. Extract the OCSP responder URL from the certificate's Authority Information Access (AIA)
+//!    extension.
+//! 2. Build an OCSP request containing the certificate's serial number and issuer information.
 //! 3. Send the request to the OCSP responder via HTTP POST.
 //! 4. Parse the response and cache it in storage.
 //! 5. Attach the raw response bytes to the certificate for TLS stapling.
@@ -162,9 +161,7 @@ const OCSP_RESPONSE_CONTENT_TYPE: &str = "application/ocsp-response";
 const DEFAULT_OCSP_LIFETIME_HOURS: i64 = 24;
 
 /// SHA-1 algorithm OID for OCSP request hashing: 1.3.14.3.2.26
-const OID_SHA1: &[u8] = &[
-    0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A,
-];
+const OID_SHA1: &[u8] = &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A];
 
 // ---------------------------------------------------------------------------
 // OCSP response status codes (outer envelope)
@@ -190,8 +187,8 @@ const CERT_STATUS_REVOKED: u8 = 1;
 ///
 /// This is the main entry point for OCSP stapling. The function:
 ///
-/// 1. Checks for a cached OCSP staple in `storage`. If it exists and is
-///    still fresh (per [`is_ocsp_fresh`]), it is used directly.
+/// 1. Checks for a cached OCSP staple in `storage`. If it exists and is still fresh (per
+///    [`is_ocsp_fresh`]), it is used directly.
 /// 2. Otherwise, fetches a fresh OCSP response from the CA's responder.
 /// 3. Caches the response in `storage` for future use.
 /// 4. Staples the response to `cert` (sets [`Certificate::ocsp_response`]).
@@ -278,17 +275,18 @@ pub async fn staple_ocsp(
     }
 
     // Fetch a fresh OCSP response.
-    let (raw_response, parsed) = match get_ocsp_for_cert_chain(&cert.cert_chain, &_config.responder_overrides).await {
-        Ok(result) => result,
-        Err(e) => {
-            debug!(
-                name = %first_name,
-                error = %e,
-                "failed to get OCSP response; stapling skipped"
-            );
-            return Ok(false);
-        }
-    };
+    let (raw_response, parsed) =
+        match get_ocsp_for_cert_chain(&cert.cert_chain, &_config.responder_overrides).await {
+            Ok(result) => result,
+            Err(e) => {
+                debug!(
+                    name = %first_name,
+                    error = %e,
+                    "failed to get OCSP response; stapling skipped"
+                );
+                return Ok(false);
+            }
+        };
 
     // Cache the response to storage (best effort).
     if let Err(e) = storage.store(&ocsp_storage_key, &raw_response).await {
@@ -318,8 +316,8 @@ pub async fn staple_ocsp(
 ///
 /// Freshness is determined by:
 /// - If `next_update` is set: fresh while `now < next_update`.
-/// - If `next_update` is absent: fresh for `DEFAULT_OCSP_LIFETIME_HOURS` (24)
-///   hours after `this_update`.
+/// - If `next_update` is absent: fresh for `DEFAULT_OCSP_LIFETIME_HOURS` (24) hours after
+///   `this_update`.
 pub fn is_ocsp_fresh(response: &OcspResponse) -> bool {
     let now = Utc::now();
 
@@ -327,8 +325,7 @@ pub fn is_ocsp_fresh(response: &OcspResponse) -> bool {
         now < next_update
     } else {
         // No nextUpdate; consider fresh for DEFAULT_OCSP_LIFETIME_HOURS.
-        let expires = response.this_update
-            + ChronoDuration::hours(DEFAULT_OCSP_LIFETIME_HOURS);
+        let expires = response.this_update + ChronoDuration::hours(DEFAULT_OCSP_LIFETIME_HOURS);
         now < expires
     }
 }
@@ -360,8 +357,8 @@ pub fn ocsp_needs_update(response: &OcspResponse) -> bool {
         }
     } else {
         // No nextUpdate: refresh after half the default lifetime.
-        let half_life = response.this_update
-            + ChronoDuration::hours(DEFAULT_OCSP_LIFETIME_HOURS / 2);
+        let half_life =
+            response.this_update + ChronoDuration::hours(DEFAULT_OCSP_LIFETIME_HOURS / 2);
         if now > half_life {
             return true;
         }
@@ -379,10 +376,11 @@ pub fn ocsp_needs_update(response: &OcspResponse) -> bool {
 /// Examines the Authority Information Access (AIA) extension and returns
 /// all URLs whose access method is `id-ad-ocsp` (OID 1.3.6.1.5.5.7.48.1).
 pub fn extract_ocsp_urls(cert_der: &[u8]) -> Result<Vec<String>> {
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| CryptoError::InvalidCertificate(format!(
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+        CryptoError::InvalidCertificate(format!(
             "failed to parse certificate for OCSP URL extraction: {e}"
-        )))?;
+        ))
+    })?;
 
     extract_ocsp_urls_from_parsed(&cert)
 }
@@ -439,52 +437,49 @@ async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
         .build()
         .map_err(|e| CertError::OcspFailed(format!("failed to build HTTP client: {e}")))?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| CertError::OcspFailed(format!(
+    let response = client.get(url).send().await.map_err(|e| {
+        CertError::OcspFailed(format!(
             "failed to fetch issuer certificate from {url}: {e}"
-        )))?;
+        ))
+    })?;
 
     if !response.status().is_success() {
         return Err(CertError::OcspFailed(format!(
             "issuer certificate fetch from {url} returned HTTP {}",
             response.status()
-        )).into());
+        ))
+        .into());
     }
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| CertError::OcspFailed(format!(
+    let body = response.bytes().await.map_err(|e| {
+        CertError::OcspFailed(format!(
             "failed to read issuer certificate response body: {e}"
-        )))?;
+        ))
+    })?;
 
     if body.is_empty() {
-        return Err(CertError::OcspFailed(
-            "issuer certificate response body is empty".into(),
-        ).into());
+        return Err(
+            CertError::OcspFailed("issuer certificate response body is empty".into()).into(),
+        );
     }
 
     // Auto-detect PEM vs DER. If the body starts with "-----BEGIN", treat
     // it as PEM; otherwise assume raw DER.
     if body.starts_with(b"-----BEGIN") {
-        let pem_str = std::str::from_utf8(&body)
-            .map_err(|e| CertError::OcspFailed(format!(
-                "issuer certificate PEM is not valid UTF-8: {e}"
-            )))?;
-        let parsed = ::pem::parse(pem_str)
-            .map_err(|e| CertError::OcspFailed(format!(
-                "failed to parse issuer certificate PEM: {e}"
-            )))?;
+        let pem_str = std::str::from_utf8(&body).map_err(|e| {
+            CertError::OcspFailed(format!("issuer certificate PEM is not valid UTF-8: {e}"))
+        })?;
+        let parsed = ::pem::parse(pem_str).map_err(|e| {
+            CertError::OcspFailed(format!("failed to parse issuer certificate PEM: {e}"))
+        })?;
         Ok(parsed.into_contents())
     } else {
         // Assume DER. Validate by attempting to parse.
-        X509Certificate::from_der(&body)
-            .map_err(|e| CertError::OcspFailed(format!(
+        X509Certificate::from_der(&body).map_err(|e| {
+            CertError::OcspFailed(format!(
                 "downloaded issuer certificate is not valid DER: {e}"
-            )))?;
+            ))
+        })?;
         Ok(body.to_vec())
     }
 }
@@ -512,18 +507,15 @@ async fn get_ocsp_for_cert_chain(
     responder_overrides: &HashMap<String, String>,
 ) -> Result<(Vec<u8>, OcspResponse)> {
     if chain.is_empty() {
-        return Err(CertError::OcspFailed(
-            "certificate chain is empty".into(),
-        ).into());
+        return Err(CertError::OcspFailed("certificate chain is empty".into()).into());
     }
 
     let leaf_der = chain[0].as_ref();
 
     // Parse leaf.
-    let (_, leaf) = X509Certificate::from_der(leaf_der)
-        .map_err(|e| CryptoError::InvalidCertificate(format!(
-            "failed to parse leaf certificate: {e}"
-        )))?;
+    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}"))
+    })?;
 
     // If the chain has an issuer, use it directly. Otherwise, try to
     // fetch the issuer from the AIA extension's Issuing Certificate URL.
@@ -551,23 +543,26 @@ async fn get_ocsp_for_cert_chain(
             Some(d) => d,
             None => {
                 return Err(CertError::OcspFailed(
-                    "certificate chain has only 1 entry and issuer could not be fetched from AIA".into(),
-                ).into());
+                    "certificate chain has only 1 entry and issuer could not be fetched from AIA"
+                        .into(),
+                )
+                .into());
             }
         }
     };
 
-    let (_, issuer) = X509Certificate::from_der(issuer_der_ref)
-        .map_err(|e| CryptoError::InvalidCertificate(format!(
-            "failed to parse issuer certificate: {e}"
-        )))?;
+    let (_, issuer) = X509Certificate::from_der(issuer_der_ref).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("failed to parse issuer certificate: {e}"))
+    })?;
 
     // Check for a responder override matching any SAN on the leaf.
     let override_url = if !responder_overrides.is_empty() {
         crate::certificates::extract_names_from_der(leaf_der)
             .ok()
             .and_then(|names| {
-                names.iter().find_map(|name| responder_overrides.get(name).cloned())
+                names
+                    .iter()
+                    .find_map(|name| responder_overrides.get(name).cloned())
             })
     } else {
         None
@@ -603,15 +598,12 @@ async fn get_ocsp_for_cert_chain(
 ///
 /// The PEM data must contain at least two `CERTIFICATE` blocks.
 pub async fn get_ocsp_for_cert(cert_pem: &[u8]) -> Result<(Vec<u8>, OcspResponse)> {
-    let pem_str = std::str::from_utf8(cert_pem)
-        .map_err(|e| CryptoError::InvalidCertificate(format!(
-            "certificate PEM is not valid UTF-8: {e}"
-        )))?;
+    let pem_str = std::str::from_utf8(cert_pem).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("certificate PEM is not valid UTF-8: {e}"))
+    })?;
 
     let pems: Vec<::pem::Pem> = ::pem::parse_many(pem_str)
-        .map_err(|e| CryptoError::InvalidCertificate(format!(
-            "failed to parse PEM bundle: {e}"
-        )))?;
+        .map_err(|e| CryptoError::InvalidCertificate(format!("failed to parse PEM bundle: {e}")))?;
 
     let cert_ders: Vec<rustls::pki_types::CertificateDer<'static>> = pems
         .into_iter()
@@ -622,7 +614,8 @@ pub async fn get_ocsp_for_cert(cert_pem: &[u8]) -> Result<(Vec<u8>, OcspResponse
     if cert_ders.len() < 2 {
         return Err(CertError::OcspFailed(
             "PEM bundle must contain at least 2 certificates (leaf + issuer)".into(),
-        ).into());
+        )
+        .into());
     }
 
     get_ocsp_for_cert_chain(&cert_ders, &HashMap::new()).await
@@ -660,10 +653,7 @@ pub async fn get_ocsp_for_cert(cert_pem: &[u8]) -> Result<(Vec<u8>, OcspResponse
 ///
 /// We always use SHA-1 for hashing (as required by RFC 5019 and most
 /// OCSP responders).
-fn build_ocsp_request(
-    leaf: &X509Certificate<'_>,
-    issuer: &X509Certificate<'_>,
-) -> Result<Vec<u8>> {
+fn build_ocsp_request(leaf: &X509Certificate<'_>, issuer: &X509Certificate<'_>) -> Result<Vec<u8>> {
     // Hash the issuer's distinguished name (DER-encoded).
     let issuer_name_der = issuer.subject().as_raw();
     let issuer_name_hash = sha1_hash(issuer_name_der);
@@ -694,11 +684,7 @@ fn build_ocsp_request(
 }
 
 /// Build a DER-encoded CertID structure.
-fn build_cert_id(
-    issuer_name_hash: &[u8],
-    issuer_key_hash: &[u8],
-    serial_number: &[u8],
-) -> Vec<u8> {
+fn build_cert_id(issuer_name_hash: &[u8], issuer_key_hash: &[u8], serial_number: &[u8]) -> Vec<u8> {
     // AlgorithmIdentifier for SHA-1:
     // SEQUENCE { OID sha1, NULL }
     let sha1_null = der_wrap(0x05, &[]); // NULL
@@ -762,29 +748,28 @@ async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
         .body(request_der.to_vec())
         .send()
         .await
-        .map_err(|e| CertError::OcspFailed(format!(
-            "OCSP HTTP request to {url} failed: {e}"
-        )))?;
+        .map_err(|e| CertError::OcspFailed(format!("OCSP HTTP request to {url} failed: {e}")))?;
 
     if !response.status().is_success() {
         return Err(CertError::OcspFailed(format!(
-            "OCSP responder returned HTTP {}", response.status()
-        )).into());
+            "OCSP responder returned HTTP {}",
+            response.status()
+        ))
+        .into());
     }
 
     let body = response
         .bytes()
         .await
-        .map_err(|e| CertError::OcspFailed(format!(
-            "failed to read OCSP response body: {e}"
-        )))?;
+        .map_err(|e| CertError::OcspFailed(format!("failed to read OCSP response body: {e}")))?;
 
     if body.len() > MAX_OCSP_RESPONSE_SIZE {
         return Err(CertError::OcspFailed(format!(
             "OCSP response too large: {} bytes (max {})",
             body.len(),
             MAX_OCSP_RESPONSE_SIZE
-        )).into());
+        ))
+        .into());
     }
 
     Ok(body.to_vec())
@@ -838,20 +823,18 @@ fn parse_ocsp_response_raw(data: &[u8]) -> Result<OcspResponse> {
     let (_, outer) = parse_der(data)
         .map_err(|e| CertError::OcspFailed(format!("failed to parse OCSP response DER: {e}")))?;
 
-    let outer_seq = outer.as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "OCSP response is not a SEQUENCE: {e}"
-        )))?;
+    let outer_seq = outer
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("OCSP response is not a SEQUENCE: {e}")))?;
 
     if outer_seq.is_empty() {
         return Err(CertError::OcspFailed("OCSP response SEQUENCE is empty".into()).into());
     }
 
     // responseStatus: ENUMERATED
-    let response_status = outer_seq[0].as_u32()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "failed to parse responseStatus: {e}"
-        )))?;
+    let response_status = outer_seq[0]
+        .as_u32()
+        .map_err(|e| CertError::OcspFailed(format!("failed to parse responseStatus: {e}")))?;
 
     if response_status != OCSP_RESPONSE_STATUS_SUCCESSFUL as u32 {
         return Ok(OcspResponse {
@@ -865,41 +848,36 @@ fn parse_ocsp_response_raw(data: &[u8]) -> Result<OcspResponse> {
     }
 
     if outer_seq.len() < 2 {
-        return Err(CertError::OcspFailed(
-            "successful OCSP response missing responseBytes".into(),
-        ).into());
+        return Err(
+            CertError::OcspFailed("successful OCSP response missing responseBytes".into()).into(),
+        );
     }
 
     // responseBytes: [0] EXPLICIT ResponseBytes
     // The context-tagged [0] wraps a SEQUENCE { OID, OCTET STRING }.
     let response_bytes_wrapper = &outer_seq[1];
-    let response_bytes_content = get_context_content(response_bytes_wrapper)
-        .ok_or_else(|| CertError::OcspFailed(
-            "failed to unwrap responseBytes context tag".into()
-        ))?;
+    let response_bytes_content = get_context_content(response_bytes_wrapper).ok_or_else(|| {
+        CertError::OcspFailed("failed to unwrap responseBytes context tag".into())
+    })?;
 
     let (_, resp_bytes_der) = parse_der(response_bytes_content)
-        .map_err(|e| CertError::OcspFailed(format!(
-            "failed to parse ResponseBytes: {e}"
-        )))?;
+        .map_err(|e| CertError::OcspFailed(format!("failed to parse ResponseBytes: {e}")))?;
 
-    let resp_bytes_seq = resp_bytes_der.as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "ResponseBytes is not a SEQUENCE: {e}"
-        )))?;
+    let resp_bytes_seq = resp_bytes_der
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("ResponseBytes is not a SEQUENCE: {e}")))?;
 
     if resp_bytes_seq.len() < 2 {
-        return Err(CertError::OcspFailed(
-            "ResponseBytes SEQUENCE too short".into(),
-        ).into());
+        return Err(CertError::OcspFailed("ResponseBytes SEQUENCE too short".into()).into());
     }
 
     // resp_bytes_seq[0] is the responseType OID (should be id-pkix-ocsp-basic).
     // resp_bytes_seq[1] is the OCTET STRING containing BasicOCSPResponse.
-    let basic_resp_der = resp_bytes_seq[1].as_slice()
-        .map_err(|e| CertError::OcspFailed(format!(
+    let basic_resp_der = resp_bytes_seq[1].as_slice().map_err(|e| {
+        CertError::OcspFailed(format!(
             "failed to extract BasicOCSPResponse OCTET STRING: {e}"
-        )))?;
+        ))
+    })?;
 
     parse_basic_ocsp_response(basic_resp_der, data)
 }
@@ -909,26 +887,20 @@ fn parse_basic_ocsp_response(data: &[u8], raw: &[u8]) -> Result<OcspResponse> {
     use x509_parser::der_parser::parse_der;
 
     let (_, basic) = parse_der(data)
-        .map_err(|e| CertError::OcspFailed(format!(
-            "failed to parse BasicOCSPResponse: {e}"
-        )))?;
+        .map_err(|e| CertError::OcspFailed(format!("failed to parse BasicOCSPResponse: {e}")))?;
 
-    let basic_seq = basic.as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "BasicOCSPResponse is not a SEQUENCE: {e}"
-        )))?;
+    let basic_seq = basic
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("BasicOCSPResponse is not a SEQUENCE: {e}")))?;
 
     if basic_seq.is_empty() {
-        return Err(CertError::OcspFailed(
-            "BasicOCSPResponse SEQUENCE is empty".into(),
-        ).into());
+        return Err(CertError::OcspFailed("BasicOCSPResponse SEQUENCE is empty".into()).into());
     }
 
     // tbsResponseData is the first element.
-    let tbs = basic_seq[0].as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "tbsResponseData is not a SEQUENCE: {e}"
-        )))?;
+    let tbs = basic_seq[0]
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("tbsResponseData is not a SEQUENCE: {e}")))?;
 
     parse_tbs_response_data(tbs, raw)
 }
@@ -965,8 +937,7 @@ fn parse_tbs_response_data(
     if idx >= tbs.len() {
         return Err(CertError::OcspFailed("ResponseData missing producedAt".into()).into());
     }
-    let produced_at = parse_generalized_time_from_obj(&tbs[idx])
-        .unwrap_or_else(|| Utc::now());
+    let produced_at = parse_generalized_time_from_obj(&tbs[idx]).unwrap_or_else(|| Utc::now());
     idx += 1;
 
     // responses: SEQUENCE OF SingleResponse
@@ -974,15 +945,15 @@ fn parse_tbs_response_data(
         return Err(CertError::OcspFailed("ResponseData missing responses".into()).into());
     }
 
-    let responses = tbs[idx].as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "responses is not a SEQUENCE: {e}"
-        )))?;
+    let responses = tbs[idx]
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("responses is not a SEQUENCE: {e}")))?;
 
     if responses.is_empty() {
         return Err(CertError::OcspFailed(
             "OCSP response contains no SingleResponse entries".into(),
-        ).into());
+        )
+        .into());
     }
 
     // Parse the first SingleResponse (we only need one).
@@ -1003,15 +974,15 @@ fn parse_single_response(
     raw: &[u8],
     produced_at: DateTime<Utc>,
 ) -> Result<OcspResponse> {
-    let seq = obj.as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!(
-            "SingleResponse is not a SEQUENCE: {e}"
-        )))?;
+    let seq = obj
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("SingleResponse is not a SEQUENCE: {e}")))?;
 
     if seq.len() < 3 {
         return Err(CertError::OcspFailed(
             "SingleResponse SEQUENCE too short (need certID, certStatus, thisUpdate)".into(),
-        ).into());
+        )
+        .into());
     }
 
     // seq[0] = certID (skip)
@@ -1065,22 +1036,21 @@ fn parse_cert_status(
 
     if tag.0 == CERT_STATUS_REVOKED as u32 {
         // Try to extract revocation time from the content.
-        let revoked_at = get_context_content(obj)
-            .and_then(|bytes| {
-                // The content is a RevokedInfo SEQUENCE.
-                // First field is GeneralizedTime.
-                x509_parser::der_parser::parse_der(bytes)
-                    .ok()
-                    .and_then(|(_, inner)| {
-                        inner.as_sequence().ok().and_then(|seq| {
-                            if seq.is_empty() {
-                                None
-                            } else {
-                                parse_generalized_time_from_obj(&seq[0])
-                            }
-                        })
+        let revoked_at = get_context_content(obj).and_then(|bytes| {
+            // The content is a RevokedInfo SEQUENCE.
+            // First field is GeneralizedTime.
+            x509_parser::der_parser::parse_der(bytes)
+                .ok()
+                .and_then(|(_, inner)| {
+                    inner.as_sequence().ok().and_then(|seq| {
+                        if seq.is_empty() {
+                            None
+                        } else {
+                            parse_generalized_time_from_obj(&seq[0])
+                        }
                     })
-            });
+                })
+        });
         return Ok((OcspStatus::Revoked, revoked_at));
     }
 
@@ -1129,12 +1099,13 @@ fn sha1_hash(data: &[u8]) -> Vec<u8> {
 fn is_context_tagged(obj: &x509_parser::der_parser::ber::BerObject<'_>, tag_num: u32) -> bool {
     let tag = obj.header.tag();
     let class = obj.header.class();
-    class == x509_parser::asn1_rs::Class::ContextSpecific
-        && tag.0 == tag_num
+    class == x509_parser::asn1_rs::Class::ContextSpecific && tag.0 == tag_num
 }
 
 /// Extract the raw content bytes from a context-tagged BER object.
-fn get_context_content<'a>(obj: &'a x509_parser::der_parser::ber::BerObject<'a>) -> Option<&'a [u8]> {
+fn get_context_content<'a>(
+    obj: &'a x509_parser::der_parser::ber::BerObject<'a>,
+) -> Option<&'a [u8]> {
     obj.content.as_slice().ok()
 }
 
@@ -1187,8 +1158,7 @@ fn parse_time_string(bytes: &[u8]) -> Option<DateTime<Utc>> {
         let sec: u32 = s[12..14].parse().ok()?;
 
         use chrono::NaiveDate;
-        let naive = NaiveDate::from_ymd_opt(year, month, day)?
-            .and_hms_opt(hour, min, sec)?;
+        let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
         Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
     } else if s.len() >= 12 {
         // UTCTime: YYMMDDHHMMSS
@@ -1201,8 +1171,7 @@ fn parse_time_string(bytes: &[u8]) -> Option<DateTime<Utc>> {
         let sec: u32 = s[10..12].parse().ok()?;
 
         use chrono::NaiveDate;
-        let naive = NaiveDate::from_ymd_opt(year, month, day)?
-            .and_hms_opt(hour, min, sec)?;
+        let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
         Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
     } else {
         None

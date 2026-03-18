@@ -2,13 +2,11 @@
 //!
 //! This module provides two issuer implementations for ZeroSSL:
 //!
-//! - [`ZeroSslIssuer`] — uses ZeroSSL's ACME endpoint with automatic EAB
-//!   provisioning (recommended for most use cases).
-//! - [`ZeroSslApiIssuer`] — uses ZeroSSL's REST API directly (not ACME).
-//!   This is useful when ACME challenges are not practical, as it supports
-//!   email-based domain validation. Note that REST API access may be
-//!   restricted by payment tier.
-//!
+//! - [`ZeroSslIssuer`] — uses ZeroSSL's ACME endpoint with automatic EAB provisioning (recommended
+//!   for most use cases).
+//! - [`ZeroSslApiIssuer`] — uses ZeroSSL's REST API directly (not ACME). This is useful when ACME
+//!   challenges are not practical, as it supports email-based domain validation. Note that REST API
+//!   access may be restricted by payment tier.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +17,7 @@ use tracing::{debug, info, warn};
 
 use crate::acme_client::{ExternalAccountBinding, ZEROSSL_PRODUCTION};
 use crate::acme_issuer::{AcmeIssuer, CertIssuer, ChainPreference, IssuedCertificate, Revoker};
-use crate::crypto::{encode_private_key_pem, generate_csr, generate_private_key, KeyType};
+use crate::crypto::{KeyType, encode_private_key_pem, generate_csr, generate_private_key};
 use crate::error::{Error, Result};
 use crate::solvers::Solver;
 use crate::storage::Storage;
@@ -185,16 +183,16 @@ async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> 
         )));
     }
 
-    let kid = eab_resp.eab_kid.ok_or_else(|| {
-        Error::Other("ZeroSSL EAB response missing eab_kid".to_owned())
-    })?;
-    let hmac_key_b64 = eab_resp.eab_hmac_key.ok_or_else(|| {
-        Error::Other("ZeroSSL EAB response missing eab_hmac_key".to_owned())
-    })?;
+    let kid = eab_resp
+        .eab_kid
+        .ok_or_else(|| Error::Other("ZeroSSL EAB response missing eab_kid".to_owned()))?;
+    let hmac_key_b64 = eab_resp
+        .eab_hmac_key
+        .ok_or_else(|| Error::Other("ZeroSSL EAB response missing eab_hmac_key".to_owned()))?;
 
     // The HMAC key from ZeroSSL is Base64URL-encoded.
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     let hmac_key = URL_SAFE_NO_PAD
         .decode(&hmac_key_b64)
@@ -311,9 +309,9 @@ impl ZeroSslIssuerBuilder {
             !self.api_key.is_empty(),
             "ZeroSslIssuer requires an API key — call .api_key() on the builder"
         );
-        let storage = self
-            .storage
-            .expect("ZeroSslIssuer requires a Storage implementation — call .storage() on the builder");
+        let storage = self.storage.expect(
+            "ZeroSslIssuer requires a Storage implementation — call .storage() on the builder",
+        );
 
         // Fetch EAB credentials from ZeroSSL.
         let eab = fetch_eab_credentials(&self.api_key).await?;
@@ -410,8 +408,7 @@ mod tests {
 
     #[test]
     fn test_builder_creation() {
-        let builder = ZeroSslIssuer::builder()
-            .api_key("test_key");
+        let builder = ZeroSslIssuer::builder().api_key("test_key");
         assert_eq!(builder.api_key, "test_key");
         assert!(builder.storage.is_none());
         assert!(builder.email.is_none());
@@ -566,11 +563,10 @@ struct ZeroSslDownloadResponse {
 /// # Limitations
 ///
 /// - REST API access may be restricted by ZeroSSL payment tier.
-/// - Only email-based validation is implemented. For HTTP or CNAME validation,
-///   use [`ZeroSslIssuer`] (the ACME-based issuer) instead.
-/// - Revocation requires the certificate ID from ZeroSSL. This issuer stores
-///   the certificate ID in the [`IssuedCertificate::metadata`] field so it can
-///   be retrieved later for revocation.
+/// - Only email-based validation is implemented. For HTTP or CNAME validation, use
+///   [`ZeroSslIssuer`] (the ACME-based issuer) instead.
+/// - Revocation requires the certificate ID from ZeroSSL. This issuer stores the certificate ID in
+///   the [`IssuedCertificate::metadata`] field so it can be retrieved later for revocation.
 ///
 /// # Example
 ///
@@ -658,7 +654,10 @@ impl ZeroSslApiIssuer {
         csr_pem: &str,
         domains: &[String],
     ) -> Result<ZeroSslCertResponse> {
-        let url = format!("{ZEROSSL_API_BASE}/certificates?access_key={}", self.api_key);
+        let url = format!(
+            "{ZEROSSL_API_BASE}/certificates?access_key={}",
+            self.api_key
+        );
         let domains_csv = domains.join(",");
 
         debug!(domains = %domains_csv, "creating ZeroSSL certificate via REST API");
@@ -669,16 +668,11 @@ impl ZeroSslApiIssuer {
             .form(&[
                 ("certificate_domains", domains_csv.as_str()),
                 ("certificate_csr", csr_pem),
-                (
-                    "certificate_validity_days",
-                    &self.validity_days.to_string(),
-                ),
+                ("certificate_validity_days", &self.validity_days.to_string()),
             ])
             .send()
             .await
-            .map_err(|e| {
-                Error::Other(format!("failed to create ZeroSSL certificate: {e}"))
-            })?;
+            .map_err(|e| Error::Other(format!("failed to create ZeroSSL certificate: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -723,7 +717,10 @@ impl ZeroSslApiIssuer {
             self.api_key
         );
 
-        debug!(cert_id = cert_id, "initiating email validation for ZeroSSL certificate");
+        debug!(
+            cert_id = cert_id,
+            "initiating email validation for ZeroSSL certificate"
+        );
 
         let client = reqwest::Client::new();
         let resp = client
@@ -732,9 +729,7 @@ impl ZeroSslApiIssuer {
             .send()
             .await
             .map_err(|e| {
-                Error::Other(format!(
-                    "failed to initiate ZeroSSL email validation: {e}"
-                ))
+                Error::Other(format!("failed to initiate ZeroSSL email validation: {e}"))
             })?;
 
         let status = resp.status();
@@ -748,7 +743,10 @@ impl ZeroSslApiIssuer {
             )));
         }
 
-        info!(cert_id = cert_id, "initiated email validation for ZeroSSL certificate");
+        info!(
+            cert_id = cert_id,
+            "initiated email validation for ZeroSSL certificate"
+        );
         Ok(())
     }
 
@@ -773,15 +771,9 @@ impl ZeroSslApiIssuer {
                 "polling ZeroSSL certificate status"
             );
 
-            let resp = client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| {
-                    Error::Other(format!(
-                        "failed to poll ZeroSSL certificate status: {e}"
-                    ))
-                })?;
+            let resp = client.get(&url).send().await.map_err(|e| {
+                Error::Other(format!("failed to poll ZeroSSL certificate status: {e}"))
+            })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -799,9 +791,7 @@ impl ZeroSslApiIssuer {
             }
 
             let cert_resp: ZeroSslCertResponse = resp.json().await.map_err(|e| {
-                Error::Other(format!(
-                    "failed to parse ZeroSSL status response: {e}"
-                ))
+                Error::Other(format!("failed to parse ZeroSSL status response: {e}"))
             })?;
 
             match cert_resp.status.as_str() {
@@ -843,11 +833,8 @@ impl ZeroSslApiIssuer {
         debug!(cert_id = cert_id, "downloading ZeroSSL certificate");
 
         let client = reqwest::Client::new();
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
+        let resp =
+            client.get(&url).send().await.map_err(|e| {
                 Error::Other(format!("failed to download ZeroSSL certificate: {e}"))
             })?;
 
@@ -862,11 +849,10 @@ impl ZeroSslApiIssuer {
             )));
         }
 
-        let download: ZeroSslDownloadResponse = resp.json().await.map_err(|e| {
-            Error::Other(format!(
-                "failed to parse ZeroSSL download response: {e}"
-            ))
-        })?;
+        let download: ZeroSslDownloadResponse = resp
+            .json()
+            .await
+            .map_err(|e| Error::Other(format!("failed to parse ZeroSSL download response: {e}")))?;
 
         // Concatenate the leaf certificate and CA bundle into a single PEM chain.
         let full_chain = format!("{}{}", download.certificate_crt, download.ca_bundle_crt);
@@ -885,17 +871,14 @@ impl CertIssuer for ZeroSslApiIssuer {
     /// Issue a certificate using ZeroSSL's REST API.
     ///
     /// The flow is:
-    /// 1. Generate a private key and CSR (if `csr_der` is empty) or use the
-    ///    provided CSR.
+    /// 1. Generate a private key and CSR (if `csr_der` is empty) or use the provided CSR.
     /// 2. Create the certificate via the ZeroSSL API.
     /// 3. Initiate email-based domain validation.
     /// 4. Poll until the certificate is issued.
     /// 5. Download and return the certificate chain.
     async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
         if domains.is_empty() {
-            return Err(Error::Other(
-                "at least one domain is required".to_owned(),
-            ));
+            return Err(Error::Other("at least one domain is required".to_owned()));
         }
 
         // Generate a key + CSR if none was provided.
@@ -999,9 +982,7 @@ impl Revoker for ZeroSslApiIssuer {
             .form(&[("reason", reason_str.as_str())])
             .send()
             .await
-            .map_err(|e| {
-                Error::Other(format!("failed to revoke ZeroSSL certificate: {e}"))
-            })?;
+            .map_err(|e| Error::Other(format!("failed to revoke ZeroSSL certificate: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {

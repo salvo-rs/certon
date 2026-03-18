@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::crypto::{
-    decode_private_key_pem, encode_private_key_pem, generate_private_key, KeyType,
+    KeyType, decode_private_key_pem, encode_private_key_pem, generate_private_key,
 };
 use crate::error::{AcmeError, Result, StorageError};
-use crate::storage::{account_key_prefix, safe_key, Storage};
+use crate::storage::{Storage, account_key_prefix, safe_key};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -143,7 +143,11 @@ fn storage_key_user_reg(issuer_key: &str, email: &str) -> String {
     } else {
         safe_key(username)
     };
-    format!("{}/{}.json", account_key_prefix(issuer_key, &email), filename)
+    format!(
+        "{}/{}.json",
+        account_key_prefix(issuer_key, &email),
+        filename
+    )
 }
 
 /// Return the storage key for the account private key PEM.
@@ -157,7 +161,11 @@ fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
     } else {
         safe_key(username)
     };
-    format!("{}/{}.key", account_key_prefix(issuer_key, &email), filename)
+    format!(
+        "{}/{}.key",
+        account_key_prefix(issuer_key, &email),
+        filename
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -197,14 +205,12 @@ pub async fn get_account(
     })?;
 
     // Decode and attach the private key PEM.
-    let pem_str = String::from_utf8(key_bytes).map_err(|e| {
-        AcmeError::Account(format!("account private key is not valid UTF-8: {e}"))
-    })?;
+    let pem_str = String::from_utf8(key_bytes)
+        .map_err(|e| AcmeError::Account(format!("account private key is not valid UTF-8: {e}")))?;
 
     // Validate that the PEM can actually be decoded.
-    let private_key = decode_private_key_pem(&pem_str).map_err(|e| {
-        AcmeError::Account(format!("could not decode account's private key: {e}"))
-    })?;
+    let private_key = decode_private_key_pem(&pem_str)
+        .map_err(|e| AcmeError::Account(format!("could not decode account's private key: {e}")))?;
 
     account.private_key_pem = pem_str;
     account.key_type = private_key.key_type();
@@ -400,11 +406,7 @@ pub async fn most_recent_account_email(
 
         // Extract the email component from the key path -- it is the last
         // segment of the entry key (which is a directory name under users/).
-        let email_part = entry
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let email_part = entry.rsplit('/').next().unwrap_or("").to_string();
 
         // Skip the "default" placeholder (represents an account with no email).
         if email_part == "default" || email_part.is_empty() {
@@ -445,11 +447,7 @@ pub async fn get_account_by_key(
 
     for entry in &entries {
         // Each entry is a directory named after the email.
-        let email_part = entry
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let email_part = entry.rsplit('/').next().unwrap_or("").to_string();
 
         if email_part.is_empty() {
             continue;
@@ -474,10 +472,7 @@ pub async fn get_account_by_key(
 /// Checks [`most_recent_account_email`] and returns the email if found.
 /// This is a convenience wrapper for use in flows that need to discover
 /// the email associated with a previously-registered account.
-pub async fn discover_email(
-    storage: &dyn Storage,
-    ca_url: &str,
-) -> Option<String> {
+pub async fn discover_email(storage: &dyn Storage, ca_url: &str) -> Option<String> {
     most_recent_account_email(storage, ca_url)
         .await
         .ok()
@@ -579,7 +574,10 @@ mod tests {
 
     #[test]
     fn normalise_strips_mailto() {
-        assert_eq!(normalise_email("mailto:user@example.com"), "user@example.com");
+        assert_eq!(
+            normalise_email("mailto:user@example.com"),
+            "user@example.com"
+        );
     }
 
     #[test]

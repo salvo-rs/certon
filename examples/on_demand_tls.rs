@@ -17,9 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use certon::{
-    CertResolver, Config, FileStorage, OnDemandConfig, Result, Storage,
-};
+use certon::{CertResolver, Config, FileStorage, OnDemandConfig, Result, Storage};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,10 +83,7 @@ async fn main() -> Result<()> {
         obtain_func: None, // Will be wired up below
     });
 
-    let resolver = CertResolver::with_on_demand(
-        config.cache.clone(),
-        on_demand_for_resolver,
-    );
+    let resolver = CertResolver::with_on_demand(config.cache.clone(), on_demand_for_resolver);
 
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()

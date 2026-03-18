@@ -25,11 +25,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rcgen::{
-    CertificateParams, CustomExtension, KeyPair as RcgenKeyPair, PKCS_ECDSA_P256_SHA256,
-};
+use rcgen::{CertificateParams, CustomExtension, KeyPair as RcgenKeyPair, PKCS_ECDSA_P256_SHA256};
 use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,11 +37,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use crate::dns_util::{
-    challenge_record_name, challenge_record_value, check_dns_propagation, from_fqdn,
-    find_zone_by_fqdn, DEFAULT_PROPAGATION_INTERVAL, DEFAULT_PROPAGATION_TIMEOUT,
+    DEFAULT_PROPAGATION_INTERVAL, DEFAULT_PROPAGATION_TIMEOUT, challenge_record_name,
+    challenge_record_value, check_dns_propagation, find_zone_by_fqdn, from_fqdn,
 };
 use crate::error::{Error, Result};
-use crate::storage::{safe_key, Storage};
+use crate::storage::{Storage, safe_key};
 
 // ---------------------------------------------------------------------------
 // Active challenges global tracking
@@ -102,8 +100,7 @@ async fn unregister_active_challenge(identifier: &str) {
 /// The typical call sequence during certificate issuance is:
 ///
 /// 1. [`Solver::present`] -- make the challenge solvable.
-/// 2. [`Solver::wait`] -- optionally block until the challenge is ready
-///    (e.g. DNS propagation).
+/// 2. [`Solver::wait`] -- optionally block until the challenge is ready (e.g. DNS propagation).
 /// 3. *(ACME CA validates the challenge)*
 /// 4. [`Solver::cleanup`] -- remove the challenge artifacts.
 #[async_trait]
@@ -320,11 +317,7 @@ impl Http01Solver {
                     };
 
                     // Wrap the handler in a 10-second timeout.
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        handler,
-                    )
-                    .await;
+                    let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
                 });
             }
         });
@@ -410,7 +403,8 @@ const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 pub struct TlsAlpn01Solver {
     /// In-memory map of domain -> (cert chain DER, private key DER) for
     /// currently active challenges.
-    challenges: Arc<RwLock<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>>>,
+    challenges:
+        Arc<RwLock<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>>>,
     /// The port to listen on (default: 443).
     pub port: u16,
     /// Handle to the background TLS server task, if running.
@@ -435,8 +429,8 @@ impl TlsAlpn01Solver {
     ///
     /// The certificate contains:
     /// - A single SAN matching `domain`
-    /// - The `acmeIdentifier` extension (OID 1.3.6.1.5.5.7.1.31) containing
-    ///   the DER-encoded ASN.1 value: `OCTET STRING { SHA-256(key_auth) }`
+    /// - The `acmeIdentifier` extension (OID 1.3.6.1.5.5.7.1.31) containing the DER-encoded ASN.1
+    ///   value: `OCTET STRING { SHA-256(key_auth) }`
     /// - Marked as critical per RFC 8737
     fn generate_challenge_cert(
         domain: &str,
@@ -444,26 +438,22 @@ impl TlsAlpn01Solver {
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         // Generate an ephemeral ECDSA P-256 key for the challenge certificate.
         let rng = SystemRandom::new();
-        let pkcs8_doc =
-            EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).map_err(|e| {
+        let pkcs8_doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+            .map_err(|e| {
                 Error::Other(format!(
                     "failed to generate ephemeral key for TLS-ALPN-01: {e}"
                 ))
             })?;
         let pkcs8_bytes = pkcs8_doc.as_ref().to_vec();
 
-        let key_pair =
-            RcgenKeyPair::from_pkcs8_der_and_sign_algo(
-                &PrivatePkcs8KeyDer::from(pkcs8_bytes.clone()),
-                &PKCS_ECDSA_P256_SHA256,
-            )
-            .map_err(|e| {
-                Error::Other(format!("failed to create rcgen key pair: {e}"))
-            })?;
+        let key_pair = RcgenKeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(pkcs8_bytes.clone()),
+            &PKCS_ECDSA_P256_SHA256,
+        )
+        .map_err(|e| Error::Other(format!("failed to create rcgen key pair: {e}")))?;
 
-        let mut params = CertificateParams::new(vec![domain.to_string()]).map_err(|e| {
-            Error::Other(format!("failed to create certificate params: {e}"))
-        })?;
+        let mut params = CertificateParams::new(vec![domain.to_string()])
+            .map_err(|e| Error::Other(format!("failed to create certificate params: {e}")))?;
 
         // Compute SHA-256(key_auth) for the acmeIdentifier extension value.
         let digest = Sha256::digest(key_auth.as_bytes());
@@ -649,8 +639,7 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
 
         let (certs, key_der) = self.challenges.get(sni)?;
 
-        let signing_key =
-            rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
 
         Some(Arc::new(rustls::sign::CertifiedKey::new(
             certs.clone(),
@@ -677,8 +666,7 @@ pub trait DnsProvider: Send + Sync {
     /// Create (or append) a TXT record in the given DNS zone.
     ///
     /// - `zone`: the DNS zone (e.g. `"example.com."`)
-    /// - `name`: the relative record name within the zone (e.g.
-    ///   `"_acme-challenge"`)
+    /// - `name`: the relative record name within the zone (e.g. `"_acme-challenge"`)
     /// - `value`: the TXT record value
     /// - `ttl`: the record TTL in seconds
     async fn set_record(&self, zone: &str, name: &str, value: &str, ttl: u32) -> Result<()>;
@@ -785,7 +773,10 @@ impl std::fmt::Debug for Dns01Solver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dns01Solver")
             .field("propagation_timeout", &self.propagation_timeout)
-            .field("propagation_check_interval", &self.propagation_check_interval)
+            .field(
+                "propagation_check_interval",
+                &self.propagation_check_interval,
+            )
             .field("propagation_delay", &self.propagation_delay)
             .field("ttl", &self.ttl)
             .field("override_domain", &self.override_domain)
@@ -801,11 +792,8 @@ impl Solver for Dns01Solver {
         let txt_value = challenge_record_value(key_auth);
 
         // Determine the zone for this domain.
-        let zone = find_zone_by_fqdn(&dns_name).ok_or_else(|| {
-            Error::Other(format!(
-                "could not determine DNS zone for {dns_name}"
-            ))
-        })?;
+        let zone = find_zone_by_fqdn(&dns_name)
+            .ok_or_else(|| Error::Other(format!("could not determine DNS zone for {dns_name}")))?;
 
         // Compute the relative record name within the zone.
         let dns_name_fqdn = if dns_name.ends_with('.') {
@@ -916,7 +904,6 @@ impl Solver for Dns01Solver {
 ///
 /// During cleanup, the challenge data is removed from storage and the inner
 /// solver's cleanup method is also called.
-///
 pub struct DistributedSolver {
     /// The underlying solver that actually presents the challenge.
     inner: Box<dyn Solver>,
@@ -946,11 +933,7 @@ impl DistributedSolver {
     ///
     /// The prefix is prepended to the challenge tokens storage path, e.g.
     /// `"<prefix>/challenge_tokens/<domain>/<token>.json"`.
-    pub fn with_prefix(
-        inner: Box<dyn Solver>,
-        storage: Arc<dyn Storage>,
-        prefix: String,
-    ) -> Self {
+    pub fn with_prefix(inner: Box<dyn Solver>, storage: Arc<dyn Storage>, prefix: String) -> Self {
         Self {
             inner,
             storage,
@@ -1059,8 +1042,9 @@ impl Solver for DistributedSolver {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
 
     // -- challenge_tokens_key -----------------------------------------------
 
@@ -1109,11 +1093,8 @@ mod tests {
     fn tls_alpn01_generate_challenge_cert() {
         // Verify that generating a challenge cert succeeds and produces valid
         // output.
-        let (certs, key) = TlsAlpn01Solver::generate_challenge_cert(
-            "example.com",
-            "token.thumbprint",
-        )
-        .unwrap();
+        let (certs, key) =
+            TlsAlpn01Solver::generate_challenge_cert("example.com", "token.thumbprint").unwrap();
         assert_eq!(certs.len(), 1);
         assert!(!certs[0].as_ref().is_empty());
         match &key {
@@ -1154,12 +1135,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_record(
-            &self,
-            _zone: &str,
-            _name: &str,
-            _value: &str,
-        ) -> Result<()> {
+        async fn delete_record(&self, _zone: &str, _name: &str, _value: &str) -> Result<()> {
             self.delete_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1232,21 +1208,10 @@ mod tests {
 
     #[async_trait]
     impl DnsProvider for MockDnsProviderWrapper {
-        async fn set_record(
-            &self,
-            zone: &str,
-            name: &str,
-            value: &str,
-            ttl: u32,
-        ) -> Result<()> {
+        async fn set_record(&self, zone: &str, name: &str, value: &str, ttl: u32) -> Result<()> {
             self.0.set_record(zone, name, value, ttl).await
         }
-        async fn delete_record(
-            &self,
-            zone: &str,
-            name: &str,
-            value: &str,
-        ) -> Result<()> {
+        async fn delete_record(&self, zone: &str, name: &str, value: &str) -> Result<()> {
             self.0.delete_record(zone, name, value).await
         }
     }

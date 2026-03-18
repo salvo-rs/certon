@@ -7,16 +7,14 @@
 //!
 //! # Key concepts
 //!
-//! - **Renewal window**: a certificate is considered due for renewal when the
-//!   remaining fraction of its total lifetime drops below a configurable ratio
-//!   (default [`DEFAULT_RENEWAL_WINDOW_RATIO`] = 1/3). An emergency renewal is
-//!   also triggered when fewer than 24 hours remain.
-//! - **Subject qualification**: helper functions such as
-//!   [`subject_qualifies_for_cert`] and [`subject_qualifies_for_public_cert`]
-//!   validate domain names before attempting certificate issuance, catching
-//!   common typos and misconfigurations early.
-//! - **Wildcard matching**: [`match_wildcard`] implements RFC 6125 / RFC 2818
-//!   wildcard rules for certificate lookups.
+//! - **Renewal window**: a certificate is considered due for renewal when the remaining fraction of
+//!   its total lifetime drops below a configurable ratio (default [`DEFAULT_RENEWAL_WINDOW_RATIO`]
+//!   = 1/3). An emergency renewal is also triggered when fewer than 24 hours remain.
+//! - **Subject qualification**: helper functions such as [`subject_qualifies_for_cert`] and
+//!   [`subject_qualifies_for_public_cert`] validate domain names before attempting certificate
+//!   issuance, catching common typos and misconfigurations early.
+//! - **Wildcard matching**: [`match_wildcard`] implements RFC 6125 / RFC 2818 wildcard rules for
+//!   certificate lookups.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -167,12 +165,10 @@ impl Certificate {
     /// Returns `true` if the certificate needs to be renewed.
     ///
     /// The decision is based on:
-    /// 1. Whether the current time falls within the renewal window determined
-    ///    by `renewal_window_ratio` (fraction of lifetime that should remain
-    ///    when renewal starts). Pass `0.0` to use
-    ///    [`DEFAULT_RENEWAL_WINDOW_RATIO`].
-    /// 2. Whether fewer than 24 hours remain before expiration (emergency
-    ///    renewal).
+    /// 1. Whether the current time falls within the renewal window determined by
+    ///    `renewal_window_ratio` (fraction of lifetime that should remain when renewal starts).
+    ///    Pass `0.0` to use [`DEFAULT_RENEWAL_WINDOW_RATIO`].
+    /// 2. Whether fewer than 24 hours remain before expiration (emergency renewal).
     /// 3. Whether the certificate is already expired.
     pub fn needs_renewal(&self, renewal_window_ratio: f64) -> bool {
         // If already expired, definitely needs renewal.
@@ -247,15 +243,19 @@ impl Certificate {
     /// Returns an error if the PEM data is malformed, contains no
     /// certificates, or the leaf certificate cannot be parsed.
     pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
-        let cert_pem_str = std::str::from_utf8(cert_pem)
-            .map_err(|e| CryptoError::InvalidCertificate(format!("cert PEM is not valid UTF-8: {e}")))?;
+        let cert_pem_str = std::str::from_utf8(cert_pem).map_err(|e| {
+            CryptoError::InvalidCertificate(format!("cert PEM is not valid UTF-8: {e}"))
+        })?;
         let key_pem_str = std::str::from_utf8(key_pem)
             .map_err(|e| CryptoError::InvalidKey(format!("key PEM is not valid UTF-8: {e}")))?;
 
         // Parse certificate chain from PEM.
         let cert_ders = parse_cert_chain_from_pem(cert_pem_str)?;
         if cert_ders.is_empty() {
-            return Err(CryptoError::InvalidCertificate("no certificates found in PEM data".into()).into());
+            return Err(CryptoError::InvalidCertificate(
+                "no certificates found in PEM data".into(),
+            )
+            .into());
         }
 
         // Parse the private key from PEM.
@@ -263,8 +263,9 @@ impl Certificate {
 
         // Parse the leaf certificate to extract metadata.
         let leaf_der = cert_ders[0].as_ref();
-        let (_, leaf) = X509Certificate::from_der(leaf_der)
-            .map_err(|e| CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}")))?;
+        let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
+            CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}"))
+        })?;
 
         // Extract subject names (CN + SANs).
         let names = extract_names(&leaf)?;
@@ -348,12 +349,15 @@ impl Certificate {
         private_key: Option<PrivateKeyDer<'static>>,
     ) -> Result<Self> {
         if cert_chain.is_empty() {
-            return Err(CryptoError::InvalidCertificate("certificate chain is empty".into()).into());
+            return Err(
+                CryptoError::InvalidCertificate("certificate chain is empty".into()).into(),
+            );
         }
 
         let leaf_der = cert_chain[0].as_ref();
-        let (_, leaf) = X509Certificate::from_der(leaf_der)
-            .map_err(|e| CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}")))?;
+        let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
+            CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}"))
+        })?;
 
         let names = extract_names(&leaf)?;
         let not_before = asn1_time_to_chrono(leaf.validity().not_before)?;
@@ -530,9 +534,7 @@ pub fn currently_in_renewal_window(
 /// second.
 fn expires_at(not_after: DateTime<Utc>) -> DateTime<Utc> {
     // Truncate sub-second precision, then add 1 second.
-    let truncated = not_after
-        .with_nanosecond(0)
-        .unwrap_or(not_after);
+    let truncated = not_after.with_nanosecond(0).unwrap_or(not_after);
     truncated + ChronoDuration::seconds(1)
 }
 
@@ -546,10 +548,8 @@ fn expires_at(not_after: DateTime<Utc>) -> DateTime<Utc> {
 /// Requirements:
 /// - Must not be empty.
 /// - Must not start or end with a dot.
-/// - If it contains a wildcard `*`, it must be a left-most label (`*.` prefix)
-///   or exactly `"*"`.
-/// - Must not contain common special characters that indicate a typo or
-///   misconfiguration.
+/// - If it contains a wildcard `*`, it must be a left-most label (`*.` prefix) or exactly `"*"`.
+/// - Must not contain common special characters that indicate a typo or misconfiguration.
 pub fn subject_qualifies_for_cert(subject: &str) -> bool {
     let trimmed = subject.trim();
     if trimmed.is_empty() {
@@ -579,8 +579,8 @@ pub fn subject_qualifies_for_cert(subject: &str) -> bool {
 ///
 /// This adds extra checks on top of [`subject_qualifies_for_cert`]:
 /// - The subject must not be an internal/loopback address or name.
-/// - Wildcard domains must have exactly one wildcard label on the left, with
-///   at least 3 labels total (e.g. `*.example.com`).
+/// - Wildcard domains must have exactly one wildcard label on the left, with at least 3 labels
+///   total (e.g. `*.example.com`).
 pub fn subject_qualifies_for_public_cert(subject: &str) -> bool {
     if !subject_qualifies_for_cert(subject) {
         return false;
@@ -617,8 +617,8 @@ pub fn subject_is_ip(subject: &str) -> bool {
 /// - `"localhost"` and subdomains of `.localhost`
 /// - Names ending in `.local`, `.internal`, or `.home.arpa`
 /// - Loopback addresses (`127.0.0.0/8`, `::1`)
-/// - Private/link-local IP addresses (`10/8`, `172.16/12`, `192.168/16`,
-///   `169.254/16`, `fe80::/10`, `fc00::/7`)
+/// - Private/link-local IP addresses (`10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `fe80::/10`,
+///   `fc00::/7`)
 pub fn subject_is_internal(subject: &str) -> bool {
     let subj = host_only(subject).to_lowercase();
     let subj = subj.trim_end_matches('.');
@@ -645,7 +645,7 @@ fn is_internal_ip(addr: &str) -> bool {
             v4.is_loopback()             // 127.0.0.0/8
                 || v4.is_unspecified()    // 0.0.0.0
                 || v4.is_private()        // 10/8, 172.16/12, 192.168/16
-                || v4.is_link_local()     // 169.254/16
+                || v4.is_link_local() // 169.254/16
         }
         IpAddr::V6(v6) => {
             v6.is_loopback()             // ::1
@@ -745,7 +745,9 @@ fn parse_cert_chain_from_pem(pem_str: &str) -> Result<Vec<CertificateDer<'static
         .collect();
 
     if certs.is_empty() {
-        return Err(CryptoError::InvalidCertificate("no certificates found in PEM data".into()).into());
+        return Err(
+            CryptoError::InvalidCertificate("no certificates found in PEM data".into()).into(),
+        );
     }
 
     Ok(certs)
@@ -766,17 +768,19 @@ fn parse_private_key_from_pem(pem_str: &str) -> Result<PrivateKeyDer<'static>> {
         "PRIVATE KEY" | "ED25519 PRIVATE KEY" => {
             Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
         }
-        "RSA PRIVATE KEY" => {
-            Ok(PrivateKeyDer::Pkcs1(rustls::pki_types::PrivatePkcs1KeyDer::from(der)))
-        }
-        "EC PRIVATE KEY" => {
-            Ok(PrivateKeyDer::Sec1(rustls::pki_types::PrivateSec1KeyDer::from(der)))
-        }
+        "RSA PRIVATE KEY" => Ok(PrivateKeyDer::Pkcs1(
+            rustls::pki_types::PrivatePkcs1KeyDer::from(der),
+        )),
+        "EC PRIVATE KEY" => Ok(PrivateKeyDer::Sec1(
+            rustls::pki_types::PrivateSec1KeyDer::from(der),
+        )),
         other if other.ends_with("PRIVATE KEY") => {
             // Fallback: try PKCS#8.
             Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der)))
         }
-        _ => Err(CryptoError::InvalidKey(format!("unsupported PEM tag for private key: {tag}")).into()),
+        _ => Err(
+            CryptoError::InvalidKey(format!("unsupported PEM tag for private key: {tag}")).into(),
+        ),
     }
 }
 
@@ -784,8 +788,8 @@ fn parse_private_key_from_pem(pem_str: &str) -> Result<PrivateKeyDer<'static>> {
 ///
 /// Names are collected from:
 /// 1. The Subject CN (Common Name), if non-empty.
-/// 2. The Subject Alternative Name (SAN) extension — DNS names, IP
-///    addresses, email addresses, and URIs.
+/// 2. The Subject Alternative Name (SAN) extension — DNS names, IP addresses, email addresses, and
+///    URIs.
 ///
 /// All names are lower-cased. Duplicates of the CN are skipped.
 fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
@@ -830,7 +834,9 @@ fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
     }
 
     if names.is_empty() {
-        return Err(CertError::InvalidDomain("certificate has no names (no CN or SANs)".into()).into());
+        return Err(
+            CertError::InvalidDomain("certificate has no names (no CN or SANs)".into()).into(),
+        );
     }
 
     Ok(names)
@@ -842,8 +848,9 @@ fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
 /// This is a lightweight convenience for callers that only need the SANs
 /// (e.g. OCSP responder override matching).
 pub fn extract_names_from_der(cert_der: &[u8]) -> Result<Vec<String>> {
-    let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| CryptoError::InvalidCertificate(format!("failed to parse certificate: {e}")))?;
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("failed to parse certificate: {e}"))
+    })?;
     extract_names(&cert)
 }
 
@@ -865,13 +872,12 @@ fn parse_ip_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
 /// Convert an `x509_parser::time::ASN1Time` into a `chrono::DateTime<Utc>`.
 fn asn1_time_to_chrono(t: x509_parser::time::ASN1Time) -> Result<DateTime<Utc>> {
     let epoch_secs = t.timestamp();
-    DateTime::from_timestamp(epoch_secs, 0)
-        .ok_or_else(|| {
-            CryptoError::InvalidCertificate(format!(
-                "failed to convert ASN.1 time (epoch {epoch_secs}) to DateTime"
-            ))
-            .into()
-        })
+    DateTime::from_timestamp(epoch_secs, 0).ok_or_else(|| {
+        CryptoError::InvalidCertificate(format!(
+            "failed to convert ASN.1 time (epoch {epoch_secs}) to DateTime"
+        ))
+        .into()
+    })
 }
 
 /// Compute the SHA-256 hash of the entire certificate chain (all DER bytes
@@ -1096,14 +1102,22 @@ mod tests {
     fn renewal_window_expired_cert() {
         let not_before = Utc::now() - ChronoDuration::days(100);
         let not_after = Utc::now() - ChronoDuration::days(1);
-        assert!(currently_in_renewal_window(not_before, not_after, DEFAULT_RENEWAL_WINDOW_RATIO));
+        assert!(currently_in_renewal_window(
+            not_before,
+            not_after,
+            DEFAULT_RENEWAL_WINDOW_RATIO
+        ));
     }
 
     #[test]
     fn renewal_window_fresh_cert() {
         let not_before = Utc::now() - ChronoDuration::days(1);
         let not_after = Utc::now() + ChronoDuration::days(89);
-        assert!(!currently_in_renewal_window(not_before, not_after, DEFAULT_RENEWAL_WINDOW_RATIO));
+        assert!(!currently_in_renewal_window(
+            not_before,
+            not_after,
+            DEFAULT_RENEWAL_WINDOW_RATIO
+        ));
     }
 
     #[test]
@@ -1111,7 +1125,11 @@ mod tests {
         // 90-day cert with 20 days remaining -> in the 1/3 window (30 days).
         let not_before = Utc::now() - ChronoDuration::days(70);
         let not_after = Utc::now() + ChronoDuration::days(20);
-        assert!(currently_in_renewal_window(not_before, not_after, DEFAULT_RENEWAL_WINDOW_RATIO));
+        assert!(currently_in_renewal_window(
+            not_before,
+            not_after,
+            DEFAULT_RENEWAL_WINDOW_RATIO
+        ));
     }
 
     #[test]

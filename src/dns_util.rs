@@ -6,14 +6,13 @@
 //! but are public so that custom solver implementations can reuse them.
 //!
 //! [`Dns01Solver`]: crate::solvers::Dns01Solver
-//!
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant as StdInstant};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hickory_resolver::TokioResolver;
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
@@ -35,12 +34,7 @@ pub const DEFAULT_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_PROPAGATION_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Well-known public recursive DNS resolvers (used as fallback).
-pub const DEFAULT_NAMESERVERS: &[&str] = &[
-    "8.8.8.8:53",
-    "8.8.4.4:53",
-    "1.1.1.1:53",
-    "1.0.0.1:53",
-];
+pub const DEFAULT_NAMESERVERS: &[&str] = &["8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"];
 
 /// Default DNS query timeout.
 pub const DNS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,7 +119,7 @@ pub fn challenge_record_name(domain: &str) -> String {
 /// // The exact output depends on the input; this just exercises the function.
 /// let value = challenge_record_value("token.thumbprint");
 /// assert!(!value.is_empty());
-/// assert!(!value.contains('='));  // URL-safe, no padding
+/// assert!(!value.contains('=')); // URL-safe, no padding
 /// ```
 pub fn challenge_record_value(key_auth: &str) -> String {
     let digest = Sha256::digest(key_auth.as_bytes());
@@ -143,8 +137,8 @@ pub fn challenge_record_value(key_auth: &str) -> String {
 /// - Each label is 1-63 characters long.
 /// - Labels contain only ASCII letters, digits, and hyphens.
 /// - Labels do not start or end with a hyphen.
-/// - There is at least one dot (i.e. at least two labels), unless the domain
-///   is a single-label TLD followed by a trailing dot.
+/// - There is at least one dot (i.e. at least two labels), unless the domain is a single-label TLD
+///   followed by a trailing dot.
 ///
 /// Wildcard domains (e.g. `*.example.com`) are accepted.
 ///
@@ -184,10 +178,7 @@ pub fn is_valid_domain(domain: &str) -> bool {
         if label.starts_with('-') || label.ends_with('-') {
             return false;
         }
-        if !label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-        {
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return false;
         }
     }
@@ -316,10 +307,14 @@ async fn lookup_txt(fqdn: &str) -> Result<Vec<String>> {
     let resolver = TokioResolver::builder_tokio()
         .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?
         .build();
-    let response = resolver.txt_lookup(fqdn).await.map_err(|e| {
-        Error::Other(format!("DNS TXT lookup failed for {fqdn}: {e}"))
-    })?;
-    Ok(response.iter().map(|r: &hickory_resolver::proto::rr::rdata::TXT| r.to_string()).collect())
+    let response = resolver
+        .txt_lookup(fqdn)
+        .await
+        .map_err(|e| Error::Other(format!("DNS TXT lookup failed for {fqdn}: {e}")))?;
+    Ok(response
+        .iter()
+        .map(|r: &hickory_resolver::proto::rr::rdata::TXT| r.to_string())
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +402,14 @@ pub fn clear_zone_cache() {
 /// ```
 /// use certon::dns_util::find_zone_by_fqdn;
 ///
-/// assert_eq!(find_zone_by_fqdn("sub.example.com"), Some("example.com.".to_string()));
-/// assert_eq!(find_zone_by_fqdn("example.com"), Some("example.com.".to_string()));
+/// assert_eq!(
+///     find_zone_by_fqdn("sub.example.com"),
+///     Some("example.com.".to_string())
+/// );
+/// assert_eq!(
+///     find_zone_by_fqdn("example.com"),
+///     Some("example.com.".to_string())
+/// );
 /// assert_eq!(find_zone_by_fqdn("com"), None);
 /// ```
 pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {

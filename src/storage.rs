@@ -224,8 +224,8 @@ const PREFIX_LOCKS: &str = "locks";
 ///    - `'*'`  -> `wildcard_`
 ///    - `':'`  -> `'-'`
 ///    - `".."` -> `""` (prevent directory traversal)
-/// 3. Remove all remaining characters that are not word characters
-///    (`[a-zA-Z0-9_]`), `@`, `.`, or `-`.
+/// 3. Remove all remaining characters that are not word characters (`[a-zA-Z0-9_]`), `@`, `.`, or
+///    `-`.
 pub fn safe_key(s: &str) -> String {
     let s = s.to_lowercase();
     let s = s.trim().to_owned();
@@ -554,12 +554,11 @@ pub async fn load_certificate(
     let cert_bytes = storage.load(&site_cert_key(issuer_key, domain)).await?;
     let meta_bytes = storage.load(&site_meta_key(issuer_key, domain)).await?;
 
-    let mut cert_res: CertificateResource =
-        serde_json::from_slice(&meta_bytes).map_err(|e| {
-            Error::Storage(StorageError::Deserialize(format!(
-                "decoding certificate metadata: {e}"
-            )))
-        })?;
+    let mut cert_res: CertificateResource = serde_json::from_slice(&meta_bytes).map_err(|e| {
+        Error::Storage(StorageError::Deserialize(format!(
+            "decoding certificate metadata: {e}"
+        )))
+    })?;
 
     cert_res.private_key_pem = key_bytes;
     cert_res.certificate_pem = cert_bytes;
@@ -689,10 +688,7 @@ mod tests {
             format!("{base}/afoo/afoo.crt")
         );
         // "c/foo" -> safe -> "cfoo"
-        assert_eq!(
-            site_cert_key(&ik, "c/foo"),
-            format!("{base}/cfoo/cfoo.crt")
-        );
+        assert_eq!(site_cert_key(&ik, "c/foo"), format!("{base}/cfoo/cfoo.crt"));
     }
 
     // -- StorageKeys -------------------------------------------------------
@@ -742,10 +738,7 @@ mod tests {
 
     #[test]
     fn ocsp_key_with_domain() {
-        assert_eq!(
-            ocsp_key("example.com", "abc123"),
-            "ocsp/example.com-abc123"
-        );
+        assert_eq!(ocsp_key("example.com", "abc123"), "ocsp/example.com-abc123");
     }
 
     #[test]
@@ -765,10 +758,7 @@ mod tests {
     #[test]
     fn account_key_prefix_with_email() {
         let ak = account_key_prefix("example.com-directory", "user@example.com");
-        assert_eq!(
-            ak,
-            "acme/example.com-directory/users/user@example.com"
-        );
+        assert_eq!(ak, "acme/example.com-directory/users/user@example.com");
     }
 
     #[test]

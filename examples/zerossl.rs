@@ -16,9 +16,7 @@
 
 use std::sync::Arc;
 
-use certon::{
-    CertResolver, Config, FileStorage, KeyType, Result, Storage, ZeroSslIssuer,
-};
+use certon::{CertResolver, Config, FileStorage, KeyType, Result, Storage, ZeroSslIssuer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
