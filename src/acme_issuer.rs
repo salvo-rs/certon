@@ -781,27 +781,27 @@ impl AcmeIssuer {
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_DNS01)
-            {
-                return Ok(c);
-            }
+        {
+            return Ok(c);
+        }
 
         // Try http-01.
         if !self.disable_http_challenge
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_HTTP01)
-            {
-                return Ok(c);
-            }
+        {
+            return Ok(c);
+        }
 
         // Try tls-alpn-01.
         if !self.disable_tlsalpn_challenge
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_TLSALPN01)
-            {
-                return Ok(c);
-            }
+        {
+            return Ok(c);
+        }
 
         let available: Vec<&str> = challenges
             .iter()
@@ -1129,9 +1129,8 @@ impl AcmeIssuer {
         // Helper: extract the issuer CN from a DER-encoded certificate.
         fn issuer_cn_from_der(der: &[u8]) -> Option<String> {
             let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-            
-            cert
-                .issuer()
+
+            cert.issuer()
                 .iter_common_name()
                 .next()
                 .and_then(|attr| attr.as_str().ok())
@@ -1143,13 +1142,14 @@ impl AcmeIssuer {
             for pref_cn in &pref.any_common_name {
                 for der in &cert_ders {
                     if let Some(cn) = issuer_cn_from_der(der)
-                        && cn == *pref_cn {
-                            debug!(
-                                preferred_cn = %pref_cn,
-                                "found certificate matching any_common_name preference"
-                            );
-                            return cert_pem.to_owned();
-                        }
+                        && cn == *pref_cn
+                    {
+                        debug!(
+                            preferred_cn = %pref_cn,
+                            "found certificate matching any_common_name preference"
+                        );
+                        return cert_pem.to_owned();
+                    }
                 }
             }
         }
@@ -1157,17 +1157,18 @@ impl AcmeIssuer {
         // Check root_common_name: match the last certificate's issuer CN.
         if !pref.root_common_name.is_empty()
             && let Some(root_der) = cert_ders.last()
-                && let Some(cn) = issuer_cn_from_der(root_der) {
-                    for pref_cn in &pref.root_common_name {
-                        if cn == *pref_cn {
-                            debug!(
-                                preferred_cn = %pref_cn,
-                                "found certificate matching root_common_name preference"
-                            );
-                            return cert_pem.to_owned();
-                        }
-                    }
+            && let Some(cn) = issuer_cn_from_der(root_der)
+        {
+            for pref_cn in &pref.root_common_name {
+                if cn == *pref_cn {
+                    debug!(
+                        preferred_cn = %pref_cn,
+                        "found certificate matching root_common_name preference"
+                    );
+                    return cert_pem.to_owned();
                 }
+            }
+        }
 
         // Check smallest preference: sort by PEM size.
         if let Some(want_smallest) = pref.smallest {

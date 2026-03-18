@@ -662,9 +662,10 @@ fn is_internal_ip(addr: &str) -> bool {
 fn host_only(hostport: &str) -> &str {
     // Handle IPv6 bracket notation: [::1]:8080
     if hostport.starts_with('[')
-        && let Some(end) = hostport.find(']') {
-            return &hostport[1..end];
-        }
+        && let Some(end) = hostport.find(']')
+    {
+        return &hostport[1..end];
+    }
     // If there are multiple colons, it is likely a bare IPv6 address (not
     // bracket-wrapped), so do not attempt host:port splitting.
     if hostport.matches(':').count() > 1 {
@@ -803,9 +804,10 @@ fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
         .map(|s| s.to_lowercase());
 
     if let Some(ref cn) = cn
-        && !cn.is_empty() {
-            names.push(cn.clone());
-        }
+        && !cn.is_empty()
+    {
+        names.push(cn.clone());
+    }
 
     // Extract SANs.
     if let Ok(Some(san_ext)) = cert.subject_alternative_name() {

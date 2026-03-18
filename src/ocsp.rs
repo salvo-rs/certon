@@ -394,9 +394,10 @@ fn extract_ocsp_urls_from_parsed(cert: &X509Certificate<'_>) -> Result<Vec<Strin
         if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
             for desc in aia.accessdescs.iter() {
                 if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_OCSP
-                    && let GeneralName::URI(uri) = &desc.access_location {
-                        urls.push(uri.to_string());
-                    }
+                    && let GeneralName::URI(uri) = &desc.access_location
+                {
+                    urls.push(uri.to_string());
+                }
             }
         }
     }
@@ -415,9 +416,10 @@ fn extract_ca_issuer_urls_from_parsed(cert: &X509Certificate<'_>) -> Vec<String>
         if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
             for desc in aia.accessdescs.iter() {
                 if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS
-                    && let GeneralName::URI(uri) = &desc.access_location {
-                        urls.push(uri.to_string());
-                    }
+                    && let GeneralName::URI(uri) = &desc.access_location
+                {
+                    urls.push(uri.to_string());
+                }
             }
         }
     }
@@ -1118,9 +1120,10 @@ fn parse_generalized_time_from_obj(
     // If this object is a GeneralizedTime (tag 24 / 0x18), its content
     // bytes are the ASCII time string.
     if let Ok(bytes) = obj.content.as_slice()
-        && let Some(dt) = parse_time_string(bytes) {
-            return Some(dt);
-        }
+        && let Some(dt) = parse_time_string(bytes)
+    {
+        return Some(dt);
+    }
 
     None
 }

@@ -385,28 +385,29 @@ impl CertCache {
                 let idx = (target_idx + offset) % cache_size;
                 let hash = &hashes[idx];
                 if let Some(evict_cert) = cache.get(hash)
-                    && evict_cert.managed {
-                        let evict_names = evict_cert.names.clone();
-                        let evict_hash = evict_cert.hash.clone();
+                    && evict_cert.managed
+                {
+                    let evict_names = evict_cert.names.clone();
+                    let evict_hash = evict_cert.hash.clone();
 
-                        debug!(
-                            removing_subjects = ?evict_names,
-                            removing_hash = %evict_hash,
-                            inserting_subjects = ?cert.names,
-                            inserting_hash = %cert_hash,
-                            "cache full; evicting random managed certificate",
-                        );
+                    debug!(
+                        removing_subjects = ?evict_names,
+                        removing_hash = %evict_hash,
+                        inserting_subjects = ?cert.names,
+                        inserting_hash = %cert_hash,
+                        "cache full; evicting random managed certificate",
+                    );
 
-                        Self::unsynced_remove_by_hash(cache, index, &evict_hash);
+                    Self::unsynced_remove_by_hash(cache, index, &evict_hash);
 
-                        if let Some(ref on_event) = options.on_event {
-                            on_event(CacheEvent::Removed {
-                                names: evict_names,
-                                hash: evict_hash,
-                            });
-                        }
-                        break;
+                    if let Some(ref on_event) = options.on_event {
+                        on_event(CacheEvent::Removed {
+                            names: evict_names,
+                            hash: evict_hash,
+                        });
                     }
+                    break;
+                }
             }
         }
 

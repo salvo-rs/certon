@@ -601,22 +601,23 @@ impl AcmeClient {
         // Validate that the directory URL uses HTTPS, unless it is a local
         // or internal address.
         if let Ok(parsed) = url::Url::parse(directory_url)
-            && parsed.scheme() == "http" {
-                let host = parsed.host_str().unwrap_or("");
-                let is_local = host == "localhost"
-                    || host == "127.0.0.1"
-                    || host == "[::1]"
-                    || host == "::1"
-                    || host.ends_with(".internal")
-                    || host.ends_with(".localhost");
-                if !is_local {
-                    return Err(AcmeError::Directory(format!(
-                        "ACME directory URL must use HTTPS (got {directory_url}); \
+            && parsed.scheme() == "http"
+        {
+            let host = parsed.host_str().unwrap_or("");
+            let is_local = host == "localhost"
+                || host == "127.0.0.1"
+                || host == "[::1]"
+                || host == "::1"
+                || host.ends_with(".internal")
+                || host.ends_with(".localhost");
+            if !is_local {
+                return Err(AcmeError::Directory(format!(
+                    "ACME directory URL must use HTTPS (got {directory_url}); \
                          HTTP is only allowed for localhost/internal hosts"
-                    ))
-                    .into());
-                }
+                ))
+                .into());
             }
+        }
 
         debug!(directory_url, "fetching ACME directory");
 
@@ -747,10 +748,11 @@ impl AcmeClient {
                     .map_err(|e| AcmeError::Nonce(format!("failed to read response body: {e}")))?;
 
                 if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&resp_bytes)
-                    && problem.problem_type.contains("badNonce") {
-                        warn!("bad nonce, retrying with fresh nonce");
-                        continue;
-                    }
+                    && problem.problem_type.contains("badNonce")
+                {
+                    warn!("bad nonce, retrying with fresh nonce");
+                    continue;
+                }
 
                 // Not a badNonce error; return an error with the body we already read.
                 let problem: std::result::Result<AcmeProblem, _> =
@@ -924,9 +926,10 @@ impl AcmeClient {
         if resp.status().as_u16() == 400 {
             let body_bytes = resp.bytes().await.unwrap_or_default();
             if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&body_bytes)
-                && problem.problem_type.contains("accountDoesNotExist") {
-                    return Ok(None);
-                }
+                && problem.problem_type.contains("accountDoesNotExist")
+            {
+                return Ok(None);
+            }
             return Err(AcmeError::Account(format!(
                 "account lookup returned HTTP 400: {}",
                 String::from_utf8_lossy(&body_bytes)
@@ -1408,10 +1411,11 @@ pub fn ari_cert_id(cert_der: &[u8]) -> Result<String> {
     let mut aki_bytes: Option<Vec<u8>> = None;
     for ext in cert.extensions() {
         if let ParsedExtension::AuthorityKeyIdentifier(aki) = ext.parsed_extension()
-            && let Some(key_id) = &aki.key_identifier {
-                aki_bytes = Some(key_id.0.to_vec());
-                break;
-            }
+            && let Some(key_id) = &aki.key_identifier
+        {
+            aki_bytes = Some(key_id.0.to_vec());
+            break;
+        }
     }
 
     let aki_bytes = aki_bytes.ok_or_else(|| {

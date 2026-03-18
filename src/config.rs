@@ -328,10 +328,7 @@ impl ConfigBuilder {
     ///
     /// The callback returns `Result<()>`. For critical events (e.g.
     /// [`EVENT_CERT_OBTAINING`]), returning an error aborts the operation.
-    pub fn on_event(
-        mut self,
-        on_event: EventCallback,
-    ) -> Self {
+    pub fn on_event(mut self, on_event: EventCallback) -> Self {
         self.on_event = Some(on_event);
         self
     }
@@ -356,10 +353,7 @@ impl ConfigBuilder {
 
     /// Set a transform applied to domain names before obtaining
     /// certificates.
-    pub fn subject_transformer(
-        mut self,
-        f: SubjectTransformer,
-    ) -> Self {
+    pub fn subject_transformer(mut self, f: SubjectTransformer) -> Self {
         self.subject_transformer = Some(f);
         self
     }
@@ -751,14 +745,13 @@ impl Config {
 
                 // Task 7: Check OCSP revocation status. If the certificate
                 // has been revoked, trigger a renewal.
-                if !needs_action
-                    && let Some(OcspStatus::Revoked) = cert.ocsp_status {
-                        warn!(
-                            domain = %domain,
-                            "certificate OCSP status is Revoked; triggering renewal"
-                        );
-                        needs_action = true;
-                    }
+                if !needs_action && let Some(OcspStatus::Revoked) = cert.ocsp_status {
+                    warn!(
+                        domain = %domain,
+                        "certificate OCSP status is Revoked; triggering renewal"
+                    );
+                    needs_action = true;
+                }
 
                 if needs_action {
                     if r#async {
@@ -1040,14 +1033,15 @@ impl Config {
             match self.storage.load(&key_path).await {
                 Ok(pem_bytes) => {
                     if let Ok(pem_str) = std::str::from_utf8(&pem_bytes)
-                        && let Ok(pk) = decode_private_key_pem(pem_str) {
-                            debug!(
-                                domain = %domain,
-                                issuer = %issuer.issuer_key(),
-                                "reusing existing private key from storage"
-                            );
-                            return Ok((pk, pem_str.to_string()));
-                        }
+                        && let Ok(pk) = decode_private_key_pem(pem_str)
+                    {
+                        debug!(
+                            domain = %domain,
+                            issuer = %issuer.issuer_key(),
+                            "reusing existing private key from storage"
+                        );
+                        return Ok((pk, pem_str.to_string()));
+                    }
                 }
                 Err(_) => continue,
             }
@@ -1415,11 +1409,11 @@ impl Config {
                     if let (Ok(cert_pem), Ok(key_pem)) = (
                         self.storage.load(&cert_key).await,
                         self.storage.load(&key_key).await,
-                    )
-                        && let Ok(c) = Certificate::from_pem(&cert_pem, &key_pem) {
-                            found = Some(c);
-                            break;
-                        }
+                    ) && let Ok(c) = Certificate::from_pem(&cert_pem, &key_pem)
+                    {
+                        found = Some(c);
+                        break;
+                    }
                 }
                 match found {
                     Some(c) => c,

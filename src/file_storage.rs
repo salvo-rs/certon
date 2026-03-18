@@ -289,8 +289,7 @@ impl FileStorage {
             use std::io::Seek;
             (&file).seek(std::io::SeekFrom::Start(0))?;
             meta.updated = chrono::Utc::now();
-            serde_json::to_writer(&file, &meta)
-                .map_err(std::io::Error::other)?;
+            serde_json::to_writer(&file, &meta).map_err(std::io::Error::other)?;
             file.sync_all()?;
 
             Ok(false) // keep going

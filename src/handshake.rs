@@ -352,16 +352,17 @@ impl CertResolver {
         // Step 3: Try fallback_server_name if set and different from the
         // original name.
         if let Some(ref fallback) = self.fallback_server_name
-            && fallback != &name {
-                debug!(
-                    sni = %name,
-                    fallback = %fallback,
-                    "trying fallback_server_name",
-                );
-                if let Some(result) = self.try_resolve_from_cache(fallback) {
-                    return Some(result);
-                }
+            && fallback != &name
+        {
+            debug!(
+                sni = %name,
+                fallback = %fallback,
+                "trying fallback_server_name",
+            );
+            if let Some(result) = self.try_resolve_from_cache(fallback) {
+                return Some(result);
             }
+        }
 
         // Step 4: Return the default certificate.
         self.try_default_cert()
@@ -397,18 +398,19 @@ impl CertResolver {
             // bytes are absent, trigger a background OCSP refresh without
             // blocking the handshake.
             if (cert.ocsp_status.is_none() || cert.ocsp_response.is_none())
-                && let Some(ref refresh_fn) = self.ocsp_refresh_func {
-                    let refresh = Arc::clone(refresh_fn);
-                    let domain = name.to_owned();
-                    debug!(
-                        sni = %name,
-                        hash = %cert.hash,
-                        "OCSP staple missing; spawning background refresh",
-                    );
-                    tokio::spawn(async move {
-                        refresh(domain).await;
-                    });
-                }
+                && let Some(ref refresh_fn) = self.ocsp_refresh_func
+            {
+                let refresh = Arc::clone(refresh_fn);
+                let domain = name.to_owned();
+                debug!(
+                    sni = %name,
+                    hash = %cert.hash,
+                    "OCSP staple missing; spawning background refresh",
+                );
+                tokio::spawn(async move {
+                    refresh(domain).await;
+                });
+            }
 
             match cert_to_certified_key(&cert) {
                 Ok(ck) => {
@@ -449,7 +451,6 @@ impl CertResolver {
         // that we can safely block on async operations. This requires a
         // multi-threaded runtime; on a current-thread runtime it will panic.
         // For production TLS servers a multi-threaded runtime is expected.
-        
 
         tokio::task::block_in_place(|| handle.block_on(self.cache.get_by_name(name)))
     }
@@ -511,22 +512,24 @@ impl CertResolver {
     async fn do_on_demand_obtain(on_demand: &OnDemandConfig, name: &str) {
         // Check rate limit.
         if let Some(ref limiter) = on_demand.rate_limit
-            && !limiter.try_allow().await {
-                warn!(
-                    sni = %name,
-                    "on-demand certificate obtain rate-limited; skipping",
-                );
-                return;
-            }
+            && !limiter.try_allow().await
+        {
+            warn!(
+                sni = %name,
+                "on-demand certificate obtain rate-limited; skipping",
+            );
+            return;
+        }
 
         if let Some(ref obtain) = on_demand.obtain_func
-            && let Err(e) = obtain(name.to_owned()).await {
-                warn!(
-                    sni = %name,
-                    error = %e,
-                    "on-demand certificate obtain failed",
-                );
-            }
+            && let Err(e) = obtain(name.to_owned()).await
+        {
+            warn!(
+                sni = %name,
+                error = %e,
+                "on-demand certificate obtain failed",
+            );
+        }
     }
 
     /// Try to return the default certificate (non-blocking).
