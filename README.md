@@ -74,10 +74,11 @@ async fn main() -> certon::Result<()> {
 - **Certificate chain preference** -- select preferred chains by root/issuer Common Name or chain size
 - **Certificate revocation** -- revoke compromised certificates via the ACME protocol
 - **Native rustls integration** -- `CertResolver` implements `rustls::server::ResolvesServerCert` and plugs directly into any rustls-based server
+- **Pluggable crypto backend** -- defaults to `aws-lc-rs` (high performance, FIPS support); optionally switch to `ring` (pure Rust compilation, smaller binary)
 
 ## Requirements
 
-1. **Rust 2021 edition** with a Tokio async runtime
+1. **Rust 2024 edition** (Rust 1.89+) with a Tokio async runtime
 2. **Public DNS name(s)** you control, pointed (A/AAAA records) at your server
 3. **Port 80** accessible from the public internet (for HTTP-01 challenge), and/or **port 443** (for TLS-ALPN-01 challenge)
    - These can be forwarded to other ports you control
@@ -97,6 +98,22 @@ Add `certon` to your `Cargo.toml`:
 [dependencies]
 certon = "0.1"
 tokio = { version = "1", features = ["full"] }
+```
+
+### Crypto Backend
+
+Certon supports two crypto backends, selected via feature flags:
+
+| Feature | Description | Default |
+|---|---|---|
+| `aws-lc-rs` | AWS Libcrypto (aws-lc-rs), excellent performance, FIPS support | **enabled by default** |
+| `ring` | ring crypto library, pure Rust compilation, smaller binary | optional |
+
+The default `aws-lc-rs` backend requires no extra configuration. To use `ring` instead:
+
+```toml
+[dependencies]
+certon = { version = "0.1", default-features = false, features = ["ring"] }
 ```
 
 ## Quick Start

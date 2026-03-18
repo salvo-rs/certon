@@ -25,17 +25,45 @@
 use std::fmt;
 use std::net::IpAddr;
 
+#[cfg(feature = "aws-lc-rs")]
+use aws_lc_rs as crypto_provider;
+use crypto_provider::rand::SystemRandom;
+use crypto_provider::signature::{
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, Ed25519KeyPair,
+};
 use rcgen::{
     CertificateParams, CustomExtension, KeyPair as RcgenKeyPair, PKCS_ECDSA_P256_SHA256,
     PKCS_ECDSA_P384_SHA384, PKCS_ED25519, PKCS_RSA_SHA256,
 };
-use ring::rand::SystemRandom;
-use ring::signature::{
-    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, Ed25519KeyPair,
-};
+#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+use ring as crypto_provider;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// Crypto-provider compatibility wrappers
+// ---------------------------------------------------------------------------
+//
+// `ring` and `aws-lc-rs` have slightly different APIs for ECDSA key loading.
+// `ring::EcdsaKeyPair::from_pkcs8` requires an `&SystemRandom` argument,
+// while `aws_lc_rs::EcdsaKeyPair::from_pkcs8` does not.
+
+/// Load an ECDSA key pair from PKCS#8 DER bytes.
+pub(crate) fn ecdsa_from_pkcs8(
+    alg: &'static crypto_provider::signature::EcdsaSigningAlgorithm,
+    pkcs8: &[u8],
+) -> std::result::Result<EcdsaKeyPair, crypto_provider::error::KeyRejected> {
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        EcdsaKeyPair::from_pkcs8(alg, pkcs8)
+    }
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    {
+        let rng = SystemRandom::new();
+        EcdsaKeyPair::from_pkcs8(alg, pkcs8, &rng)
+    }
+}
 
 use crate::error::{CryptoError, Result};
 
@@ -221,8 +249,8 @@ pub fn generate_private_key(key_type: KeyType) -> Result<PrivateKey> {
 
 /// Helper: generate an RSA private key as PKCS#8 DER.
 ///
-/// `ring` does not expose RSA key generation, so we delegate to the
-/// `rsa` crate and then serialise via `pkcs8`.
+/// Neither `ring` nor `aws-lc-rs` expose RSA key generation, so we
+/// delegate to the `rsa` crate and then serialise via `pkcs8`.
 fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::EncodePrivateKey;
@@ -238,8 +266,8 @@ fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
 
 /// Helper: generate an ECDSA P-521 private key as PKCS#8 DER.
 ///
-/// `ring` does not support P-521, so we use the `p521` crate from
-/// RustCrypto and encode via the `elliptic-curve` PKCS#8 support.
+/// The `ring` crate does not support P-521, so we use the `p521` crate
+/// from RustCrypto and encode via the `elliptic-curve` PKCS#8 support.
 fn generate_p521_pkcs8() -> Result<Vec<u8>> {
     use elliptic_curve::pkcs8::EncodePrivateKey;
     use p521::ecdsa::SigningKey;
@@ -387,13 +415,13 @@ fn decode_ec_private_key(sec1_der: &[u8]) -> Result<PrivateKey> {
     // Detect curve from SEC 1 structure.
     // The SEC 1 ECPrivateKey may contain an optional `parameters` field
     // (context tag [0]) that holds the curve OID. If absent, we try both
-    // P-256 and P-384 by attempting to load into ring.
+    // P-256 and P-384 by attempting to load into the crypto provider.
     let key_type = detect_ec_curve_from_sec1(sec1_der);
 
     // Wrap SEC 1 DER into PKCS#8 for internal storage.
     let pkcs8_der = wrap_ec_sec1_in_pkcs8(sec1_der, key_type)?;
 
-    // Validate by attempting to parse with ring.
+    // Validate by attempting to parse with the crypto provider.
     validate_ec_key(&pkcs8_der, key_type)?;
 
     Ok(PrivateKey {
@@ -500,18 +528,17 @@ fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {
 /// Validate that `pkcs8_der` can actually be loaded as an EC key of the
 /// given curve.
 fn validate_ec_key(pkcs8_der: &[u8], key_type: KeyType) -> Result<()> {
-    let rng = SystemRandom::new();
     match key_type {
         KeyType::EcdsaP256 => {
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng)
+            ecdsa_from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der)
                 .map_err(|e| CryptoError::InvalidKey(format!("P-256 validation failed: {e}")))?;
         }
         KeyType::EcdsaP384 => {
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_der, &rng)
+            ecdsa_from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_der)
                 .map_err(|e| CryptoError::InvalidKey(format!("P-384 validation failed: {e}")))?;
         }
         KeyType::EcdsaP521 => {
-            // ring does not support P-521; validate using the p521 crate.
+            // The `ring` crate does not support P-521; validate using the p521 crate.
             use elliptic_curve::pkcs8::DecodePrivateKey;
             p521::SecretKey::from_pkcs8_der(pkcs8_der)
                 .map_err(|e| CryptoError::InvalidKey(format!("P-521 validation failed: {e}")))?;
@@ -552,10 +579,8 @@ fn decode_rsa_private_key(pkcs1_der: &[u8]) -> Result<PrivateKey> {
 
 /// Decode a PKCS#8 private key, auto-detecting the algorithm.
 fn decode_pkcs8_private_key(pkcs8_der: &[u8]) -> Result<PrivateKey> {
-    let rng = SystemRandom::new();
-
     // Try ECDSA P-256.
-    if EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der, &rng).is_ok() {
+    if ecdsa_from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_der).is_ok() {
         return Ok(PrivateKey {
             key_type: KeyType::EcdsaP256,
             pkcs8_der: pkcs8_der.to_vec(),
@@ -563,14 +588,14 @@ fn decode_pkcs8_private_key(pkcs8_der: &[u8]) -> Result<PrivateKey> {
     }
 
     // Try ECDSA P-384.
-    if EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_der, &rng).is_ok() {
+    if ecdsa_from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8_der).is_ok() {
         return Ok(PrivateKey {
             key_type: KeyType::EcdsaP384,
             pkcs8_der: pkcs8_der.to_vec(),
         });
     }
 
-    // Try ECDSA P-521 (not supported by ring, use p521 crate).
+    // Try ECDSA P-521 (not supported by the `ring` crate, use p521 crate).
     {
         use elliptic_curve::pkcs8::DecodePrivateKey;
         if p521::SecretKey::from_pkcs8_der(pkcs8_der).is_ok() {

@@ -74,10 +74,11 @@ async fn main() -> certon::Result<()> {
 - **证书链偏好** -- 按根证书/颁发者 Common Name 或链大小选择首选证书链
 - **证书吊销** -- 通过 ACME 协议吊销受损的证书
 - **原生 rustls 集成** -- `CertResolver` 实现了 `rustls::server::ResolvesServerCert`，可直接接入任何基于 rustls 的服务器
+- **可选加密后端** -- 默认使用 `aws-lc-rs`（性能优秀，支持 FIPS），也可切换为 `ring`（纯 Rust 编译，体积更小）
 
 ## 环境要求
 
-1. **Rust 2021 edition** 和 Tokio 异步运行时
+1. **Rust 2024 edition**（Rust 1.89+）和 Tokio 异步运行时
 2. 您控制的**公共 DNS 域名**，A/AAAA 记录指向您的服务器
 3. **80 端口**可从公网访问（用于 HTTP-01 验证），和/或 **443 端口**（用于 TLS-ALPN-01 验证）
    - 可以通过端口转发实现
@@ -97,6 +98,22 @@ async fn main() -> certon::Result<()> {
 [dependencies]
 certon = "0.1"
 tokio = { version = "1", features = ["full"] }
+```
+
+### 加密后端
+
+Certon 支持两种加密后端，通过 feature flag 选择：
+
+| Feature | 说明 | 默认 |
+|---|---|---|
+| `aws-lc-rs` | AWS Libcrypto (aws-lc-rs)，性能优秀，支持 FIPS | **默认启用** |
+| `ring` | ring 加密库，纯 Rust 编译，体积更小 | 可选 |
+
+默认使用 `aws-lc-rs`，无需额外配置。如需使用 `ring`：
+
+```toml
+[dependencies]
+certon = { version = "0.1", default-features = false, features = ["ring"] }
 ```
 
 ## 快速开始

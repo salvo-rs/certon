@@ -25,9 +25,13 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+#[cfg(feature = "aws-lc-rs")]
+use aws_lc_rs as crypto_provider;
+use crypto_provider::rand::SystemRandom;
+use crypto_provider::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
 use rcgen::{CertificateParams, CustomExtension, KeyPair as RcgenKeyPair, PKCS_ECDSA_P256_SHA256};
-use ring::rand::SystemRandom;
-use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair};
+#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+use ring as crypto_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -639,7 +643,7 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
 
         let (certs, key_der) = self.challenges.get(sni)?;
 
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der).ok()?;
+        let signing_key = crate::handshake::signing_key_from_der(key_der).ok()?;
 
         Some(Arc::new(rustls::sign::CertifiedKey::new(
             certs.clone(),

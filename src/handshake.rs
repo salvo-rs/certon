@@ -590,10 +590,26 @@ impl CertResolver {
 // Certificate conversion
 // ---------------------------------------------------------------------------
 
+/// Create a rustls signing key from a [`PrivateKeyDer`].
+///
+/// Uses the crypto provider selected by the `aws-lc-rs` or `ring` feature.
+pub fn signing_key_from_der(
+    key_der: &PrivateKeyDer<'_>,
+) -> std::result::Result<Arc<dyn rustls::sign::SigningKey>, rustls::Error> {
+    #[cfg(feature = "aws-lc-rs")]
+    {
+        rustls::crypto::aws_lc_rs::sign::any_supported_type(key_der)
+    }
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    {
+        rustls::crypto::ring::sign::any_supported_type(key_der)
+    }
+}
+
 /// Convert a [`Certificate`] into a rustls [`CertifiedKey`].
 ///
 /// This reconstructs the [`PrivateKeyDer`] from the stored raw bytes and
-/// [`PrivateKeyKind`], then uses `rustls::crypto::ring::sign::any_supported_type`
+/// [`PrivateKeyKind`], then uses the feature-selected crypto provider
 /// to produce a signing key. The certificate chain and signing key are bundled
 /// into a [`CertifiedKey`].
 ///
@@ -603,13 +619,13 @@ impl CertResolver {
 /// # Errors
 ///
 /// Returns an error if the certificate has no private key or if the key
-/// type is not supported by the ring crypto provider.
+/// type is not supported by the crypto provider.
 pub fn cert_to_certified_key(cert: &Certificate) -> Result<Arc<CertifiedKey>> {
     // Reconstruct the PrivateKeyDer.
     let key_der = reconstruct_private_key_der(cert)?;
 
     // Convert to a rustls signing key.
-    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der).map_err(|e| {
+    let signing_key = signing_key_from_der(&key_der).map_err(|e| {
         CryptoError::InvalidKey(format!(
             "failed to create signing key from private key: {e}"
         ))

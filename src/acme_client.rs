@@ -11,12 +11,16 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(feature = "aws-lc-rs")]
+use aws_lc_rs as crypto_provider;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
+use crypto_provider::rand::SystemRandom;
+use crypto_provider::signature::{self, ECDSA_P256_SHA256_FIXED_SIGNING};
 use reqwest::header::HeaderValue;
-use ring::rand::SystemRandom;
-use ring::signature::{self, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+#[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+use ring as crypto_provider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -413,9 +417,8 @@ struct JwsBody {
 /// The public key is extracted from the PKCS#8 DER. The uncompressed point
 /// format is 65 bytes: `0x04 || x (32 bytes) || y (32 bytes)`.
 fn jwk_from_key(key: &PrivateKey) -> Result<Jwk> {
-    let rng = SystemRandom::new();
     let key_pair =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der(), &rng)
+        crate::crypto::ecdsa_from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der())
             .map_err(|e| AcmeError::Account(format!("failed to load ECDSA key pair: {e}")))?;
 
     let public_key = signature::KeyPair::public_key(&key_pair).as_ref();
@@ -493,9 +496,10 @@ pub fn key_authorization_sha256(token: &str, account_key: &PrivateKey) -> Result
 fn sign_with_key(key: &PrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let rng = SystemRandom::new();
     let key_pair =
-        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der(), &rng).map_err(
-            |e| AcmeError::Account(format!("failed to load ECDSA key pair for signing: {e}")),
-        )?;
+        crate::crypto::ecdsa_from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, key.pkcs8_der())
+            .map_err(|e| {
+                AcmeError::Account(format!("failed to load ECDSA key pair for signing: {e}"))
+            })?;
 
     let sig = key_pair
         .sign(&rng, data)
@@ -598,6 +602,8 @@ impl AcmeClient {
     /// The CA URL must use HTTPS. HTTP is only allowed for localhost,
     /// `127.0.0.1`, `[::1]`, and `.internal` hosts (for testing/development).
     pub async fn new(directory_url: &str) -> Result<Self> {
+        crate::install_default_crypto_provider();
+
         // Validate that the directory URL uses HTTPS, unless it is a local
         // or internal address.
         if let Ok(parsed) = url::Url::parse(directory_url)
@@ -1462,7 +1468,7 @@ fn build_eab_jws(
     eab: &ExternalAccountBinding,
     new_account_url: &str,
 ) -> Result<serde_json::Value> {
-    use ring::hmac;
+    use crypto_provider::hmac;
 
     let jwk = jwk_from_key(account_key)?;
     let jwk_json = serde_json::to_vec(&jwk)
