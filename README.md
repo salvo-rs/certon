@@ -7,7 +7,7 @@
 [![Documentation](https://docs.rs/certon/badge.svg)](https://docs.rs/certon)
 [![License](https://img.shields.io/crates/l/certon.svg)](LICENSE)
 
-**English** | [简体中文](README.zh-hans.md) | [繁體中文](README.zh-hant.md)
+**English** | [简体中文](README.zh.md)
 
 Certon brings production-grade automatic certificate management to Rust programs: obtain, renew, and serve TLS certificates from any ACME-compatible Certificate Authority, with just a few lines of code.
 
