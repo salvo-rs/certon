@@ -1,0 +1,48 @@
+name: ci-macos
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '.github/workflows/**'
+  push:
+    branches:
+      - main
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - '.github/workflows/**'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - stable
+          # - nightly
+
+    name: Check ${{ matrix.version }} - x86_64-apple-darwin
+    runs-on: macOS-latest
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.version }}
+          components: rustfmt, clippy
+
+      - name: check build
+        run: cargo check --all --bins --examples --tests
+
+      - name: check release build
+        run: cargo check --all --bins --examples --tests --release
+
+      - name: Cargo test
+        timeout-minutes: 40
+        run: cargo test --all --all-features --no-fail-fast -- --nocapture
