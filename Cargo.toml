@@ -15,7 +15,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "charset", "form"] }
