@@ -28,6 +28,17 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, P
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::sync::{Mutex, Notify, RwLock};
+
+/// Decision function that determines whether on-demand TLS is allowed for a name.
+type DecisionFunc = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Async callback that triggers certificate acquisition for a domain.
+type ObtainFunc =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
+/// Async callback that triggers a background OCSP staple refresh for a domain.
+type OcspRefreshFunc =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 use tracing::{debug, warn};
 
 use crate::cache::CertCache;
@@ -55,7 +66,7 @@ pub struct OnDemandConfig {
     ///
     /// Returns `true` if the name is allowed.
     /// If `None`, the decision falls through to `host_allowlist`.
-    pub decision_func: Option<Arc<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub decision_func: Option<DecisionFunc>,
 
     /// An explicit set of hostnames for which on-demand issuance is permitted.
     ///
@@ -75,9 +86,7 @@ pub struct OnDemandConfig {
     /// This function is spawned in the background (via `tokio::spawn`) when
     /// a certificate is needed but not cached. The obtained certificate is
     /// expected to be placed into the [`CertCache`] by the callback.
-    pub obtain_func: Option<
-        Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>,
-    >,
+    pub obtain_func: Option<ObtainFunc>,
 }
 
 impl fmt::Debug for OnDemandConfig {
@@ -176,8 +185,7 @@ pub struct CertResolver {
     /// Optional callback that triggers a background OCSP staple refresh
     /// for a given domain. This is spawned as a background task to avoid
     /// blocking the TLS handshake.
-    pub ocsp_refresh_func:
-        Option<Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>>,
+    pub ocsp_refresh_func: Option<OcspRefreshFunc>,
 }
 
 impl fmt::Debug for CertResolver {

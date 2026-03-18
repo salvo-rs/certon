@@ -62,6 +62,10 @@ pub const DEFAULT_RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// for cached certificates.
 pub const DEFAULT_OCSP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Callback that returns per-certificate configuration data.
+type CertConfigFunc =
+    Arc<dyn Fn(&Certificate) -> Arc<dyn std::any::Any + Send + Sync> + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // CacheEvent
 // ---------------------------------------------------------------------------
@@ -152,8 +156,7 @@ pub struct CacheOptions {
     /// per-certificate configuration by returning an
     /// `Arc<dyn Any + Send + Sync>`. The returned value can later be
     /// downcast to the expected concrete type.
-    pub get_config_for_cert:
-        Option<Arc<dyn Fn(&Certificate) -> Arc<dyn std::any::Any + Send + Sync> + Send + Sync>>,
+    pub get_config_for_cert: Option<CertConfigFunc>,
 }
 
 impl Default for CacheOptions {

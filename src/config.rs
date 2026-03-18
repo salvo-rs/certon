@@ -37,6 +37,12 @@ use crate::storage::{
     store_certificate,
 };
 
+/// Callback invoked on notable lifecycle events.
+type EventCallback = Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>;
+
+/// Transform applied to domain names before obtaining certificates.
+type SubjectTransformer = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // IssuerPolicy
 // ---------------------------------------------------------------------------
@@ -164,7 +170,7 @@ pub struct Config {
     /// from the callback may abort the current operation (for critical
     /// events like [`EVENT_CERT_OBTAINING`]). Callbacks should return
     /// quickly as they are invoked synchronously.
-    pub on_event: Option<Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>>,
+    pub on_event: Option<EventCallback>,
 
     /// Whether user interaction is allowed (e.g. for Terms of Service
     /// acceptance prompts). When `true`, operations run synchronously in
@@ -182,7 +188,7 @@ pub struct Config {
 
     /// Optional transform applied to domain names before obtaining
     /// certificates. Can be used for normalization, aliasing, etc.
-    pub subject_transformer: Option<Arc<dyn Fn(&str) -> Result<String> + Send + Sync>>,
+    pub subject_transformer: Option<SubjectTransformer>,
 
     /// Fallback server name used when the TLS client does not provide an
     /// SNI value.
@@ -262,11 +268,11 @@ pub struct ConfigBuilder {
     key_type: KeyType,
     ocsp: OcspConfig,
     cache: Option<Arc<CertCache>>,
-    on_event: Option<Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>>,
+    on_event: Option<EventCallback>,
     interactive: bool,
     must_staple: bool,
     reuse_private_keys: bool,
-    subject_transformer: Option<Arc<dyn Fn(&str) -> Result<String> + Send + Sync>>,
+    subject_transformer: Option<SubjectTransformer>,
     default_server_name: Option<String>,
     fallback_server_name: Option<String>,
     disable_storage_check: bool,
@@ -324,7 +330,7 @@ impl ConfigBuilder {
     /// [`EVENT_CERT_OBTAINING`]), returning an error aborts the operation.
     pub fn on_event(
         mut self,
-        on_event: Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>,
+        on_event: EventCallback,
     ) -> Self {
         self.on_event = Some(on_event);
         self
@@ -352,7 +358,7 @@ impl ConfigBuilder {
     /// certificates.
     pub fn subject_transformer(
         mut self,
-        f: Arc<dyn Fn(&str) -> Result<String> + Send + Sync>,
+        f: SubjectTransformer,
     ) -> Self {
         self.subject_transformer = Some(f);
         self

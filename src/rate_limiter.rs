@@ -52,7 +52,7 @@ impl RateLimiter {
     /// configuration would never allow any events.
     pub fn new(max_events: usize, window: Duration) -> Self {
         assert!(
-            !(max_events == 0 && !window.is_zero()),
+            max_events != 0 || window.is_zero(),
             "invalid configuration: max_events = 0 and window != 0 would never allow any events"
         );
 

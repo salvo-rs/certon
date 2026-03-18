@@ -43,6 +43,10 @@ use crate::dns_util::{
 use crate::error::{Error, Result};
 use crate::storage::{Storage, safe_key};
 
+/// Shared map of domain -> (cert chain DER, private key DER) for TLS-ALPN-01 challenges.
+type ChallengeMap =
+    Arc<RwLock<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>>>;
+
 // ---------------------------------------------------------------------------
 // Active challenges global tracking
 // ---------------------------------------------------------------------------
@@ -403,8 +407,7 @@ const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 pub struct TlsAlpn01Solver {
     /// In-memory map of domain -> (cert chain DER, private key DER) for
     /// currently active challenges.
-    challenges:
-        Arc<RwLock<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>>>,
+    challenges: ChallengeMap,
     /// The port to listen on (default: 443).
     pub port: u16,
     /// Handle to the background TLS server task, if running.
@@ -538,12 +541,9 @@ impl TlsAlpn01Solver {
 
                     drop(challenges_snapshot);
 
-                    let mut config = match rustls::ServerConfig::builder()
+                    let mut config = rustls::ServerConfig::builder()
                         .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(resolver))
-                    {
-                        config => config,
-                    };
+                        .with_cert_resolver(Arc::new(resolver));
 
                     config.alpn_protocols = vec![ACME_TLS_ALPN_PROTOCOL.to_vec()];
 

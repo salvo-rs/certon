@@ -47,6 +47,9 @@ use crate::error::{AcmeError, Error, Result};
 use crate::solvers::{DistributedSolver, Solver};
 use crate::storage::{Storage, issuer_key};
 
+/// Callback invoked on newly created accounts before CA registration.
+type NewAccountFunc = Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>;
+
 // ---------------------------------------------------------------------------
 // Well-known CA constants (re-exported for convenience)
 // ---------------------------------------------------------------------------
@@ -304,7 +307,7 @@ pub struct AcmeIssuer {
     ///
     /// This allows the caller to modify the account (e.g. set external
     /// account binding, change contacts) before it is registered.
-    pub new_account_func: Option<Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>>,
+    pub new_account_func: Option<NewAccountFunc>,
 
     /// Offset from now for the `notBefore` field of the certificate.
     pub not_before: Option<Duration>,
@@ -371,7 +374,7 @@ pub struct AcmeIssuerBuilder {
     preferred_chains: Option<ChainPreference>,
     cert_obtain_timeout: Duration,
     resolver: Option<String>,
-    new_account_func: Option<Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>>,
+    new_account_func: Option<NewAccountFunc>,
     not_before: Option<Duration>,
     not_after: Option<Duration>,
     profile: Option<String>,
@@ -500,7 +503,7 @@ impl AcmeIssuerBuilder {
     }
 
     /// Set a callback invoked on newly created accounts before CA registration.
-    pub fn new_account_func(mut self, func: Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>) -> Self {
+    pub fn new_account_func(mut self, func: NewAccountFunc) -> Self {
         self.new_account_func = Some(func);
         self
     }
