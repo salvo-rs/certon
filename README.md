@@ -540,4 +540,4 @@ Staging certificates are not publicly trusted, but the rate limits are much more
 
 ## License
 
-CertAuto is dual-licensed under the [MIT License](LICENSE-MIT) and the [Apache License 2.0](LICENSE-APACHE). You may choose either license at your option.
+CertAuto is licensed under the [Apache License 2.0](LICENSE).

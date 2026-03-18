@@ -540,4 +540,4 @@ let issuer = AcmeIssuer::builder()
 
 ## 许可证
 
-CertAuto 采用 [MIT 许可证](LICENSE-MIT) 和 [Apache 许可证 2.0](LICENSE-APACHE) 双重许可。您可以选择其中任何一个。
+CertAuto 采用 [Apache 许可证 2.0](LICENSE) 许可。
