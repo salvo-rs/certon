@@ -7,7 +7,7 @@
 [![Documentation](https://docs.rs/certauto/badge.svg)](https://docs.rs/certauto)
 [![License](https://img.shields.io/crates/l/certauto.svg)](LICENSE)
 
-[English](README.md) | **简体中文** | [繁體中文](README.zh-hant.md)
+[English](README.md) | **简体中文**
 
 CertAuto 为 Rust 程序提供生产级的自动证书管理：从任何 ACME 兼容的证书颁发机构（CA）自动获取、续期和服务 TLS 证书，只需几行代码。
 
