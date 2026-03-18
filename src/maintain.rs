@@ -822,7 +822,7 @@ mod tests {
     #[test]
     fn test_needs_ocsp_refresh_with_response() {
         let mut cert = make_managed_cert(&["example.com"], "h1", 60);
-        cert.ocsp_response = Some(vec![1, 2, 3]); // unparseable -> triggers refresh
+        cert.ocsp_response = Some(vec![1, 2, 3]); // unparsable -> triggers refresh
         assert!(needs_ocsp_refresh(&cert));
     }
 
