@@ -1,23 +1,23 @@
-# CertAuto
+# Certon
 
 **Automatic HTTPS/TLS certificate management for Rust, powered by the ACME protocol.**
 
 <!-- badges -->
-[![Crates.io](https://img.shields.io/crates/v/certauto.svg)](https://crates.io/crates/certauto)
-[![Documentation](https://docs.rs/certauto/badge.svg)](https://docs.rs/certauto)
-[![License](https://img.shields.io/crates/l/certauto.svg)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/certon.svg)](https://crates.io/crates/certon)
+[![Documentation](https://docs.rs/certon/badge.svg)](https://docs.rs/certon)
+[![License](https://img.shields.io/crates/l/certon.svg)](LICENSE)
 
 **English** | [简体中文](README.zh-hans.md) | [繁體中文](README.zh-hant.md)
 
-CertAuto brings production-grade automatic certificate management to Rust programs: obtain, renew, and serve TLS certificates from any ACME-compatible Certificate Authority, with just a few lines of code.
+Certon brings production-grade automatic certificate management to Rust programs: obtain, renew, and serve TLS certificates from any ACME-compatible Certificate Authority, with just a few lines of code.
 
 ```rust
-use certauto::Config;
+use certon::Config;
 
 #[tokio::main]
-async fn main() -> certauto::Result<()> {
+async fn main() -> certon::Result<()> {
     let domains = vec!["example.com".into()];
-    let tls_config = certauto::manage(&domains).await?;
+    let tls_config = certon::manage(&domains).await?;
     // Use tls_config with tokio-rustls, hyper, axum, salvo, etc.
     Ok(())
 }
@@ -84,18 +84,18 @@ async fn main() -> certauto::Result<()> {
    - Or use the DNS-01 challenge to waive both requirements entirely
    - This is a requirement of the ACME protocol, not a library limitation
 4. **Persistent storage** for certificates, keys, and metadata
-   - Default: local file system (`~/.local/share/certauto` on Linux, `~/Library/Application Support/certauto` on macOS, `%APPDATA%/certauto` on Windows)
+   - Default: local file system (`~/.local/share/certon` on Linux, `~/Library/Application Support/certon` on macOS, `%APPDATA%/certon` on Windows)
    - Custom backends available via the `Storage` trait
 
 > **Before using this library, your domain names MUST be pointed (A/AAAA records) at your server (unless you use the DNS-01 challenge).**
 
 ## Installation
 
-Add `certauto` to your `Cargo.toml`:
+Add `certon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-certauto = "0.1"
+certon = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -104,15 +104,15 @@ tokio = { version = "1", features = ["full"] }
 The simplest way to get started -- one function call manages everything:
 
 ```rust
-use certauto::Config;
+use certon::Config;
 
 #[tokio::main]
-async fn main() -> certauto::Result<()> {
+async fn main() -> certon::Result<()> {
     let domains = vec!["example.com".into()];
 
     // Obtain (or load from storage) certificates and return a
     // rustls::ServerConfig ready for use with any TLS server.
-    let tls_config = certauto::manage(&domains).await?;
+    let tls_config = certon::manage(&domains).await?;
 
     // Use tls_config with tokio-rustls, hyper, axum, salvo, etc.
     Ok(())
@@ -130,10 +130,10 @@ This will:
 
 ```rust
 use std::sync::Arc;
-use certauto::{Config, FileStorage, Storage};
+use certon::{Config, FileStorage, Storage};
 
 #[tokio::main]
-async fn main() -> certauto::Result<()> {
+async fn main() -> certon::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
     let config = Config::builder()
         .storage(storage)
@@ -143,7 +143,7 @@ async fn main() -> certauto::Result<()> {
     config.manage_sync(&domains).await?;
 
     // Start background maintenance (renewal + OCSP refresh).
-    let _handle = certauto::start_maintenance(&config);
+    let _handle = certon::start_maintenance(&config);
 
     Ok(())
 }
@@ -153,7 +153,7 @@ async fn main() -> certauto::Result<()> {
 
 ```rust
 use std::sync::Arc;
-use certauto::{
+use certon::{
     AcmeIssuer, Config, FileStorage, Storage,
     LETS_ENCRYPT_STAGING,
 };
@@ -179,7 +179,7 @@ The DNS-01 challenge is required for wildcard certificates and works even when y
 
 ```rust
 use std::sync::Arc;
-use certauto::{AcmeIssuer, Dns01Solver, DnsProvider};
+use certon::{AcmeIssuer, Dns01Solver, DnsProvider};
 
 // Implement DnsProvider for your DNS service (Cloudflare, Route53, etc.)
 let dns_solver = Arc::new(Dns01Solver::new(
@@ -201,7 +201,7 @@ To implement a DNS provider, implement the `DnsProvider` trait:
 
 ```rust
 use async_trait::async_trait;
-use certauto::{DnsProvider, Result};
+use certon::{DnsProvider, Result};
 
 struct MyDnsProvider { /* ... */ }
 
@@ -225,11 +225,11 @@ impl DnsProvider for MyDnsProvider {
 
 ### ZeroSSL
 
-ZeroSSL provides free certificates via ACME with External Account Binding. CertAuto handles EAB provisioning automatically using your ZeroSSL API key.
+ZeroSSL provides free certificates via ACME with External Account Binding. Certon handles EAB provisioning automatically using your ZeroSSL API key.
 
 ```rust
 use std::sync::Arc;
-use certauto::{Config, FileStorage, Storage, ZeroSslIssuer};
+use certon::{Config, FileStorage, Storage, ZeroSslIssuer};
 
 let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
 
@@ -252,8 +252,8 @@ Implement the `Storage` trait to use databases, Redis, S3, or any other persiste
 
 ```rust
 use async_trait::async_trait;
-use certauto::storage::{Storage, KeyInfo};
-use certauto::Result;
+use certon::storage::{Storage, KeyInfo};
+use certon::Result;
 
 struct MyDatabaseStorage { /* ... */ }
 
@@ -308,7 +308,7 @@ On-demand TLS obtains certificates at TLS handshake time for domains that have n
 ```rust
 use std::collections::HashSet;
 use std::sync::Arc;
-use certauto::OnDemandConfig;
+use certon::OnDemandConfig;
 
 let on_demand = Arc::new(OnDemandConfig {
     host_allowlist: Some(HashSet::from([
@@ -391,16 +391,16 @@ Events emitted include:
 
 ## The ACME Challenges
 
-The ACME protocol verifies domain ownership through challenges. CertAuto supports all three standard challenge types.
+The ACME protocol verifies domain ownership through challenges. Certon supports all three standard challenge types.
 
 ### HTTP-01 Challenge
 
 The HTTP-01 challenge proves control of a domain by serving a specific token at `http://<domain>/.well-known/acme-challenge/<token>` on **port 80**.
 
-CertAuto's `Http01Solver` starts a lightweight HTTP server that automatically serves the challenge response. The server is started when a challenge is presented and stopped when the challenge completes.
+Certon's `Http01Solver` starts a lightweight HTTP server that automatically serves the challenge response. The server is started when a challenge is presented and stopped when the challenge completes.
 
 ```rust
-use certauto::Http01Solver;
+use certon::Http01Solver;
 
 let solver = Http01Solver::new(80); // or Http01Solver::default()
 ```
@@ -411,10 +411,10 @@ let solver = Http01Solver::new(80); // or Http01Solver::default()
 
 The TLS-ALPN-01 challenge proves control of a domain by presenting a self-signed certificate with a special `acmeIdentifier` extension during a TLS handshake on **port 443**, negotiated via the `acme-tls/1` ALPN protocol.
 
-CertAuto's `TlsAlpn01Solver` handles this by generating an ephemeral challenge certificate and serving it on a temporary TLS listener.
+Certon's `TlsAlpn01Solver` handles this by generating an ephemeral challenge certificate and serving it on a temporary TLS listener.
 
 ```rust
-use certauto::TlsAlpn01Solver;
+use certon::TlsAlpn01Solver;
 
 let solver = TlsAlpn01Solver::new(443); // or TlsAlpn01Solver::default()
 ```
@@ -425,10 +425,10 @@ let solver = TlsAlpn01Solver::new(443); // or TlsAlpn01Solver::default()
 
 The DNS-01 challenge proves control of a domain by creating a specific TXT record at `_acme-challenge.<domain>`. This is the **only** challenge type that supports wildcard certificates and does not require your server to be publicly accessible.
 
-CertAuto's `Dns01Solver` accepts a `DnsProvider` implementation that creates and deletes TXT records via your DNS provider's API. It automatically waits for DNS propagation before notifying the CA.
+Certon's `Dns01Solver` accepts a `DnsProvider` implementation that creates and deletes TXT records via your DNS provider's API. It automatically waits for DNS propagation before notifying the CA.
 
 ```rust
-use certauto::Dns01Solver;
+use certon::Dns01Solver;
 
 let solver = Dns01Solver::new(Box::new(my_cloudflare_provider));
 // With custom propagation settings:
@@ -443,7 +443,7 @@ let solver = Dns01Solver::with_timeouts(
 
 ## Storage
 
-CertAuto requires persistent storage for certificates, private keys, metadata, OCSP staples, and lock files. Storage is abstracted behind the `Storage` trait, making it easy to swap backends.
+Certon requires persistent storage for certificates, private keys, metadata, OCSP staples, and lock files. Storage is abstracted behind the `Storage` trait, making it easy to swap backends.
 
 **Default: `FileStorage`**
 
@@ -451,7 +451,7 @@ The built-in `FileStorage` stores everything on the local file system with these
 
 - **Atomic writes** -- data is written to a temporary file, then atomically renamed into place, preventing partial reads
 - **Distributed locking** -- lock files contain a JSON timestamp refreshed by a background keepalive task every 5 seconds; stale locks (older than 10 seconds) are automatically broken
-- **Platform-aware paths** -- defaults to `~/.local/share/certauto` (Linux), `~/Library/Application Support/certauto` (macOS), or `%APPDATA%/certauto` (Windows)
+- **Platform-aware paths** -- defaults to `~/.local/share/certon` (Linux), `~/Library/Application Support/certon` (macOS), or `%APPDATA%/certon` (Windows)
 
 **Clustering:** Any instances sharing the same storage backend are considered part of the same cluster. For `FileStorage`, mounting a shared network folder is sufficient. For custom backends, ensure that all instances point to the same database/service.
 
@@ -473,7 +473,7 @@ The built-in `FileStorage` stores everything on the local file system with these
 
 ## Certificate Maintenance
 
-CertAuto runs background maintenance via `certauto::start_maintenance()`, which spawns a tokio task performing two periodic loops:
+Certon runs background maintenance via `certon::start_maintenance()`, which spawns a tokio task performing two periodic loops:
 
 1. **Renewal loop** (every 10 minutes by default) -- iterates all managed certificates in the cache and renews any that have entered the renewal window (by default, when less than 1/3 of the certificate lifetime remains)
 
@@ -485,7 +485,7 @@ Both loops respect the `CertCache::stop()` signal for graceful shutdown.
 let config = Config::builder().storage(storage).build();
 
 // Start background maintenance.
-let handle = certauto::start_maintenance(&config);
+let handle = certon::start_maintenance(&config);
 
 // ... later, to stop gracefully:
 // config.cache.stop();
@@ -510,23 +510,23 @@ Because `rustls::server::ResolvesServerCert::resolve` is synchronous, on-demand 
 
 ## API Reference
 
-Full API documentation is available on [docs.rs](https://docs.rs/certauto).
+Full API documentation is available on [docs.rs](https://docs.rs/certon).
 
 Key entry points:
 
-- [`certauto::manage()`](https://docs.rs/certauto/latest/certauto/fn.manage.html) -- highest-level function, returns a ready-to-use `rustls::ServerConfig`
-- [`Config::builder()`](https://docs.rs/certauto/latest/certauto/struct.ConfigBuilder.html) -- configure and build a `Config`
-- [`AcmeIssuer::builder()`](https://docs.rs/certauto/latest/certauto/struct.AcmeIssuerBuilder.html) -- configure an ACME issuer
-- [`Storage` trait](https://docs.rs/certauto/latest/certauto/trait.Storage.html) -- implement custom storage backends
-- [`Solver` trait](https://docs.rs/certauto/latest/certauto/trait.Solver.html) -- implement custom challenge solvers
-- [`DnsProvider` trait](https://docs.rs/certauto/latest/certauto/trait.DnsProvider.html) -- implement DNS providers for DNS-01 challenges
+- [`certon::manage()`](https://docs.rs/certon/latest/certon/fn.manage.html) -- highest-level function, returns a ready-to-use `rustls::ServerConfig`
+- [`Config::builder()`](https://docs.rs/certon/latest/certon/struct.ConfigBuilder.html) -- configure and build a `Config`
+- [`AcmeIssuer::builder()`](https://docs.rs/certon/latest/certon/struct.AcmeIssuerBuilder.html) -- configure an ACME issuer
+- [`Storage` trait](https://docs.rs/certon/latest/certon/trait.Storage.html) -- implement custom storage backends
+- [`Solver` trait](https://docs.rs/certon/latest/certon/trait.Solver.html) -- implement custom challenge solvers
+- [`DnsProvider` trait](https://docs.rs/certon/latest/certon/trait.DnsProvider.html) -- implement DNS providers for DNS-01 challenges
 
 ## Development and Testing
 
 Let's Encrypt imposes [strict rate limits](https://letsencrypt.org/docs/rate-limits/) on its production endpoint. During development, always use the **staging** endpoint:
 
 ```rust
-use certauto::LETS_ENCRYPT_STAGING;
+use certon::LETS_ENCRYPT_STAGING;
 
 let issuer = AcmeIssuer::builder()
     .ca(LETS_ENCRYPT_STAGING)
@@ -540,4 +540,4 @@ Staging certificates are not publicly trusted, but the rate limits are much more
 
 ## License
 
-CertAuto is licensed under the [Apache License 2.0](LICENSE).
+Certon is licensed under the [Apache License 2.0](LICENSE).

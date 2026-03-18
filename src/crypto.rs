@@ -450,7 +450,9 @@ fn wrap_ec_sec1_in_pkcs8(sec1_der: &[u8], key_type: KeyType) -> Result<Vec<u8>> 
         KeyType::EcdsaP384 => OID_P384,
         KeyType::EcdsaP521 => OID_P521,
         _ => {
-            return Err(CryptoError::PemDecode("cannot wrap non-EC key as EC PKCS#8".into()).into());
+            return Err(
+                CryptoError::PemDecode("cannot wrap non-EC key as EC PKCS#8".into()).into(),
+            );
         }
     };
 

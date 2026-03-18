@@ -1,8 +1,8 @@
-//! # CertAuto
+//! # Certon
 //!
 //! Automatic HTTPS/TLS certificate management using the ACME protocol.
 //!
-//! CertAuto provides production-grade automatic certificate management.
+//! Certon provides production-grade automatic certificate management.
 //!
 //! ## Quick Start
 //!
