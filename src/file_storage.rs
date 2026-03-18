@@ -398,85 +398,6 @@ impl FileStorage {
         }
     }
 
-    /// Try to acquire the lock with a maximum number of attempts.
-    ///
-    /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if
-    /// `max_attempts` was reached without acquiring the lock.
-    async fn try_obtain_lock(&self, name: &str, max_attempts: u32) -> Result<bool> {
-        let filename = self.lock_filename(name);
-        let mut empty_count: u32 = 0;
-        let mut attempts: u32 = 0;
-
-        loop {
-            attempts += 1;
-            if attempts > max_attempts {
-                return Ok(false);
-            }
-
-            match Self::create_lock_file(&filename).await {
-                Ok(true) => {
-                    let handle = Self::spawn_keepalive(filename);
-                    self.lock_keepalives
-                        .lock()
-                        .await
-                        .insert(name.to_string(), handle);
-                    return Ok(true);
-                }
-                Ok(false) => {
-                    // Lock file already exists -- fall through to staleness check.
-                }
-                Err(e) => {
-                    return Err(StorageError::LockFailed(format!("creating lock file: {e}")).into());
-                }
-            }
-
-            match Self::read_lock_meta(&filename).await {
-                Ok(None) => {
-                    empty_count += 1;
-                    if empty_count < MAX_EMPTY_LOCK_READS {
-                        tokio::time::sleep(EMPTY_LOCK_RETRY_DELAY).await;
-                        continue;
-                    }
-                    info!(
-                        name,
-                        "lock file empty after {MAX_EMPTY_LOCK_READS} reads; treating as stale"
-                    );
-                    let _ = tokio::fs::remove_file(&filename).await;
-                    continue;
-                }
-                Ok(Some(meta)) => {
-                    if Self::lock_is_stale(&meta) {
-                        info!(
-                            name,
-                            created = %meta.created,
-                            updated = %meta.updated,
-                            "lock is stale; removing and retrying"
-                        );
-                        match tokio::fs::remove_file(&filename).await {
-                            Ok(()) => continue,
-                            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                            Err(e) => {
-                                return Err(StorageError::LockFailed(format!(
-                                    "unable to delete stale lockfile; deadlocked: {e}"
-                                ))
-                                .into());
-                            }
-                        }
-                    }
-                    tokio::time::sleep(LOCK_POLL_INTERVAL).await;
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(
-                        StorageError::LockFailed(format!("accessing lock file: {e}")).into(),
-                    );
-                }
-            }
-        }
-    }
-
     /// Clean up empty ancestor directories up to (but not including)
     /// `self.path`.
     async fn clean_empty_dirs(&self, mut dir: &Path) {
@@ -737,6 +658,7 @@ fn default_data_dir() -> PathBuf {
 
 /// Best-effort detection of the user's home directory from environment
 /// variables.
+#[allow(dead_code)]
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {
