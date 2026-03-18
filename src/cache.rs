@@ -39,7 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::{RwLock, watch};
 use tracing::{debug, info};
 
@@ -372,10 +372,7 @@ impl CertCache {
         // Evict a random managed cert if at capacity.
         if options.capacity > 0 && cache.len() >= options.capacity {
             let cache_size = cache.len();
-            let target_idx = {
-                use rand::RngExt;
-                rand::rng().random_range(0..cache_size)
-            };
+            let target_idx = rand::rng().random_range(0..cache_size);
 
             // Collect all hashes so we can pick one by index.
             let hashes: Vec<String> = cache.keys().cloned().collect();
