@@ -47,8 +47,10 @@ use crate::error::{CryptoError, Result};
 ///
 /// The default is [`KeyType::EcdsaP256`] (P-256 ECDSA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum KeyType {
     /// ECDSA using the NIST P-256 curve (a.k.a. `secp256r1` / `prime256v1`).
+    #[default]
     EcdsaP256,
     /// ECDSA using the NIST P-384 curve (a.k.a. `secp384r1`).
     EcdsaP384,
@@ -64,11 +66,6 @@ pub enum KeyType {
     Ed25519,
 }
 
-impl Default for KeyType {
-    fn default() -> Self {
-        Self::EcdsaP256
-    }
-}
 
 impl fmt::Display for KeyType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -411,12 +408,12 @@ fn decode_ec_private_key(sec1_der: &[u8]) -> Result<PrivateKey> {
 /// optional parameters.
 fn detect_ec_curve_from_sec1(sec1_der: &[u8]) -> KeyType {
     // Try parsing the SEC 1 structure to look for the parameters OID.
-    if let Ok((_, parsed)) = x509_parser::der_parser::parse_der(sec1_der) {
-        if let Ok(seq) = parsed.as_sequence() {
+    if let Ok((_, parsed)) = x509_parser::der_parser::parse_der(sec1_der)
+        && let Ok(seq) = parsed.as_sequence() {
             // seq[0] = version, seq[1] = private key octet string,
             // seq[2..] = optional parameters/public key
-            if seq.len() > 1 {
-                if let Ok(privkey_bytes) = seq[1].as_slice() {
+            if seq.len() > 1
+                && let Ok(privkey_bytes) = seq[1].as_slice() {
                     // P-256 private keys are 32 bytes, P-384 are 48, P-521 are 66.
                     return match privkey_bytes.len() {
                         32 => KeyType::EcdsaP256,
@@ -425,9 +422,7 @@ fn detect_ec_curve_from_sec1(sec1_der: &[u8]) -> KeyType {
                         _ => KeyType::EcdsaP256, // default guess
                     };
                 }
-            }
         }
-    }
     KeyType::EcdsaP256
 }
 

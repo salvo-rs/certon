@@ -381,8 +381,8 @@ impl CertCache {
             for offset in 0..cache_size {
                 let idx = (target_idx + offset) % cache_size;
                 let hash = &hashes[idx];
-                if let Some(evict_cert) = cache.get(hash) {
-                    if evict_cert.managed {
+                if let Some(evict_cert) = cache.get(hash)
+                    && evict_cert.managed {
                         let evict_names = evict_cert.names.clone();
                         let evict_hash = evict_cert.hash.clone();
 
@@ -404,7 +404,6 @@ impl CertCache {
                         }
                         break;
                     }
-                }
             }
         }
 

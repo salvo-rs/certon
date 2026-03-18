@@ -745,15 +745,14 @@ impl Config {
 
                 // Task 7: Check OCSP revocation status. If the certificate
                 // has been revoked, trigger a renewal.
-                if !needs_action {
-                    if let Some(OcspStatus::Revoked) = cert.ocsp_status {
+                if !needs_action
+                    && let Some(OcspStatus::Revoked) = cert.ocsp_status {
                         warn!(
                             domain = %domain,
                             "certificate OCSP status is Revoked; triggering renewal"
                         );
                         needs_action = true;
                     }
-                }
 
                 if needs_action {
                     if r#async {
@@ -1034,8 +1033,8 @@ impl Config {
             let key_path = site_private_key(&issuer.issuer_key(), domain);
             match self.storage.load(&key_path).await {
                 Ok(pem_bytes) => {
-                    if let Ok(pem_str) = std::str::from_utf8(&pem_bytes) {
-                        if let Ok(pk) = decode_private_key_pem(pem_str) {
+                    if let Ok(pem_str) = std::str::from_utf8(&pem_bytes)
+                        && let Ok(pk) = decode_private_key_pem(pem_str) {
                             debug!(
                                 domain = %domain,
                                 issuer = %issuer.issuer_key(),
@@ -1043,7 +1042,6 @@ impl Config {
                             );
                             return Ok((pk, pem_str.to_string()));
                         }
-                    }
                 }
                 Err(_) => continue,
             }
@@ -1411,12 +1409,11 @@ impl Config {
                     if let (Ok(cert_pem), Ok(key_pem)) = (
                         self.storage.load(&cert_key).await,
                         self.storage.load(&key_key).await,
-                    ) {
-                        if let Ok(c) = Certificate::from_pem(&cert_pem, &key_pem) {
+                    )
+                        && let Ok(c) = Certificate::from_pem(&cert_pem, &key_pem) {
                             found = Some(c);
                             break;
                         }
-                    }
                 }
                 match found {
                     Some(c) => c,

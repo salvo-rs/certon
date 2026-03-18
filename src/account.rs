@@ -247,9 +247,7 @@ pub async fn save_account(
     let pk_key = storage_key_user_private_key(&issuer_key, &email);
 
     // Store registration JSON.
-    if let Err(e) = storage.store(&reg_key, &reg_bytes).await {
-        return Err(e);
-    }
+    storage.store(&reg_key, &reg_bytes).await?;
 
     // Store private key PEM; roll back the registration JSON on failure.
     if let Err(e) = storage
@@ -413,7 +411,7 @@ pub async fn most_recent_account_email(
             continue;
         }
 
-        let dominated = best_modified.map_or(false, |bm| info.modified <= bm);
+        let dominated = best_modified.is_some_and(|bm| info.modified <= bm);
         if !dominated {
             best_modified = Some(info.modified);
             best_email = Some(email_part);

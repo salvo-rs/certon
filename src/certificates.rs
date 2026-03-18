@@ -661,11 +661,10 @@ fn is_internal_ip(addr: &str) -> bool {
 /// Extracts only the host part from a potential `host:port` string.
 fn host_only(hostport: &str) -> &str {
     // Handle IPv6 bracket notation: [::1]:8080
-    if hostport.starts_with('[') {
-        if let Some(end) = hostport.find(']') {
+    if hostport.starts_with('[')
+        && let Some(end) = hostport.find(']') {
             return &hostport[1..end];
         }
-    }
     // If there are multiple colons, it is likely a bare IPv6 address (not
     // bracket-wrapped), so do not attempt host:port splitting.
     if hostport.matches(':').count() > 1 {
@@ -803,11 +802,10 @@ fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
         .and_then(|attr| attr.as_str().ok())
         .map(|s| s.to_lowercase());
 
-    if let Some(ref cn) = cn {
-        if !cn.is_empty() {
+    if let Some(ref cn) = cn
+        && !cn.is_empty() {
             names.push(cn.clone());
         }
-    }
 
     // Extract SANs.
     if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
@@ -825,7 +823,7 @@ fn extract_names(cert: &X509Certificate<'_>) -> Result<Vec<String>> {
 
             if let Some(san) = san_str {
                 // Skip if it duplicates the CN.
-                let dominated_by_cn = cn.as_ref().map_or(false, |c| c == &san);
+                let dominated_by_cn = cn.as_ref() == Some(&san);
                 if !dominated_by_cn && !san.is_empty() {
                     names.push(san);
                 }

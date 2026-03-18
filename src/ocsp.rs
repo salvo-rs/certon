@@ -393,11 +393,10 @@ fn extract_ocsp_urls_from_parsed(cert: &X509Certificate<'_>) -> Result<Vec<Strin
     for ext in cert.extensions() {
         if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
             for desc in aia.accessdescs.iter() {
-                if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_OCSP {
-                    if let GeneralName::URI(uri) = &desc.access_location {
+                if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_OCSP
+                    && let GeneralName::URI(uri) = &desc.access_location {
                         urls.push(uri.to_string());
                     }
-                }
             }
         }
     }
@@ -415,11 +414,10 @@ fn extract_ca_issuer_urls_from_parsed(cert: &X509Certificate<'_>) -> Vec<String>
     for ext in cert.extensions() {
         if let ParsedExtension::AuthorityInfoAccess(aia) = ext.parsed_extension() {
             for desc in aia.accessdescs.iter() {
-                if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS {
-                    if let GeneralName::URI(uri) = &desc.access_location {
+                if desc.access_method == OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS
+                    && let GeneralName::URI(uri) = &desc.access_location {
                         urls.push(uri.to_string());
                     }
-                }
             }
         }
     }
@@ -937,7 +935,7 @@ fn parse_tbs_response_data(
     if idx >= tbs.len() {
         return Err(CertError::OcspFailed("ResponseData missing producedAt".into()).into());
     }
-    let produced_at = parse_generalized_time_from_obj(&tbs[idx]).unwrap_or_else(|| Utc::now());
+    let produced_at = parse_generalized_time_from_obj(&tbs[idx]).unwrap_or_else(Utc::now);
     idx += 1;
 
     // responses: SEQUENCE OF SingleResponse
@@ -997,7 +995,7 @@ fn parse_single_response(
     let next_update = if seq.len() > 3 && is_context_tagged(&seq[3], 0) {
         // Unwrap the context tag to get the GeneralizedTime inside.
         let content = get_context_content(&seq[3]);
-        content.and_then(|bytes| parse_generalized_time_from_bytes(bytes))
+        content.and_then(parse_generalized_time_from_bytes)
     } else {
         None
     };
@@ -1119,11 +1117,10 @@ fn parse_generalized_time_from_obj(
 ) -> Option<DateTime<Utc>> {
     // If this object is a GeneralizedTime (tag 24 / 0x18), its content
     // bytes are the ASCII time string.
-    if let Ok(bytes) = obj.content.as_slice() {
-        if let Some(dt) = parse_time_string(bytes) {
+    if let Ok(bytes) = obj.content.as_slice()
+        && let Some(dt) = parse_time_string(bytes) {
             return Some(dt);
         }
-    }
 
     None
 }

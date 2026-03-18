@@ -231,7 +231,7 @@ impl FileStorage {
             }
         })
         .await
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, e))??;
+        .map_err(|e| std::io::Error::other(e))??;
 
         Ok(result)
     }
@@ -290,13 +290,13 @@ impl FileStorage {
             (&file).seek(std::io::SeekFrom::Start(0))?;
             meta.updated = chrono::Utc::now();
             serde_json::to_writer(&file, &meta)
-                .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?;
+                .map_err(|e| std::io::Error::other(e))?;
             file.sync_all()?;
 
             Ok(false) // keep going
         })
         .await
-        .map_err(|e| std::io::Error::new(ErrorKind::Other, e))?
+        .map_err(|e| std::io::Error::other(e))?
     }
 
     /// Spawn a background task that periodically refreshes a lock file's

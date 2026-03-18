@@ -420,11 +420,10 @@ pub fn is_valid_challenge_token(token: &str) -> bool {
 /// Handles IPv6 bracket notation (e.g. `[::1]:8080` -> `::1`).
 fn strip_port(host: &str) -> &str {
     // Handle IPv6 bracket notation: [::1]:8080
-    if host.starts_with('[') {
-        if let Some(end) = host.find(']') {
+    if host.starts_with('[')
+        && let Some(end) = host.find(']') {
             return &host[1..end];
         }
-    }
     // If there are multiple colons, it is likely a bare IPv6 address.
     if host.matches(':').count() > 1 {
         return host;

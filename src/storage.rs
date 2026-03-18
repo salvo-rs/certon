@@ -344,7 +344,7 @@ pub fn issuer_key(ca_url: &str) -> String {
             if path.is_empty() || path == "/" {
                 host.to_owned()
             } else {
-                let collapsed = path.replace('/', "-").replace('\\', "-");
+                let collapsed = path.replace(['/', '\\'], "-");
                 let collapsed = collapsed.trim_matches('-');
                 if collapsed.is_empty() {
                     host.to_owned()

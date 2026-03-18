@@ -1006,15 +1006,14 @@ impl Solver for DistributedSolver {
                     }
                 } else {
                     // Store the updated map.
-                    if let Ok(json_bytes) = serde_json::to_vec(&token_map) {
-                        if let Err(e) = self.storage.store(&storage_key, &json_bytes).await {
+                    if let Ok(json_bytes) = serde_json::to_vec(&token_map)
+                        && let Err(e) = self.storage.store(&storage_key, &json_bytes).await {
                             error!(
                                 key = %storage_key,
                                 error = %e,
                                 "failed to update challenge tokens in storage during cleanup"
                             );
                         }
-                    }
                 }
             }
             Err(e) => {
