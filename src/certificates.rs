@@ -197,7 +197,7 @@ impl Certificate {
                     let start_utc = start.with_timezone(&Utc);
                     let end_utc = end.with_timezone(&Utc);
                     if start_utc < end_utc {
-                        use rand::Rng;
+                        use rand::RngExt;
                         let range_secs = (end_utc - start_utc).num_seconds().max(1);
                         let offset = rand::rng().random_range(0..range_secs);
                         let random_time = start_utc + ChronoDuration::seconds(offset);
