@@ -38,7 +38,7 @@ pem = "3"
 aws-lc-rs = { version = "1", optional = true }
 ring = { version = "0.17", optional = true }
 sha1 = "0.10"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # ECDSA / RSA / Ed25519 keys
 p256 = { version = "0.13", features = ["ecdsa"] }
