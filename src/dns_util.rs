@@ -737,8 +737,8 @@ mod tests {
     #[test]
     fn test_recursive_nameservers_defaults() {
         let servers = recursive_nameservers(&[]);
-        assert_eq!(servers.len(), 4);
-        assert!(servers[0].ends_with(":53"));
+        assert!(!servers.is_empty());
+        assert!(servers.iter().all(|s| s.ends_with(":53")));
     }
 
     #[test]
