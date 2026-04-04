@@ -1,8 +1,8 @@
 [package]
 name = "certon"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.92"
 description = "Automatic HTTPS/TLS certificate management via the ACME protocol"
 license = "Apache-2.0"
 repository = "https://github.com/salvo-rs/certon"
