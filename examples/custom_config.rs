@@ -13,6 +13,8 @@ use certon::{
     Result, Storage,
 };
 
+type EventCallback = dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -45,11 +47,10 @@ async fn main() -> Result<()> {
 
     // -- Event callback --------------------------------------------------------
     // Receive lifecycle events (cert_obtaining, cert_obtained, cert_failed, etc.)
-    let on_event: Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync> =
-        Arc::new(|event_name, data| {
-            println!("[event] {}: {}", event_name, data);
-            Ok(())
-        });
+    let on_event: Arc<EventCallback> = Arc::new(|event_name, data| {
+        println!("[event] {}: {}", event_name, data);
+        Ok(())
+    });
 
     // -- Build the Config ------------------------------------------------------
     let config = Config::builder()

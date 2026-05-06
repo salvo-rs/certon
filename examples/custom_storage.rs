@@ -83,10 +83,10 @@ impl Storage for MemoryStorage {
 
         let mut results = Vec::new();
         for key in data.keys() {
-            if let Some(rest) = key.strip_prefix(&prefix) {
-                if recursive || !rest.contains('/') {
-                    results.push(key.clone());
-                }
+            if let Some(rest) = key.strip_prefix(&prefix)
+                && (recursive || !rest.contains('/'))
+            {
+                results.push(key.clone());
             }
         }
         results.sort();

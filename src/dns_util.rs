@@ -307,7 +307,7 @@ async fn lookup_txt(fqdn: &str) -> Result<Vec<String>> {
     let resolver = TokioResolver::builder_tokio()
         .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?
         .build()
-        .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?;
+        .map_err(|e| Error::Other(format!("failed to build DNS resolver: {e}")))?;
     let response = resolver
         .txt_lookup(fqdn)
         .await

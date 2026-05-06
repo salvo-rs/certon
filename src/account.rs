@@ -47,7 +47,7 @@ const DEFAULT_KEY_FILENAME: &str = "private";
 /// Accounts are uniquely identified by their CA URL and email address.
 /// A single application may have accounts on multiple CAs simultaneously
 /// (e.g. Let's Encrypt production and ZeroSSL).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AcmeAccount {
     /// Account status as reported by the CA (e.g. `"valid"`, `"deactivated"`,
     /// `"revoked"`).
@@ -76,6 +76,20 @@ pub struct AcmeAccount {
     /// The key algorithm used for this account's private key.
     #[serde(default)]
     pub key_type: KeyType,
+}
+
+impl std::fmt::Debug for AcmeAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcmeAccount")
+            .field("status", &self.status)
+            .field("contact", &self.contact)
+            .field("location", &self.location)
+            .field("terms_of_service_agreed", &self.terms_of_service_agreed)
+            .field("private_key_pem", &"[REDACTED]")
+            .field("private_key_pem_len", &self.private_key_pem.len())
+            .field("key_type", &self.key_type)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

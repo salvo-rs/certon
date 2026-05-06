@@ -14,6 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::acme_client::{ExternalAccountBinding, ZEROSSL_PRODUCTION};
 use crate::acme_issuer::{AcmeIssuer, CertIssuer, ChainPreference, IssuedCertificate, Revoker};
@@ -31,6 +32,52 @@ const ZEROSSL_EAB_ENDPOINT: &str = "https://api.zerossl.com/acme/eab-credentials
 
 /// The issuer key prefix used for storage partitioning.
 const ZEROSSL_ISSUER_KEY: &str = "zerossl";
+
+/// Timeout for individual ZeroSSL API requests.
+const ZEROSSL_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn zerossl_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(ZEROSSL_HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Other(format!("failed to build ZeroSSL HTTP client: {e}")))
+}
+
+fn zerossl_url(base: &str, api_key: &str) -> Result<Url> {
+    let mut url = Url::parse(base)
+        .map_err(|e| Error::Other(format!("failed to build ZeroSSL API URL: {e}")))?;
+    url.query_pairs_mut().append_pair("access_key", api_key);
+    Ok(url)
+}
+
+fn zerossl_api_url<'a>(segments: impl IntoIterator<Item = &'a str>, api_key: &str) -> Result<Url> {
+    let mut url = Url::parse(ZEROSSL_API_BASE)
+        .map_err(|e| Error::Other(format!("failed to build ZeroSSL API URL: {e}")))?;
+    {
+        let mut path_segments = url
+            .path_segments_mut()
+            .map_err(|_| Error::Other("ZeroSSL API base URL cannot be a base".to_owned()))?;
+        path_segments.clear();
+        for segment in segments {
+            path_segments.push(segment);
+        }
+    }
+    url.query_pairs_mut().append_pair("access_key", api_key);
+    Ok(url)
+}
+
+fn zerossl_request_error(action: &str, e: reqwest::Error) -> Error {
+    let timeout = e.is_timeout();
+    let e = e.without_url();
+    if timeout {
+        Error::Timeout(format!(
+            "ZeroSSL {action} timed out after {:?}",
+            ZEROSSL_HTTP_TIMEOUT
+        ))
+    } else {
+        Error::Other(format!("failed to {action}: {e}"))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // EAB API response
@@ -146,16 +193,16 @@ impl Revoker for ZeroSslIssuer {
 /// This makes a POST request to ZeroSSL's EAB endpoint and returns the
 /// [`ExternalAccountBinding`] that can be used with ACME registration.
 async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> {
-    let url = format!("{ZEROSSL_EAB_ENDPOINT}?access_key={api_key}");
+    let url = zerossl_url(ZEROSSL_EAB_ENDPOINT, api_key)?;
 
     debug!("fetching EAB credentials from ZeroSSL API");
 
-    let client = reqwest::Client::new();
+    let client = zerossl_client()?;
     let resp = client
-        .post(&url)
+        .post(url)
         .send()
         .await
-        .map_err(|e| Error::Other(format!("failed to request ZeroSSL EAB credentials: {e}")))?;
+        .map_err(|e| zerossl_request_error("request EAB credentials", e))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -654,17 +701,14 @@ impl ZeroSslApiIssuer {
         csr_pem: &str,
         domains: &[String],
     ) -> Result<ZeroSslCertResponse> {
-        let url = format!(
-            "{ZEROSSL_API_BASE}/certificates?access_key={}",
-            self.api_key
-        );
+        let url = zerossl_api_url(["certificates"], &self.api_key)?;
         let domains_csv = domains.join(",");
 
         debug!(domains = %domains_csv, "creating ZeroSSL certificate via REST API");
 
-        let client = reqwest::Client::new();
+        let client = zerossl_client()?;
         let resp = client
-            .post(&url)
+            .post(url)
             .form(&[
                 ("certificate_domains", domains_csv.as_str()),
                 ("certificate_csr", csr_pem),
@@ -672,7 +716,7 @@ impl ZeroSslApiIssuer {
             ])
             .send()
             .await
-            .map_err(|e| Error::Other(format!("failed to create ZeroSSL certificate: {e}")))?;
+            .map_err(|e| zerossl_request_error("create ZeroSSL certificate", e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -712,25 +756,20 @@ impl ZeroSslApiIssuer {
     /// This tells ZeroSSL to send validation emails to the domain's
     /// administrative contacts.
     async fn verify_by_email(&self, cert_id: &str) -> Result<()> {
-        let url = format!(
-            "{ZEROSSL_API_BASE}/certificates/{cert_id}/challenges?access_key={}",
-            self.api_key
-        );
+        let url = zerossl_api_url(["certificates", cert_id, "challenges"], &self.api_key)?;
 
         debug!(
             cert_id = cert_id,
             "initiating email validation for ZeroSSL certificate"
         );
 
-        let client = reqwest::Client::new();
+        let client = zerossl_client()?;
         let resp = client
-            .post(&url)
+            .post(url)
             .form(&[("validation_method", "EMAIL")])
             .send()
             .await
-            .map_err(|e| {
-                Error::Other(format!("failed to initiate ZeroSSL email validation: {e}"))
-            })?;
+            .map_err(|e| zerossl_request_error("initiate ZeroSSL email validation", e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -756,11 +795,8 @@ impl ZeroSslApiIssuer {
     /// if the maximum number of poll attempts is exceeded or an unexpected
     /// status is encountered.
     async fn wait_for_issued(&self, cert_id: &str) -> Result<ZeroSslCertResponse> {
-        let url = format!(
-            "{ZEROSSL_API_BASE}/certificates/{cert_id}?access_key={}",
-            self.api_key
-        );
-        let client = reqwest::Client::new();
+        let url = zerossl_api_url(["certificates", cert_id], &self.api_key)?;
+        let client = zerossl_client()?;
 
         for attempt in 1..=MAX_POLL_ATTEMPTS {
             tokio::time::sleep(self.poll_interval).await;
@@ -771,9 +807,11 @@ impl ZeroSslApiIssuer {
                 "polling ZeroSSL certificate status"
             );
 
-            let resp = client.get(&url).send().await.map_err(|e| {
-                Error::Other(format!("failed to poll ZeroSSL certificate status: {e}"))
-            })?;
+            let resp = client
+                .get(url.clone())
+                .send()
+                .await
+                .map_err(|e| zerossl_request_error("poll ZeroSSL certificate status", e))?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -825,18 +863,19 @@ impl ZeroSslApiIssuer {
     /// Returns the PEM-encoded certificate chain (leaf + CA bundle
     /// concatenated).
     async fn download_certificate(&self, cert_id: &str) -> Result<String> {
-        let url = format!(
-            "{ZEROSSL_API_BASE}/certificates/{cert_id}/download/return?access_key={}",
-            self.api_key
-        );
+        let url = zerossl_api_url(
+            ["certificates", cert_id, "download", "return"],
+            &self.api_key,
+        )?;
 
         debug!(cert_id = cert_id, "downloading ZeroSSL certificate");
 
-        let client = reqwest::Client::new();
-        let resp =
-            client.get(&url).send().await.map_err(|e| {
-                Error::Other(format!("failed to download ZeroSSL certificate: {e}"))
-            })?;
+        let client = zerossl_client()?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| zerossl_request_error("download ZeroSSL certificate", e))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -969,20 +1008,17 @@ impl Revoker for ZeroSslApiIssuer {
         })?;
 
         let reason_str = reason.unwrap_or(0).to_string();
-        let url = format!(
-            "{ZEROSSL_API_BASE}/certificates/{cert_id}/revoke?access_key={}",
-            self.api_key
-        );
+        let url = zerossl_api_url(["certificates", &cert_id, "revoke"], &self.api_key)?;
 
         debug!(cert_id = %cert_id, reason = %reason_str, "revoking ZeroSSL certificate via REST API");
 
-        let client = reqwest::Client::new();
+        let client = zerossl_client()?;
         let resp = client
-            .post(&url)
+            .post(url)
             .form(&[("reason", reason_str.as_str())])
             .send()
             .await
-            .map_err(|e| Error::Other(format!("failed to revoke ZeroSSL certificate: {e}")))?;
+            .map_err(|e| zerossl_request_error("revoke ZeroSSL certificate", e))?;
 
         let status = resp.status();
         if !status.is_success() {
