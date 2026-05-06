@@ -1408,6 +1408,18 @@ fn is_authorized_ocsp_responder(
         return false;
     }
 
+    // Reject expired or not-yet-valid delegated responder certificates so a
+    // stale OCSP signing key cannot keep producing accepted responses after
+    // the CA has rotated it.
+    if !responder_cert.validity().is_valid() {
+        debug!(
+            not_before = %responder_cert.validity().not_before,
+            not_after = %responder_cert.validity().not_after,
+            "delegated OCSP responder certificate is outside its validity window"
+        );
+        return false;
+    }
+
     let has_ocsp_signing_eku = responder_cert
         .extended_key_usage()
         .ok()
