@@ -306,14 +306,19 @@ async fn try_lookup_txt(name: &str, expected_value: &str) -> std::result::Result
 async fn lookup_txt(fqdn: &str) -> Result<Vec<String>> {
     let resolver = TokioResolver::builder_tokio()
         .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?
-        .build();
+        .build()
+        .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?;
     let response = resolver
         .txt_lookup(fqdn)
         .await
         .map_err(|e| Error::Other(format!("DNS TXT lookup failed for {fqdn}: {e}")))?;
     Ok(response
+        .answers()
         .iter()
-        .map(|r: &hickory_resolver::proto::rr::rdata::TXT| r.to_string())
+        .filter_map(|record| match &record.data {
+            hickory_resolver::proto::rr::RData::TXT(txt) => Some(txt.to_string()),
+            _ => None,
+        })
         .collect())
 }
 
@@ -447,8 +452,8 @@ pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
         return None;
     }
 
-    let resolver = match TokioResolver::builder_tokio() {
-        Ok(builder) => builder.build(),
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
+        Ok(resolver) => resolver,
         Err(_) => {
             let result = find_zone_by_fqdn_heuristic(fqdn);
             zone_cache_set(&normalized, result.clone());
