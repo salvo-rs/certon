@@ -425,7 +425,7 @@ impl StorageKeys {
 /// Note that `certificate_pem` and `private_key_pem` are marked
 /// `#[serde(skip)]` because they are stored as separate files in storage
 /// rather than inline in the JSON metadata sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CertificateResource {
     /// The Subject Alternative Names on the certificate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -446,6 +446,19 @@ pub struct CertificateResource {
     /// The unique key identifying the issuer of this certificate.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub issuer_key: String,
+}
+
+impl std::fmt::Debug for CertificateResource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertificateResource")
+            .field("sans", &self.sans)
+            .field("certificate_pem_len", &self.certificate_pem.len())
+            .field("private_key_pem", &"[REDACTED]")
+            .field("private_key_pem_len", &self.private_key_pem.len())
+            .field("issuer_data", &self.issuer_data)
+            .field("issuer_key", &self.issuer_key)
+            .finish()
+    }
 }
 
 impl CertificateResource {

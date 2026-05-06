@@ -15,8 +15,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["aws-lc-rs"]
-aws-lc-rs = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs", "rcgen/aws_lc_rs", "reqwest/rustls"]
-ring = ["dep:ring", "rustls/ring", "tokio-rustls/ring", "rcgen/ring", "reqwest/rustls-no-provider"]
+aws-lc-rs = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs", "rcgen/aws_lc_rs", "reqwest/rustls", "x509-parser/verify-aws"]
+ring = ["dep:ring", "rustls/ring", "tokio-rustls/ring", "rcgen/ring", "reqwest/rustls-no-provider", "x509-parser/verify"]
 
 [dependencies]
 # Async runtime
@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "charset", "form"] }
 
 # TLS
-rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.40", default-features = false, features = ["logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
 
 # Certificate generation and parsing
@@ -35,7 +35,7 @@ x509-parser = "0.18"
 pem = "3"
 
 # Crypto primitives
-aws-lc-rs = { version = "1", optional = true }
+aws-lc-rs = { version = "1.16.3", optional = true }
 ring = { version = "0.17", optional = true }
 sha1 = "0.11"
 sha2 = "0.11"

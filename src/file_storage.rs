@@ -12,8 +12,8 @@
 //!   `%APPDATA%/certon` on Windows).
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::io::{ErrorKind, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -116,11 +116,87 @@ impl FileStorage {
 
     // -- path helpers -------------------------------------------------------
 
-    /// Map a storage key to an absolute filesystem path.
-    fn filename(&self, key: &str) -> PathBuf {
-        // Keys use forward-slash separators regardless of OS.
-        let relative: PathBuf = key.split('/').collect();
-        self.path.join(relative)
+    /// Map a storage key to a filesystem path under the storage root.
+    fn filename(&self, key: &str) -> Result<PathBuf> {
+        self.filename_inner(key, false)
+    }
+
+    /// Map a storage prefix to a filesystem path under the storage root.
+    fn prefix_filename(&self, prefix: &str) -> Result<PathBuf> {
+        self.filename_inner(prefix, true)
+    }
+
+    fn filename_inner(&self, key: &str, allow_empty: bool) -> Result<PathBuf> {
+        if key.is_empty() {
+            return if allow_empty {
+                Ok(self.path.clone())
+            } else {
+                Err(invalid_key_error(key, "empty keys are not allowed"))
+            };
+        }
+
+        if key.contains('\\') {
+            return Err(invalid_key_error(
+                key,
+                "keys must use forward slash separators",
+            ));
+        }
+
+        if key.contains('\0') {
+            return Err(invalid_key_error(key, "keys must not contain NUL bytes"));
+        }
+
+        let mut relative = PathBuf::new();
+        for component in key.split('/') {
+            if component.is_empty() {
+                return Err(invalid_key_error(
+                    key,
+                    "keys must not contain empty path components",
+                ));
+            }
+            if component == "." || component == ".." {
+                return Err(invalid_key_error(
+                    key,
+                    "keys must not contain dot path components",
+                ));
+            }
+            if component.contains(':') {
+                return Err(invalid_key_error(
+                    key,
+                    "keys must not contain drive or alternate-stream separators",
+                ));
+            }
+
+            let component_path = Path::new(component);
+            if component_path.is_absolute()
+                || component_path.components().any(|part| {
+                    matches!(
+                        part,
+                        Component::Prefix(_)
+                            | Component::RootDir
+                            | Component::ParentDir
+                            | Component::CurDir
+                    )
+                })
+            {
+                return Err(invalid_key_error(
+                    key,
+                    "keys must be relative storage paths",
+                ));
+            }
+
+            relative.push(component);
+        }
+
+        let filename = self.path.join(relative);
+        if !filename.starts_with(&self.path) {
+            return Err(invalid_key_error(
+                key,
+                "resolved key escapes the storage root",
+            ));
+        }
+
+        Ok(filename)
     }
 
     /// Return the directory that holds lock files.
@@ -156,22 +232,29 @@ impl FileStorage {
         );
         let temp_path = path.with_file_name(temp_name);
 
-        // Write data to temp file.
-        if let Err(e) = tokio::fs::write(&temp_path, data).await {
-            // Clean up temp file on failure.
+        let data = data.to_vec();
+        let temp_path_for_write = temp_path.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(_mode);
+            }
+
+            let mut file = options.open(&temp_path_for_write)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(std::io::Error::other);
+
+        if let Err(e) = write_result.and_then(|inner| inner) {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(e);
-        }
-
-        // Set file permissions on Unix.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(_mode);
-            if let Err(e) = tokio::fs::set_permissions(&temp_path, perms).await {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(e);
-            }
         }
 
         // Rename into final location.
@@ -437,7 +520,7 @@ impl std::fmt::Display for FileStorage {
 #[async_trait]
 impl Storage for FileStorage {
     async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
-        let filename = self.filename(key);
+        let filename = self.filename(key)?;
 
         // Determine permission mode based on whether this looks like a private
         // key (contains ".key" in path).
@@ -449,7 +532,7 @@ impl Storage for FileStorage {
     }
 
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
-        let filename = self.filename(key);
+        let filename = self.filename(key)?;
         tokio::fs::read(&filename).await.map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
                 StorageError::NotFound(key.to_string()).into()
@@ -460,7 +543,7 @@ impl Storage for FileStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let filename = self.filename(key);
+        let filename = self.filename(key)?;
 
         // Try removing as a file first, then as a directory tree.
         match tokio::fs::remove_file(&filename).await {
@@ -485,7 +568,7 @@ impl Storage for FileStorage {
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        let filename = self.filename(key);
+        let filename = self.filename(key)?;
         match tokio::fs::metadata(&filename).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
@@ -494,7 +577,7 @@ impl Storage for FileStorage {
     }
 
     async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
-        let walk_prefix = self.filename(prefix);
+        let walk_prefix = self.prefix_filename(prefix)?;
         let mut keys = Vec::new();
 
         // Use a manual stack-based walk so we can control recursion depth.
@@ -540,7 +623,7 @@ impl Storage for FileStorage {
     }
 
     async fn stat(&self, key: &str) -> Result<KeyInfo> {
-        let filename = self.filename(key);
+        let filename = self.filename(key)?;
         let metadata = tokio::fs::metadata(&filename).await.map_err(|e| {
             if e.kind() == ErrorKind::NotFound {
                 Error::from(StorageError::NotFound(key.to_string()))
@@ -655,6 +738,14 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(".").join("certon")
 }
 
+fn invalid_key_error(key: &str, reason: &str) -> Error {
+    StorageError::Io(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("invalid storage key {key:?}: {reason}"),
+    ))
+    .into()
+}
+
 /// Best-effort detection of the user's home directory from environment
 /// variables.
 #[allow(dead_code)]
@@ -697,9 +788,34 @@ mod tests {
     fn filename_mapping() {
         let fs = FileStorage::new("/data");
         assert_eq!(
-            fs.filename("certificates/acme/example.com"),
+            fs.filename("certificates/acme/example.com").unwrap(),
             PathBuf::from("/data/certificates/acme/example.com")
         );
+    }
+
+    #[test]
+    fn filename_rejects_escape_keys() {
+        let fs = FileStorage::new("/data");
+        for key in [
+            "",
+            "../outside",
+            "certs/../../outside",
+            "/absolute",
+            "certs//leaf",
+            "certs/",
+            "certs/./leaf",
+            "certs\\leaf",
+            "C:/outside",
+            "certs/leaf:key",
+        ] {
+            assert!(fs.filename(key).is_err(), "key should be rejected: {key}");
+        }
+    }
+
+    #[test]
+    fn empty_prefix_maps_to_storage_root_for_listing() {
+        let fs = FileStorage::new("/data");
+        assert_eq!(fs.prefix_filename("").unwrap(), PathBuf::from("/data"));
     }
 
     #[test]

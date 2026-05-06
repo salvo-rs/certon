@@ -202,7 +202,7 @@ pub trait Manager: Send + Sync {
 /// Contains the PEM-encoded certificate chain, the private key (if one was
 /// generated during issuance), and arbitrary issuer-specific metadata
 /// (such as the ACME order URL and certificate URL).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IssuedCertificate {
     /// PEM-encoded certificate chain.
     pub certificate_pem: Vec<u8>,
@@ -211,6 +211,17 @@ pub struct IssuedCertificate {
     /// Arbitrary issuer-specific metadata (e.g. the ACME certificate URL,
     /// order details, etc.).
     pub metadata: serde_json::Value,
+}
+
+impl std::fmt::Debug for IssuedCertificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCertificate")
+            .field("certificate_pem_len", &self.certificate_pem.len())
+            .field("private_key_pem", &"[REDACTED]")
+            .field("private_key_pem_len", &self.private_key_pem.len())
+            .field("metadata", &self.metadata)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

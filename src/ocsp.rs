@@ -22,11 +22,13 @@ use std::collections::HashMap;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use sha1::{Digest as Sha1Digest, Sha1};
 use tracing::{debug, warn};
+use x509_parser::asn1_rs::FromDer;
 use x509_parser::extensions::GeneralName;
 use x509_parser::oid_registry::{
-    OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS, OID_PKIX_ACCESS_DESCRIPTOR_OCSP,
+    OID_HASH_SHA1, OID_PKIX_ACCESS_DESCRIPTOR_CA_ISSUERS, OID_PKIX_ACCESS_DESCRIPTOR_OCSP,
 };
 use x509_parser::prelude::*;
+use x509_parser::verify::verify_signature;
 
 use crate::certificates::Certificate;
 use crate::error::{CertError, CryptoError, Error, Result, StorageError};
@@ -143,6 +145,51 @@ pub struct OcspResponse {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug)]
+struct ParsedOcspResponse<'a> {
+    response: OcspResponse,
+    basic: Option<ParsedBasicOcspResponse<'a>>,
+}
+
+#[derive(Debug)]
+struct ParsedBasicOcspResponse<'a> {
+    tbs_response_data: &'a [u8],
+    signature_algorithm: x509_parser::x509::AlgorithmIdentifier<'a>,
+    signature_value: x509_parser::asn1_rs::BitString<'a>,
+    included_certs: Vec<&'a [u8]>,
+    responder_id: OcspResponderId,
+    cert_id: OcspCertId,
+}
+
+#[derive(Debug)]
+struct ParsedResponseData {
+    response: OcspResponse,
+    responder_id: OcspResponderId,
+    cert_id: OcspCertId,
+}
+
+#[derive(Debug)]
+enum OcspResponderId {
+    ByName(Vec<u8>),
+    ByKey(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct OcspCertId {
+    issuer_name_hash: Vec<u8>,
+    issuer_key_hash: Vec<u8>,
+    serial_number: Vec<u8>,
+    uses_sha1: bool,
+}
+
+#[derive(Debug)]
+struct DerTlv<'a> {
+    tag: u8,
+    full: &'a [u8],
+    value: &'a [u8],
+    rest: &'a [u8],
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -162,6 +209,9 @@ const DEFAULT_OCSP_LIFETIME_HOURS: i64 = 24;
 
 /// SHA-1 algorithm OID for OCSP request hashing: 1.3.14.3.2.26
 const OID_SHA1: &[u8] = &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A];
+
+/// id-pkix-ocsp-basic OID content bytes: 1.3.6.1.5.5.7.48.1.1
+const OID_OCSP_BASIC_CONTENT: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
 
 // ---------------------------------------------------------------------------
 // OCSP response status codes (outer envelope)
@@ -231,7 +281,7 @@ pub async fn staple_ocsp(
     // Try loading a cached OCSP response from storage.
     match storage.load(&ocsp_storage_key).await {
         Ok(cached_bytes) => {
-            match parse_ocsp_response_raw(&cached_bytes) {
+            match parse_ocsp_response_for_cert_chain(&cached_bytes, &cert.cert_chain).await {
                 Ok(parsed) if is_ocsp_fresh(&parsed) => {
                     debug!(
                         name = %first_name,
@@ -484,6 +534,57 @@ async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
     }
 }
 
+async fn parse_ocsp_response_for_cert_chain(
+    data: &[u8],
+    chain: &[rustls::pki_types::CertificateDer<'static>],
+) -> Result<OcspResponse> {
+    if chain.is_empty() {
+        return Err(CertError::OcspFailed("certificate chain is empty".into()).into());
+    }
+
+    let leaf_der = chain[0].as_ref();
+    let (_, leaf) = X509Certificate::from_der(leaf_der).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("failed to parse leaf certificate: {e}"))
+    })?;
+
+    let fetched_issuer_der: Option<Vec<u8>>;
+    let issuer_der_ref: &[u8] = if chain.len() >= 2 {
+        chain[1].as_ref()
+    } else {
+        let issuer_urls = extract_ca_issuer_urls_from_parsed(&leaf);
+        let mut downloaded = None;
+        for url in &issuer_urls {
+            match fetch_issuer_cert(url).await {
+                Ok(der_bytes) => {
+                    debug!(url = %url, "fetched issuer certificate from AIA extension");
+                    downloaded = Some(der_bytes);
+                    break;
+                }
+                Err(e) => {
+                    debug!(url = %url, error = %e, "failed to fetch issuer from AIA URL");
+                }
+            }
+        }
+        fetched_issuer_der = downloaded;
+        match fetched_issuer_der.as_deref() {
+            Some(d) => d,
+            None => {
+                return Err(CertError::OcspFailed(
+                    "certificate chain has only 1 entry and issuer could not be fetched from AIA"
+                        .into(),
+                )
+                .into());
+            }
+        }
+    };
+
+    let (_, issuer) = X509Certificate::from_der(issuer_der_ref).map_err(|e| {
+        CryptoError::InvalidCertificate(format!("failed to parse issuer certificate: {e}"))
+    })?;
+
+    parse_and_validate_ocsp_response_raw(data, &leaf, &issuer)
+}
+
 // ---------------------------------------------------------------------------
 // Fetch OCSP response for a certificate chain
 // ---------------------------------------------------------------------------
@@ -585,8 +686,8 @@ async fn get_ocsp_for_cert_chain(
     // Send HTTP POST request.
     let raw_response = send_ocsp_request(&ocsp_url, &ocsp_request_der).await?;
 
-    // Parse the response.
-    let parsed = parse_ocsp_response_raw(&raw_response)?;
+    // Parse and validate the signed response before caching or stapling it.
+    let parsed = parse_and_validate_ocsp_response_raw(&raw_response, &leaf, &issuer)?;
 
     Ok((raw_response, parsed))
 }
@@ -817,37 +918,59 @@ async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
 ///   singleExtensions [1] EXPLICIT Extensions OPTIONAL
 /// }
 /// ```
+#[cfg(test)]
 fn parse_ocsp_response_raw(data: &[u8]) -> Result<OcspResponse> {
-    use x509_parser::der_parser::parse_der;
+    parse_ocsp_response_der(data).map(|parsed| parsed.response)
+}
 
-    let (_, outer) = parse_der(data)
-        .map_err(|e| CertError::OcspFailed(format!("failed to parse OCSP response DER: {e}")))?;
+fn parse_and_validate_ocsp_response_raw(
+    data: &[u8],
+    leaf: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> Result<OcspResponse> {
+    let parsed = parse_ocsp_response_der(data)?;
+    if let Some(basic) = &parsed.basic {
+        validate_basic_ocsp_response(basic, leaf, issuer)?;
+    } else {
+        return Err(CertError::OcspFailed(
+            "OCSP responder did not return a successful BasicOCSPResponse".into(),
+        )
+        .into());
+    }
+    Ok(parsed.response)
+}
 
-    let outer_seq = outer
-        .as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!("OCSP response is not a SEQUENCE: {e}")))?;
-
-    if outer_seq.is_empty() {
+fn parse_ocsp_response_der(data: &[u8]) -> Result<ParsedOcspResponse<'_>> {
+    let outer_tlv = read_der_tlv(data)?;
+    if outer_tlv.tag != 0x30 || !outer_tlv.rest.is_empty() {
+        return Err(CertError::OcspFailed("OCSP response is not a single SEQUENCE".into()).into());
+    }
+    if outer_tlv.value.is_empty() {
         return Err(CertError::OcspFailed("OCSP response SEQUENCE is empty".into()).into());
     }
 
     // responseStatus: ENUMERATED
-    let response_status = outer_seq[0]
-        .as_u32()
-        .map_err(|e| CertError::OcspFailed(format!("failed to parse responseStatus: {e}")))?;
+    let response_status_tlv = read_der_tlv(outer_tlv.value)?;
+    if response_status_tlv.tag != 0x0a {
+        return Err(CertError::OcspFailed("OCSP responseStatus is not ENUMERATED".into()).into());
+    }
+    let response_status = parse_der_u32(response_status_tlv.value)?;
 
     if response_status != OCSP_RESPONSE_STATUS_SUCCESSFUL as u32 {
-        return Ok(OcspResponse {
-            status: OcspStatus::ServerFailed,
-            raw: data.to_vec(),
-            this_update: Utc::now(),
-            next_update: None,
-            produced_at: Utc::now(),
-            revoked_at: None,
+        return Ok(ParsedOcspResponse {
+            response: OcspResponse {
+                status: OcspStatus::ServerFailed,
+                raw: data.to_vec(),
+                this_update: Utc::now(),
+                next_update: None,
+                produced_at: Utc::now(),
+                revoked_at: None,
+            },
+            basic: None,
         });
     }
 
-    if outer_seq.len() < 2 {
+    if response_status_tlv.rest.is_empty() {
         return Err(
             CertError::OcspFailed("successful OCSP response missing responseBytes".into()).into(),
         );
@@ -855,36 +978,78 @@ fn parse_ocsp_response_raw(data: &[u8]) -> Result<OcspResponse> {
 
     // responseBytes: [0] EXPLICIT ResponseBytes
     // The context-tagged [0] wraps a SEQUENCE { OID, OCTET STRING }.
-    let response_bytes_wrapper = &outer_seq[1];
-    let response_bytes_content = get_context_content(response_bytes_wrapper).ok_or_else(|| {
-        CertError::OcspFailed("failed to unwrap responseBytes context tag".into())
-    })?;
-
-    let (_, resp_bytes_der) = parse_der(response_bytes_content)
-        .map_err(|e| CertError::OcspFailed(format!("failed to parse ResponseBytes: {e}")))?;
-
-    let resp_bytes_seq = resp_bytes_der
-        .as_sequence()
-        .map_err(|e| CertError::OcspFailed(format!("ResponseBytes is not a SEQUENCE: {e}")))?;
-
-    if resp_bytes_seq.len() < 2 {
-        return Err(CertError::OcspFailed("ResponseBytes SEQUENCE too short".into()).into());
+    let response_bytes_wrapper = read_der_tlv(response_status_tlv.rest)?;
+    if response_bytes_wrapper.tag != 0xa0 || !response_bytes_wrapper.rest.is_empty() {
+        return Err(
+            CertError::OcspFailed("failed to unwrap responseBytes context tag".into()).into(),
+        );
     }
 
-    // resp_bytes_seq[0] is the responseType OID (should be id-pkix-ocsp-basic).
-    // resp_bytes_seq[1] is the OCTET STRING containing BasicOCSPResponse.
-    let basic_resp_der = resp_bytes_seq[1].as_slice().map_err(|e| {
-        CertError::OcspFailed(format!(
-            "failed to extract BasicOCSPResponse OCTET STRING: {e}"
-        ))
-    })?;
+    let response_bytes = read_der_tlv(response_bytes_wrapper.value)?;
+    if response_bytes.tag != 0x30 || !response_bytes.rest.is_empty() {
+        return Err(CertError::OcspFailed("ResponseBytes is not a SEQUENCE".into()).into());
+    }
 
-    parse_basic_ocsp_response(basic_resp_der, data)
+    let response_type = read_der_tlv(response_bytes.value)?;
+    if response_type.tag != 0x06 || response_type.value != OID_OCSP_BASIC_CONTENT {
+        return Err(
+            CertError::OcspFailed("OCSP responseType is not id-pkix-ocsp-basic".into()).into(),
+        );
+    }
+
+    let response_octet = read_der_tlv(response_type.rest)?;
+    if response_octet.tag != 0x04 || !response_octet.rest.is_empty() {
+        return Err(CertError::OcspFailed(
+            "ResponseBytes response is not a single OCTET STRING".into(),
+        )
+        .into());
+    }
+
+    parse_basic_ocsp_response(response_octet.value, data)
 }
 
 /// Parse a BasicOCSPResponse structure.
-fn parse_basic_ocsp_response(data: &[u8], raw: &[u8]) -> Result<OcspResponse> {
+fn parse_basic_ocsp_response<'a>(data: &'a [u8], raw: &[u8]) -> Result<ParsedOcspResponse<'a>> {
     use x509_parser::der_parser::parse_der;
+
+    let basic_tlv = read_der_tlv(data)?;
+    if basic_tlv.tag != 0x30 || !basic_tlv.rest.is_empty() {
+        return Err(
+            CertError::OcspFailed("BasicOCSPResponse is not a single SEQUENCE".into()).into(),
+        );
+    }
+
+    let tbs_tlv = read_der_tlv(basic_tlv.value)?;
+    let signature_algorithm_tlv = read_der_tlv(tbs_tlv.rest)?;
+    let signature_value_tlv = read_der_tlv(signature_algorithm_tlv.rest)?;
+    let included_certs = parse_basic_ocsp_included_certs(signature_value_tlv.rest)?;
+
+    let (sig_alg_rest, signature_algorithm) = x509_parser::x509::AlgorithmIdentifier::from_der(
+        signature_algorithm_tlv.full,
+    )
+    .map_err(|e| {
+        CertError::OcspFailed(format!(
+            "failed to parse BasicOCSPResponse signatureAlgorithm: {e}"
+        ))
+    })?;
+    if !sig_alg_rest.is_empty() {
+        return Err(CertError::OcspFailed(
+            "BasicOCSPResponse signatureAlgorithm has trailing data".into(),
+        )
+        .into());
+    }
+
+    let (sig_rest, signature_value) =
+        x509_parser::asn1_rs::BitString::from_der(signature_value_tlv.full).map_err(|e| {
+            CertError::OcspFailed(format!(
+                "failed to parse BasicOCSPResponse signature BIT STRING: {e}"
+            ))
+        })?;
+    if !sig_rest.is_empty() {
+        return Err(
+            CertError::OcspFailed("BasicOCSPResponse signature has trailing data".into()).into(),
+        );
+    }
 
     let (_, basic) = parse_der(data)
         .map_err(|e| CertError::OcspFailed(format!("failed to parse BasicOCSPResponse: {e}")))?;
@@ -902,7 +1067,18 @@ fn parse_basic_ocsp_response(data: &[u8], raw: &[u8]) -> Result<OcspResponse> {
         .as_sequence()
         .map_err(|e| CertError::OcspFailed(format!("tbsResponseData is not a SEQUENCE: {e}")))?;
 
-    parse_tbs_response_data(tbs, raw)
+    let parsed_response_data = parse_tbs_response_data(tbs, raw)?;
+    Ok(ParsedOcspResponse {
+        response: parsed_response_data.response,
+        basic: Some(ParsedBasicOcspResponse {
+            tbs_response_data: tbs_tlv.full,
+            signature_algorithm,
+            signature_value,
+            included_certs,
+            responder_id: parsed_response_data.responder_id,
+            cert_id: parsed_response_data.cert_id,
+        }),
+    })
 }
 
 /// Parse the ResponseData (tbsResponseData) structure.
@@ -917,7 +1093,7 @@ fn parse_basic_ocsp_response(data: &[u8], raw: &[u8]) -> Result<OcspResponse> {
 fn parse_tbs_response_data(
     tbs: &[x509_parser::der_parser::ber::BerObject<'_>],
     raw: &[u8],
-) -> Result<OcspResponse> {
+) -> Result<ParsedResponseData> {
     // The version field is optional (context tag [0]). We need to handle
     // both cases: with and without version.
     let mut idx = 0;
@@ -927,11 +1103,12 @@ fn parse_tbs_response_data(
         idx += 1; // skip version
     }
 
-    // responderID: can be byName [1] or byKey [2] -- skip it.
+    // responderID: can be byName [1] or byKey [2].
     if idx >= tbs.len() {
         return Err(CertError::OcspFailed("ResponseData too short".into()).into());
     }
-    idx += 1; // skip responderID
+    let responder_id = parse_responder_id(&tbs[idx])?;
+    idx += 1;
 
     // producedAt: GeneralizedTime
     if idx >= tbs.len() {
@@ -957,7 +1134,12 @@ fn parse_tbs_response_data(
     }
 
     // Parse the first SingleResponse (we only need one).
-    parse_single_response(&responses[0], raw, produced_at)
+    let (response, cert_id) = parse_single_response(&responses[0], raw, produced_at)?;
+    Ok(ParsedResponseData {
+        response,
+        responder_id,
+        cert_id,
+    })
 }
 
 /// Parse a SingleResponse structure.
@@ -973,7 +1155,7 @@ fn parse_single_response(
     obj: &x509_parser::der_parser::ber::BerObject<'_>,
     raw: &[u8],
     produced_at: DateTime<Utc>,
-) -> Result<OcspResponse> {
+) -> Result<(OcspResponse, OcspCertId)> {
     let seq = obj
         .as_sequence()
         .map_err(|e| CertError::OcspFailed(format!("SingleResponse is not a SEQUENCE: {e}")))?;
@@ -985,7 +1167,8 @@ fn parse_single_response(
         .into());
     }
 
-    // seq[0] = certID (skip)
+    let cert_id = parse_cert_id(&seq[0])?;
+
     // seq[1] = certStatus
     let (status, revoked_at) = parse_cert_status(&seq[1])?;
 
@@ -1002,14 +1185,17 @@ fn parse_single_response(
         None
     };
 
-    Ok(OcspResponse {
-        status,
-        raw: raw.to_vec(),
-        this_update,
-        next_update,
-        produced_at,
-        revoked_at,
-    })
+    Ok((
+        OcspResponse {
+            status,
+            raw: raw.to_vec(),
+            this_update,
+            next_update,
+            produced_at,
+            revoked_at,
+        },
+        cert_id,
+    ))
 }
 
 /// Parse the CertStatus field from a SingleResponse.
@@ -1058,9 +1244,291 @@ fn parse_cert_status(
     Ok((OcspStatus::Unknown, None))
 }
 
+fn parse_responder_id(
+    obj: &x509_parser::der_parser::ber::BerObject<'_>,
+) -> Result<OcspResponderId> {
+    if is_context_tagged(obj, 1) {
+        let name = get_context_content(obj)
+            .ok_or_else(|| CertError::OcspFailed("responderID byName is empty".into()))?;
+        return Ok(OcspResponderId::ByName(name.to_vec()));
+    }
+
+    if is_context_tagged(obj, 2) {
+        let key_hash = get_context_content(obj)
+            .ok_or_else(|| CertError::OcspFailed("responderID byKey is empty".into()))?;
+        let key_hash = x509_parser::der_parser::parse_der(key_hash)
+            .ok()
+            .and_then(|(_, inner)| inner.as_slice().ok().map(|bytes| bytes.to_vec()))
+            .unwrap_or_else(|| key_hash.to_vec());
+        return Ok(OcspResponderId::ByKey(key_hash));
+    }
+
+    Err(CertError::OcspFailed("unsupported responderID choice in OCSP response".into()).into())
+}
+
+fn parse_cert_id(obj: &x509_parser::der_parser::ber::BerObject<'_>) -> Result<OcspCertId> {
+    let seq = obj
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("CertID is not a SEQUENCE: {e}")))?;
+    if seq.len() < 4 {
+        return Err(CertError::OcspFailed("CertID SEQUENCE too short".into()).into());
+    }
+
+    let hash_algorithm = seq[0]
+        .as_sequence()
+        .map_err(|e| CertError::OcspFailed(format!("CertID hashAlgorithm is invalid: {e}")))?;
+    let hash_oid = hash_algorithm
+        .first()
+        .ok_or_else(|| CertError::OcspFailed("CertID hashAlgorithm is empty".into()))?
+        .as_oid()
+        .map_err(|e| CertError::OcspFailed(format!("CertID hashAlgorithm OID invalid: {e}")))?;
+
+    let issuer_name_hash = seq[1]
+        .as_slice()
+        .map_err(|e| CertError::OcspFailed(format!("issuerNameHash is invalid: {e}")))?
+        .to_vec();
+    let issuer_key_hash = seq[2]
+        .as_slice()
+        .map_err(|e| CertError::OcspFailed(format!("issuerKeyHash is invalid: {e}")))?
+        .to_vec();
+    let serial_number = seq[3]
+        .as_slice()
+        .map_err(|e| CertError::OcspFailed(format!("CertID serialNumber is invalid: {e}")))?
+        .to_vec();
+
+    Ok(OcspCertId {
+        issuer_name_hash,
+        issuer_key_hash,
+        serial_number,
+        uses_sha1: *hash_oid == OID_HASH_SHA1,
+    })
+}
+
+fn validate_basic_ocsp_response(
+    basic: &ParsedBasicOcspResponse<'_>,
+    leaf: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> Result<()> {
+    validate_ocsp_cert_id(&basic.cert_id, leaf, issuer)?;
+
+    if responder_matches_cert(&basic.responder_id, issuer)
+        && verify_basic_ocsp_signature(basic, issuer).is_ok()
+    {
+        return Ok(());
+    }
+
+    for cert_der in &basic.included_certs {
+        let (_, responder_cert) = match X509Certificate::from_der(cert_der) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                debug!(error = %e, "skipping unparsable OCSP responder certificate");
+                continue;
+            }
+        };
+
+        if !responder_matches_cert(&basic.responder_id, &responder_cert) {
+            continue;
+        }
+        if !is_authorized_ocsp_responder(&responder_cert, issuer) {
+            continue;
+        }
+        if verify_basic_ocsp_signature(basic, &responder_cert).is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(CertError::OcspFailed(
+        "BasicOCSPResponse signature or responder authorization could not be verified".into(),
+    )
+    .into())
+}
+
+fn validate_ocsp_cert_id(
+    cert_id: &OcspCertId,
+    leaf: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> Result<()> {
+    if !cert_id.uses_sha1 {
+        return Err(
+            CertError::OcspFailed("OCSP CertID uses an unsupported hash algorithm".into()).into(),
+        );
+    }
+
+    let expected_issuer_name_hash = sha1_hash(issuer.subject().as_raw());
+    let expected_issuer_key_hash = hash_issuer_public_key(issuer)?;
+    if cert_id.issuer_name_hash != expected_issuer_name_hash
+        || cert_id.issuer_key_hash != expected_issuer_key_hash
+    {
+        return Err(CertError::OcspFailed(
+            "OCSP CertID issuer hashes do not match the certificate issuer".into(),
+        )
+        .into());
+    }
+
+    if normalize_der_integer(&cert_id.serial_number) != normalize_der_integer(leaf.raw_serial()) {
+        return Err(CertError::OcspFailed(
+            "OCSP CertID serial number does not match the leaf certificate".into(),
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn verify_basic_ocsp_signature(
+    basic: &ParsedBasicOcspResponse<'_>,
+    signer: &X509Certificate<'_>,
+) -> Result<()> {
+    verify_signature(
+        signer.public_key(),
+        &basic.signature_algorithm,
+        &basic.signature_value,
+        basic.tbs_response_data,
+    )
+    .map_err(|e| CertError::OcspFailed(format!("OCSP signature verification failed: {e}")).into())
+}
+
+fn responder_matches_cert(responder_id: &OcspResponderId, cert: &X509Certificate<'_>) -> bool {
+    match responder_id {
+        OcspResponderId::ByName(name) => name.as_slice() == cert.subject().as_raw(),
+        OcspResponderId::ByKey(key_hash) => {
+            key_hash.as_slice() == sha1_hash(&cert.public_key().subject_public_key.data)
+        }
+    }
+}
+
+fn is_authorized_ocsp_responder(
+    responder_cert: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> bool {
+    if responder_cert
+        .verify_signature(Some(issuer.public_key()))
+        .is_err()
+    {
+        return false;
+    }
+
+    let has_ocsp_signing_eku = responder_cert
+        .extended_key_usage()
+        .ok()
+        .flatten()
+        .map(|eku| eku.value.ocsp_signing)
+        .unwrap_or(false);
+    if !has_ocsp_signing_eku {
+        return false;
+    }
+
+    responder_cert
+        .key_usage()
+        .ok()
+        .flatten()
+        .map(|key_usage| key_usage.value.digital_signature())
+        .unwrap_or(true)
+}
+
+fn normalize_der_integer(bytes: &[u8]) -> &[u8] {
+    let mut normalized = bytes;
+    while normalized.len() > 1 && normalized[0] == 0 {
+        normalized = &normalized[1..];
+    }
+    normalized
+}
+
 // ---------------------------------------------------------------------------
 // DER helpers
 // ---------------------------------------------------------------------------
+
+fn read_der_tlv(input: &[u8]) -> Result<DerTlv<'_>> {
+    if input.len() < 2 {
+        return Err(CertError::OcspFailed("truncated DER object".into()).into());
+    }
+
+    let tag = input[0];
+    let len_byte = input[1];
+    let (len, header_len) = if len_byte & 0x80 == 0 {
+        (len_byte as usize, 2)
+    } else {
+        let len_len = (len_byte & 0x7f) as usize;
+        if len_len == 0 {
+            return Err(
+                CertError::OcspFailed("indefinite DER length is not allowed".into()).into(),
+            );
+        }
+        if len_len > std::mem::size_of::<usize>() || input.len() < 2 + len_len {
+            return Err(CertError::OcspFailed("invalid DER length".into()).into());
+        }
+        let mut len = 0usize;
+        for byte in &input[2..2 + len_len] {
+            len = (len << 8) | (*byte as usize);
+        }
+        (len, 2 + len_len)
+    };
+
+    let end = header_len
+        .checked_add(len)
+        .ok_or_else(|| CertError::OcspFailed("DER length overflow".into()))?;
+    if input.len() < end {
+        return Err(CertError::OcspFailed("truncated DER content".into()).into());
+    }
+
+    Ok(DerTlv {
+        tag,
+        full: &input[..end],
+        value: &input[header_len..end],
+        rest: &input[end..],
+    })
+}
+
+fn parse_der_u32(input: &[u8]) -> Result<u32> {
+    let input = normalize_der_integer(input);
+    if input.is_empty() || input.len() > 4 {
+        return Err(CertError::OcspFailed("invalid DER integer length".into()).into());
+    }
+
+    let mut value: u32 = 0;
+    for byte in input {
+        value = (value << 8) | (*byte as u32);
+    }
+    Ok(value)
+}
+
+fn parse_basic_ocsp_included_certs(mut input: &[u8]) -> Result<Vec<&[u8]>> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let certs_wrapper = read_der_tlv(input)?;
+    if certs_wrapper.tag != 0xa0 || !certs_wrapper.rest.is_empty() {
+        return Err(CertError::OcspFailed(
+            "BasicOCSPResponse certs field is not a single [0] EXPLICIT value".into(),
+        )
+        .into());
+    }
+
+    let certs_seq = read_der_tlv(certs_wrapper.value)?;
+    if certs_seq.tag != 0x30 || !certs_seq.rest.is_empty() {
+        return Err(CertError::OcspFailed(
+            "BasicOCSPResponse certs field is not a SEQUENCE".into(),
+        )
+        .into());
+    }
+
+    input = certs_seq.value;
+    let mut certs = Vec::new();
+    while !input.is_empty() {
+        let cert_tlv = read_der_tlv(input)?;
+        if cert_tlv.tag != 0x30 {
+            return Err(CertError::OcspFailed(
+                "BasicOCSPResponse included cert is not a SEQUENCE".into(),
+            )
+            .into());
+        }
+        certs.push(cert_tlv.full);
+        input = cert_tlv.rest;
+    }
+
+    Ok(certs)
+}
 
 /// Minimal DER TLV wrapper (same as in crypto.rs).
 fn der_wrap(tag: u8, content: &[u8]) -> Vec<u8> {

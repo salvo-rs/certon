@@ -99,7 +99,7 @@ pub use file_storage::FileStorage;
 pub use handshake::{CertResolver, OnDemandConfig};
 pub use maintain::MaintenanceConfig;
 pub use ocsp::OcspConfig;
-pub use redirect::{HttpsRedirectHandler, start_https_redirect};
+pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
 pub use solvers::{
     DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
 };
