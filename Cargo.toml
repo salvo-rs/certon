@@ -1,6 +1,6 @@
 [package]
 name = "certon"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Automatic HTTPS/TLS certificate management via the ACME protocol"
