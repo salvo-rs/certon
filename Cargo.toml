@@ -44,7 +44,7 @@ sha2 = "0.11"
 p256 = { version = "0.13", features = ["ecdsa"] }
 p521 = { version = "0.13", features = ["ecdsa"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying"] }
-elliptic-curve = { version = "0.13", features = ["sec1"] }
+elliptic-curve = { version = "0.14", features = ["sec1"] }
 signature = "3"
 rsa = { version = "0.9", features = ["sha2"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
