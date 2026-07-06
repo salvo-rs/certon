@@ -47,7 +47,7 @@ ecdsa = { version = "0.16", features = ["signing", "verifying"] }
 elliptic-curve = { version = "0.13", features = ["sec1"] }
 signature = "3"
 rsa = { version = "0.9", features = ["sha2"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 
 # Encoding
 base64 = "0.22"
