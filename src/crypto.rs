@@ -269,10 +269,10 @@ fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
 /// The `ring` crate does not support P-521, so we use the `p521` crate
 /// from RustCrypto and encode via the `elliptic-curve` PKCS#8 support.
 fn generate_p521_pkcs8() -> Result<Vec<u8>> {
-    use elliptic_curve::pkcs8::EncodePrivateKey;
     use p521::ecdsa::SigningKey;
+    use p521::elliptic_curve::pkcs8::EncodePrivateKey;
 
-    let signing_key = SigningKey::random(&mut elliptic_curve::rand_core::OsRng);
+    let signing_key = SigningKey::random(&mut p521::elliptic_curve::rand_core::OsRng);
     let secret_key = signing_key.as_nonzero_scalar();
     let sk = p521::SecretKey::from(secret_key);
     let doc = sk
@@ -539,7 +539,7 @@ fn validate_ec_key(pkcs8_der: &[u8], key_type: KeyType) -> Result<()> {
         }
         KeyType::EcdsaP521 => {
             // The `ring` crate does not support P-521; validate using the p521 crate.
-            use elliptic_curve::pkcs8::DecodePrivateKey;
+            use p521::elliptic_curve::pkcs8::DecodePrivateKey;
             p521::SecretKey::from_pkcs8_der(pkcs8_der)
                 .map_err(|e| CryptoError::InvalidKey(format!("P-521 validation failed: {e}")))?;
         }
@@ -597,7 +597,7 @@ fn decode_pkcs8_private_key(pkcs8_der: &[u8]) -> Result<PrivateKey> {
 
     // Try ECDSA P-521 (not supported by the `ring` crate, use p521 crate).
     {
-        use elliptic_curve::pkcs8::DecodePrivateKey;
+        use p521::elliptic_curve::pkcs8::DecodePrivateKey;
         if p521::SecretKey::from_pkcs8_der(pkcs8_der).is_ok() {
             return Ok(PrivateKey {
                 key_type: KeyType::EcdsaP521,
