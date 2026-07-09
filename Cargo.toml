@@ -42,7 +42,7 @@ sha2 = "0.11"
 
 # ECDSA / RSA / Ed25519 keys
 p256 = { version = "0.14", features = ["ecdsa"] }
-p521 = { version = "0.13", features = ["ecdsa"] }
+p521 = { version = "0.14", features = ["ecdsa"] }
 ecdsa = "0.17"
 elliptic-curve = { version = "0.14", features = ["sec1"] }
 signature = "3"
