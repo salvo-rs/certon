@@ -78,7 +78,7 @@ async fn main() -> certon::Result<()> {
 
 ## Requirements
 
-1. **Rust 2024 edition** (Rust 1.89+) with a Tokio async runtime
+1. **Rust 2024 edition** (Rust 1.92+) with a Tokio async runtime
 2. **Public DNS name(s)** you control, pointed (A/AAAA records) at your server
 3. **Port 80** accessible from the public internet (for HTTP-01 challenge), and/or **port 443** (for TLS-ALPN-01 challenge)
    - These can be forwarded to other ports you control
@@ -96,7 +96,7 @@ Add `certon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-certon = "0.1"
+certon = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -113,7 +113,7 @@ The default `aws-lc-rs` backend requires no extra configuration. To use `ring` i
 
 ```toml
 [dependencies]
-certon = { version = "0.1", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring"] }
 ```
 
 ## Quick Start
