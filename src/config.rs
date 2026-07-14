@@ -1465,7 +1465,7 @@ impl Config {
     /// Build a [`rustls::ClientConfig`] for mutual TLS (mTLS) using a
     /// managed certificate.
     ///
-    /// This is a convenience wrapper around [`client_credentials`] that
+    /// This is a convenience wrapper around [`Self::client_credentials`] that
     /// produces a ready-to-use `ClientConfig`.
     ///
     /// # Errors
