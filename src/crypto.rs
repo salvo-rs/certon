@@ -269,12 +269,10 @@ fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
 /// The `ring` crate does not support P-521, so we use the `p521` crate
 /// from RustCrypto and encode via the `elliptic-curve` PKCS#8 support.
 fn generate_p521_pkcs8() -> Result<Vec<u8>> {
-    use p521::ecdsa::SigningKey;
+    use p521::elliptic_curve::Generate;
     use p521::elliptic_curve::pkcs8::EncodePrivateKey;
 
-    let signing_key = SigningKey::random(&mut p521::elliptic_curve::rand_core::OsRng);
-    let secret_key = signing_key.as_nonzero_scalar();
-    let sk = p521::SecretKey::from(secret_key);
+    let sk = p521::SecretKey::generate_from_rng(&mut rand::rng());
     let doc = sk
         .to_pkcs8_der()
         .map_err(|e| CryptoError::KeyGeneration(format!("ECDSA P-521 PKCS#8 encode: {e}")))?;
@@ -884,6 +882,18 @@ mod tests {
 
         let decoded = decode_private_key_pem(&pem_str).unwrap();
         assert_eq!(decoded.key_type(), KeyType::EcdsaP384);
+    }
+
+    #[test]
+    fn test_generate_and_roundtrip_ecdsa_p521() {
+        let key = generate_private_key(KeyType::EcdsaP521).unwrap();
+        assert_eq!(key.key_type(), KeyType::EcdsaP521);
+
+        let pem_str = encode_private_key_pem(&key).unwrap();
+        assert!(pem_str.contains("EC PRIVATE KEY"));
+
+        let decoded = decode_private_key_pem(&pem_str).unwrap();
+        assert_eq!(decoded.key_type(), KeyType::EcdsaP521);
     }
 
     #[test]
