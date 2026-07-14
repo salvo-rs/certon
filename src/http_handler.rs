@@ -201,7 +201,7 @@ impl HttpChallengeHandler {
 
     /// Handle an incoming HTTP request with blind solving fallback.
     ///
-    /// This method works like [`handle_request`] but adds a "blind solving"
+    /// This method works like [`Self::handle_request`] but adds a "blind solving"
     /// fallback: if a challenge token is found in the path but is NOT in the
     /// local map or storage, and `account_thumbprint` is provided, it returns
     /// `{token}.{thumbprint}` as the key authorization.

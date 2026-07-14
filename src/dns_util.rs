@@ -400,7 +400,7 @@ pub fn clear_zone_cache() {
 /// (e.g. no network), falls back to a heuristic that returns the last two
 /// labels of the domain.
 ///
-/// Results are cached for [`ZONE_CACHE_TTL`] to avoid repeated DNS lookups.
+/// Results are cached for `ZONE_CACHE_TTL` to avoid repeated DNS lookups.
 ///
 /// # Examples
 ///
@@ -436,7 +436,7 @@ pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {
 /// Returns the first domain that has an SOA record. Falls back to the
 /// heuristic if no SOA is found.
 ///
-/// Results are cached for [`ZONE_CACHE_TTL`] to avoid repeated DNS lookups.
+/// Results are cached for `ZONE_CACHE_TTL` to avoid repeated DNS lookups.
 pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
     let normalized = from_fqdn(fqdn).to_lowercase();
 
