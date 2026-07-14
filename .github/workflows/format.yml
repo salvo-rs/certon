@@ -1,7 +1,18 @@
 on:
+  pull_request:
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - 'rustfmt.toml'
+      - '.github/workflows/format.yml'
   push:
     branches:
-      - '*'
+      - main
+    paths:
+      - '**.rs'
+      - '**/Cargo.toml'
+      - 'rustfmt.toml'
+      - '.github/workflows/format.yml'
 
 name: "Format Code"
 permissions:
@@ -14,6 +25,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2
         with:
-          components: rustfmt, clippy
+          components: rustfmt
       - name: Check formatting
         run: cargo +nightly fmt --all -- --check
