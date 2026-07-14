@@ -78,7 +78,7 @@ async fn main() -> certon::Result<()> {
 
 ## 环境要求
 
-1. **Rust 2024 edition**（Rust 1.89+）和 Tokio 异步运行时
+1. **Rust 2024 edition**（Rust 1.92+）和 Tokio 异步运行时
 2. 您控制的**公共 DNS 域名**，A/AAAA 记录指向您的服务器
 3. **80 端口**可从公网访问（用于 HTTP-01 验证），和/或 **443 端口**（用于 TLS-ALPN-01 验证）
    - 可以通过端口转发实现
@@ -96,7 +96,7 @@ async fn main() -> certon::Result<()> {
 
 ```toml
 [dependencies]
-certon = "0.1"
+certon = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -113,7 +113,7 @@ Certon 支持两种加密后端，通过 feature flag 选择：
 
 ```toml
 [dependencies]
-certon = { version = "0.1", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring"] }
 ```
 
 ## 快速开始
