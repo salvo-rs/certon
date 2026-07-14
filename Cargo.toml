@@ -40,14 +40,12 @@ ring = { version = "0.17", optional = true }
 sha1 = "0.11"
 sha2 = "0.11"
 
-# ECDSA / RSA / Ed25519 keys
-p256 = { version = "0.14", features = ["ecdsa"] }
+# Key generation and signing
 p521 = { version = "0.14", features = ["ecdsa"] }
 ecdsa = "0.17"
 elliptic-curve = { version = "0.14", features = ["sec1"] }
 signature = "3"
 rsa = { version = "0.9", features = ["sha2"] }
-ed25519-dalek = { version = "3", features = ["rand_core"] }
 
 # Encoding
 base64 = "0.22"
@@ -77,11 +75,9 @@ url = "2"
 # Internationalized Domain Names
 idna = "1"
 
-# Futures utilities
-futures = "0.3"
+# DNS resolution
 hickory-resolver = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = "0.3"
-tokio-test = "0.4"
