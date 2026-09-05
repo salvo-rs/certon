@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use certon::{CertResolver, Config, FileStorage, OnDemandConfig, Result, Storage};
+use certon::{CertManager, CertResolver, FileStorage, OnDemandConfig, Result, Storage};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
         obtain_func: None,
     });
 
-    // -- Build the Config with on-demand TLS -----------------------------------
-    let config = Config::builder()
+    // -- Build the CertManager with on-demand TLS -----------------------------------
+    let manager = CertManager::builder()
         .storage(storage)
         .on_demand(on_demand_allowlist)
         .build();
@@ -78,12 +78,12 @@ async fn main() -> Result<()> {
         host_allowlist: None,
         rate_limit: None,
         // The obtain function is called when a certificate needs to be
-        // obtained for a new domain. It should use the Config to manage
+        // obtained for a new domain. It should use the CertManager to manage
         // the domain.
         obtain_func: None, // Will be wired up below
     });
 
-    let resolver = CertResolver::with_on_demand(config.cache.clone(), on_demand_for_resolver);
+    let resolver = CertResolver::with_on_demand(manager.cache.clone(), on_demand_for_resolver);
 
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -93,11 +93,11 @@ async fn main() -> Result<()> {
     println!("Allowed domains will get certificates automatically on first TLS handshake");
 
     // Start background maintenance for certificate renewal.
-    let _maintenance = certon::start_maintenance(&config);
+    let _maintenance = certon::start_maintenance(&manager);
 
     // Keep the process alive.
     tokio::signal::ctrl_c().await.ok();
-    config.cache.stop();
+    manager.cache.stop();
 
     Ok(())
 }
