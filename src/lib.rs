@@ -30,6 +30,7 @@
 //!   `rustls::ServerConfig`.
 //! - [`Storage`] is the persistence abstraction; [`FileStorage`] is the default filesystem-backed
 //!   implementation.
+//! - [`http`] owns the single HTTP client every outbound request shares.
 //! - [`start_maintenance`] runs background loops that renew certificates and refresh OCSP staples.
 //! - [`Manager`] is an external certificate provider trait for custom sources.
 //! - [`PreChecker`] validates domains before ACME issuance is attempted.
@@ -39,23 +40,6 @@
 compile_error!("Either the `aws-lc-rs` (default) or `ring` feature must be enabled");
 
 use std::sync::Arc;
-
-/// Install the default rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
-/// based on the enabled feature.
-///
-/// This is called automatically by [`Config`] and [`AcmeClient`](acme_client::AcmeClient),
-/// but you may call it early if you create rustls configurations before using certon.
-/// Subsequent calls are no-ops.
-pub fn install_default_crypto_provider() {
-    #[cfg(feature = "aws-lc-rs")]
-    {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-}
 
 pub mod account;
 pub mod acme_client;
@@ -69,6 +53,7 @@ pub mod dns_util;
 pub mod error;
 pub mod file_storage;
 pub mod handshake;
+pub mod http;
 pub mod http_handler;
 pub mod maintain;
 pub mod ocsp;
@@ -97,6 +82,7 @@ pub use crypto::{KeyType, PrivateKey};
 pub use error::{Error, Result};
 pub use file_storage::FileStorage;
 pub use handshake::{CertResolver, OnDemandConfig};
+pub use http::set_user_agent;
 pub use maintain::MaintenanceConfig;
 pub use ocsp::OcspConfig;
 pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
@@ -137,7 +123,6 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 /// }
 /// ```
 pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
-    install_default_crypto_provider();
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
     let config = Config::builder().storage(storage).build();
     config.manage_sync(domains).await?;
