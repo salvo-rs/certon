@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::acme_issuer::CertIssuer;
 use crate::async_jobs::{JobQueue, RetryConfig, do_with_retry};
 use crate::cache::CertCache;
+use crate::cert_store::{CertStore, KeyValueCertStore};
 use crate::certificates::{Certificate, subject_qualifies_for_cert};
 use crate::crypto::{
     KeyType, decode_private_key_pem, encode_private_key_pem, generate_csr, generate_private_key,
@@ -41,8 +42,7 @@ use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
 use crate::storage::{
-    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
-    store_certificate,
+    CertificateResource, Storage, site_cert_key, site_meta_key, site_private_key,
 };
 
 /// Callback invoked on notable lifecycle events.
@@ -118,7 +118,15 @@ pub struct CertManager {
     /// configured for Let's Encrypt production.
     pub issuers: Vec<Arc<dyn CertIssuer>>,
 
-    /// Persistent storage backend for certificates, keys, and metadata.
+    /// Where certificates go.
+    ///
+    /// Defaults to a [`KeyValueCertStore`] over `storage`, so a deployment
+    /// that has said nothing keeps exactly the layout it already has on disk.
+    pub certificates: Arc<dyn CertStore>,
+
+    /// Key-value storage for everything that does not go through
+    /// [`CertStore`] yet: OCSP staples, ACME account data, challenge state,
+    /// and cluster locks.
     pub storage: Arc<dyn Storage>,
 
     /// Shared in-memory certificate cache.
@@ -155,6 +163,7 @@ impl std::fmt::Debug for CertManager {
         f.debug_struct("CertManager")
             .field("policy", &self.policy)
             .field("issuers", &self.issuers.len())
+            .field("certificates", &self.certificates)
             .field("on_demand", &self.on_demand.is_some())
             .field("on_event", &self.on_event.is_some())
             .field("subject_transformer", &self.subject_transformer.is_some())
@@ -176,6 +185,7 @@ pub struct CertManagerBuilder {
     on_demand: Option<Arc<OnDemandConfig>>,
     issuers: Option<Vec<Arc<dyn CertIssuer>>>,
     storage: Option<Arc<dyn Storage>>,
+    certificates: Option<Arc<dyn CertStore>>,
     cache: Option<Arc<CertCache>>,
     on_event: Option<EventCallback>,
     subject_transformer: Option<SubjectTransformer>,
@@ -211,6 +221,17 @@ impl CertManagerBuilder {
     }
 
     /// Set the persistent storage backend.
+    /// Put certificates somewhere other than the key-value storage.
+    ///
+    /// Without this they go into `storage` under certon's own key layout,
+    /// which is what every existing deployment has. With it, they can go into
+    /// a database or a secret manager without the ACME account key and the
+    /// lock files having to follow them there.
+    pub fn certificates(mut self, certificates: Arc<dyn CertStore>) -> Self {
+        self.certificates = Some(certificates);
+        self
+    }
+
     pub fn storage(mut self, storage: Arc<dyn Storage>) -> Self {
         self.storage = Some(storage);
         self
@@ -324,8 +345,13 @@ impl CertManagerBuilder {
 
         let issuers = self.issuers.unwrap_or_default();
 
+        let certificates = self
+            .certificates
+            .unwrap_or_else(|| Arc::new(KeyValueCertStore::new(Arc::clone(&storage))));
+
         CertManager {
             policy: self.policy,
+            certificates,
             issuers,
             storage,
             cache,
@@ -359,6 +385,7 @@ impl CertManager {
         Self {
             policy: self.policy.clone(),
             issuers: self.issuers.clone(),
+            certificates: Arc::clone(&self.certificates),
             storage: Arc::clone(&self.storage),
             cache: Arc::clone(&self.cache),
             on_demand: self.on_demand.clone(),
@@ -380,6 +407,7 @@ impl CertManager {
             on_demand: None,
             issuers: None,
             storage: None,
+            certificates: None,
             cache: None,
             on_event: None,
             subject_transformer: None,
@@ -449,23 +477,19 @@ impl CertManager {
     /// Load a certificate resource from storage, trying all configured
     /// issuers in order. Returns the first successfully loaded resource.
     async fn load_cert_resource_any_issuer(&self, domain: &str) -> Result<CertificateResource> {
-        let mut last_err = None;
-
         for issuer in &self.issuers {
-            match load_certificate(self.storage.as_ref(), &issuer.issuer_key(), domain).await {
-                Ok(cert_res) => return Ok(cert_res),
-                Err(e) => {
-                    // NotFound is expected when trying multiple issuers.
-                    last_err = Some(e);
-                }
+            // A store that is broken is reported; a store that simply has
+            // nothing for this issuer means try the next one. Those used to be
+            // the same `Err`, so a failing backend read as "not issued yet"
+            // and the next thing that happened was ordering a new certificate.
+            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
+                return Ok(resource);
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            Error::Storage(StorageError::NotFound(format!(
-                "no certificate resource found for '{domain}' from any configured issuer"
-            )))
-        }))
+        Err(Error::Storage(StorageError::NotFound(format!(
+            "no certificate resource found for '{domain}' from any configured issuer"
+        ))))
     }
 
     /// Delete certificate assets (cert, key, meta) for `domain` under
@@ -853,7 +877,7 @@ impl CertManager {
                         issuer_key: ik.clone(),
                     };
 
-                    store_certificate(self.storage.as_ref(), &ik, &cert_res).await?;
+                    self.certificates.save(&ik, &cert_res).await?;
 
                     info!(
                         domain = %domain,
@@ -1078,7 +1102,7 @@ impl CertManager {
                         issuer_key: ik.clone(),
                     };
 
-                    store_certificate(self.storage.as_ref(), &ik, &new_cert_res).await?;
+                    self.certificates.save(&ik, &new_cert_res).await?;
 
                     info!(
                         domain = %domain,
@@ -1139,15 +1163,14 @@ impl CertManager {
             let ik = issuer.issuer_key();
 
             // Try to load the certificate resource for this issuer.
-            let cert_res = match load_certificate(self.storage.as_ref(), &ik, domain).await {
-                Ok(res) => res,
-                Err(_) => continue,
+            // A store that cannot be read is reported rather than skipped:
+            // this used to be `Err(_) => continue`, so revoking against a
+            // broken backend quietly revoked nothing and said it was fine.
+            let Some(cert_res) = self.certificates.load(&ik, domain).await? else {
+                continue;
             };
 
-            // We need to check if the private key exists.
-            let pk_key = site_private_key(&ik, domain);
-            let pk_exists = self.storage.exists(&pk_key).await.unwrap_or(false);
-            if !pk_exists {
+            if cert_res.private_key_pem.is_empty() {
                 return Err(Error::Config(format!(
                     "private key not found for '{domain}' (issuer {i}: {ik})"
                 )));
