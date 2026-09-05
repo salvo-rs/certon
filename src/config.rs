@@ -33,8 +33,8 @@ use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::storage::{
-    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
-    store_certificate,
+    CertificateResource, Storage, acquire, load_certificate, site_cert_key, site_meta_key,
+    site_private_key, store_certificate,
 };
 
 /// Callback invoked on notable lifecycle events.
@@ -873,28 +873,17 @@ impl Config {
         info!(domain = %domain, "acquiring lock for certificate obtain");
 
         let lock_key = Self::lock_key(CERT_ISSUE_LOCK_OP, domain);
-        self.storage.lock(&lock_key).await?;
+        // Held until this guard is dropped, which happens on every path out of
+        // here including a panic and a cancelled future. It used to be a
+        // matching `unlock` below, and a cancelled future left the lock held
+        // for the life of the process.
+        let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
-        let result = if interactive {
+        if interactive {
             self.do_obtain(domain).await
         } else {
-            let storage = Arc::clone(&self.storage);
-            let res = do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await;
-            // Ensure lock is released even on retry exhaustion.
-            drop(storage);
-            res
-        };
-
-        info!(domain = %domain, "releasing lock for certificate obtain");
-        if let Err(unlock_err) = self.storage.unlock(&lock_key).await {
-            error!(
-                domain = %domain,
-                error = %unlock_err,
-                "failed to release lock after certificate obtain"
-            );
+            do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await
         }
-
-        result
     }
 
     /// The inner obtain logic, called once per attempt (with or without

@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info};
 
 use crate::error::{Error, Result, StorageError};
-use crate::storage::{KeyInfo, Storage, safe_key, track_lock, untrack_lock};
+use crate::storage::{KeyInfo, Storage, safe_key};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -643,26 +643,19 @@ impl Storage for FileStorage {
     }
 
     async fn lock(&self, name: &str) -> Result<()> {
-        let result = match tokio::time::timeout(self.lock_timeout, self.obtain_lock(name)).await {
+        match tokio::time::timeout(self.lock_timeout, self.obtain_lock(name)).await {
             Ok(result) => result,
             Err(_) => Err(StorageError::LockFailed(format!(
                 "lock acquisition for {name:?} timed out after {:?}",
                 self.lock_timeout,
             ))
             .into()),
-        };
-        if result.is_ok() {
-            track_lock(name);
         }
-        result
     }
 
     async fn try_lock(&self, name: &str, timeout: Duration) -> Result<bool> {
         match tokio::time::timeout(timeout, self.obtain_lock(name)).await {
-            Ok(Ok(())) => {
-                track_lock(name);
-                Ok(true)
-            }
+            Ok(Ok(())) => Ok(true),
             Ok(Err(e)) => Err(e),
             Err(_) => Ok(false),
         }
@@ -678,17 +671,13 @@ impl Storage for FileStorage {
         // if the calling task is cancelled (e.g. via tokio::select! or
         // task abort).
         let filename = self.lock_filename(name);
-        let result = tokio::task::spawn_blocking(move || match std::fs::remove_file(&filename) {
+        tokio::task::spawn_blocking(move || match std::fs::remove_file(&filename) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::from(StorageError::Io(e))),
         })
         .await
-        .map_err(|e| Error::Other(format!("unlock spawn_blocking failed: {e}")))?;
-
-        untrack_lock(name);
-
-        result
+        .map_err(|e| Error::Other(format!("unlock spawn_blocking failed: {e}")))?
     }
 }
 
