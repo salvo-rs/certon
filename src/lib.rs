@@ -65,6 +65,7 @@ pub mod cache;
 pub mod certificates;
 pub mod config;
 pub mod crypto;
+#[cfg(feature = "dns-01")]
 pub mod dns_util;
 pub mod error;
 pub mod file_storage;
@@ -76,6 +77,7 @@ pub mod rate_limiter;
 pub mod redirect;
 pub mod solvers;
 pub mod storage;
+#[cfg(feature = "zerossl")]
 pub mod zerossl_issuer;
 
 // ---------------------------------------------------------------------------
@@ -100,10 +102,11 @@ pub use handshake::{CertResolver, OnDemandConfig};
 pub use maintain::MaintenanceConfig;
 pub use ocsp::OcspConfig;
 pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
-pub use solvers::{
-    DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
-};
+pub use solvers::{DistributedSolver, Http01Solver, Solver, TlsAlpn01Solver};
+#[cfg(feature = "dns-01")]
+pub use solvers::{Dns01Solver, DnsProvider};
 pub use storage::{CertificateResource, KeyInfo, Storage, StorageKeys};
+#[cfg(feature = "zerossl")]
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
 // ---------------------------------------------------------------------------

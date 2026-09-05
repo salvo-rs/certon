@@ -40,6 +40,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
+#[cfg(feature = "dns-01")]
 use crate::dns_util::{
     DEFAULT_PROPAGATION_INTERVAL, DEFAULT_PROPAGATION_TIMEOUT, challenge_record_name,
     challenge_record_value, check_dns_propagation, find_zone_by_fqdn, from_fqdn,
@@ -655,6 +656,9 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
 // ===========================================================================
 // DNS-01 Solver
 // ===========================================================================
+//
+// Behind the `dns-01` feature: this is the only challenge type that needs a
+// DNS resolver, and a resolver is the largest dependency certon has.
 
 /// Abstraction over a DNS provider that can create and delete TXT records.
 ///
@@ -665,6 +669,7 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
 /// twice with the same arguments should not create duplicate records, and
 /// calling [`DnsProvider::delete_record`] for a non-existent record should
 /// not fail.
+#[cfg(feature = "dns-01")]
 #[async_trait]
 pub trait DnsProvider: Send + Sync {
     /// Create (or append) a TXT record in the given DNS zone.
@@ -689,6 +694,7 @@ pub trait DnsProvider: Send + Sync {
 ///
 /// After presenting the record, the solver's [`Solver::wait`] implementation
 /// polls DNS resolvers until the record propagates or the timeout is reached.
+#[cfg(feature = "dns-01")]
 pub struct Dns01Solver {
     /// The DNS provider that creates and deletes TXT records.
     pub provider: Box<dyn DnsProvider>,
@@ -721,12 +727,14 @@ pub struct Dns01Solver {
 }
 
 /// Information remembered about a presented DNS record, used for cleanup.
+#[cfg(feature = "dns-01")]
 struct DnsRecordMemory {
     zone: String,
     relative_name: String,
     value: String,
 }
 
+#[cfg(feature = "dns-01")]
 impl Dns01Solver {
     /// Create a new DNS-01 solver with the given provider and default timeouts.
     ///
@@ -773,6 +781,7 @@ impl Dns01Solver {
     }
 }
 
+#[cfg(feature = "dns-01")]
 impl std::fmt::Debug for Dns01Solver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dns01Solver")
@@ -789,6 +798,7 @@ impl std::fmt::Debug for Dns01Solver {
     }
 }
 
+#[cfg(feature = "dns-01")]
 #[async_trait]
 impl Solver for Dns01Solver {
     async fn present(&self, domain: &str, _token: &str, key_auth: &str) -> Result<()> {
@@ -895,7 +905,6 @@ impl Solver for Dns01Solver {
         Ok(())
     }
 }
-
 // ===========================================================================
 // Distributed Solver
 // ===========================================================================
@@ -1046,6 +1055,7 @@ impl Solver for DistributedSolver {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "dns-01")]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
@@ -1109,114 +1119,126 @@ mod tests {
         }
     }
 
-    // -- Dns01Solver --------------------------------------------------------
+    // Behind the same feature as the solver they exercise.
+    #[cfg(feature = "dns-01")]
+    mod dns01 {
+        use super::*;
 
-    /// A mock DNS provider that counts calls.
-    struct MockDnsProvider {
-        set_count: AtomicUsize,
-        delete_count: AtomicUsize,
-    }
+        // -- Dns01Solver --------------------------------------------------------
 
-    impl MockDnsProvider {
-        fn new() -> Self {
-            Self {
-                set_count: AtomicUsize::new(0),
-                delete_count: AtomicUsize::new(0),
+        /// A mock DNS provider that counts calls.
+        struct MockDnsProvider {
+            set_count: AtomicUsize,
+            delete_count: AtomicUsize,
+        }
+
+        impl MockDnsProvider {
+            fn new() -> Self {
+                Self {
+                    set_count: AtomicUsize::new(0),
+                    delete_count: AtomicUsize::new(0),
+                }
             }
         }
-    }
 
-    #[async_trait]
-    impl DnsProvider for MockDnsProvider {
-        async fn set_record(
-            &self,
-            _zone: &str,
-            _name: &str,
-            _value: &str,
-            _ttl: u32,
-        ) -> Result<()> {
-            self.set_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+        #[async_trait]
+        impl DnsProvider for MockDnsProvider {
+            async fn set_record(
+                &self,
+                _zone: &str,
+                _name: &str,
+                _value: &str,
+                _ttl: u32,
+            ) -> Result<()> {
+                self.set_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn delete_record(&self, _zone: &str, _name: &str, _value: &str) -> Result<()> {
+                self.delete_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
         }
 
-        async fn delete_record(&self, _zone: &str, _name: &str, _value: &str) -> Result<()> {
-            self.delete_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn dns01_solver_default_timeouts() {
-        let provider = MockDnsProvider::new();
-        let solver = Dns01Solver::new(Box::new(provider));
-        assert_eq!(solver.propagation_timeout, DEFAULT_PROPAGATION_TIMEOUT);
-        assert_eq!(
-            solver.propagation_check_interval,
-            DEFAULT_PROPAGATION_INTERVAL
-        );
-        assert_eq!(solver.ttl, 120);
-    }
-
-    #[test]
-    fn dns01_solver_dns_name_default() {
-        let provider = MockDnsProvider::new();
-        let solver = Dns01Solver::new(Box::new(provider));
-        let name = solver.dns_name("example.com");
-        assert_eq!(name, "_acme-challenge.example.com.");
-    }
-
-    #[test]
-    fn dns01_solver_dns_name_override() {
-        let provider = MockDnsProvider::new();
-        let mut solver = Dns01Solver::new(Box::new(provider));
-        solver.override_domain = Some("delegated.example.net.".to_string());
-        let name = solver.dns_name("example.com");
-        assert_eq!(name, "delegated.example.net.");
-    }
-
-    #[tokio::test]
-    async fn dns01_present_and_cleanup() {
-        let provider = Arc::new(MockDnsProvider::new());
-        let provider_ref = Arc::clone(&provider);
-
-        let solver = Dns01Solver::new(Box::new(MockDnsProviderWrapper(provider_ref)));
-
-        solver
-            .present("example.com", "token", "key_auth")
-            .await
-            .unwrap();
-
-        // Verify the record was remembered.
-        {
-            let records = solver.records.read().await;
-            assert_eq!(records.len(), 1);
+        #[test]
+        fn dns01_solver_default_timeouts() {
+            let provider = MockDnsProvider::new();
+            let solver = Dns01Solver::new(Box::new(provider));
+            assert_eq!(solver.propagation_timeout, DEFAULT_PROPAGATION_TIMEOUT);
+            assert_eq!(
+                solver.propagation_check_interval,
+                DEFAULT_PROPAGATION_INTERVAL
+            );
+            assert_eq!(solver.ttl, 120);
         }
 
-        solver
-            .cleanup("example.com", "token", "key_auth")
-            .await
-            .unwrap();
-
-        // Record should be cleaned up.
-        {
-            let records = solver.records.read().await;
-            assert!(records.is_empty());
+        #[test]
+        fn dns01_solver_dns_name_default() {
+            let provider = MockDnsProvider::new();
+            let solver = Dns01Solver::new(Box::new(provider));
+            let name = solver.dns_name("example.com");
+            assert_eq!(name, "_acme-challenge.example.com.");
         }
 
-        assert_eq!(provider.set_count.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.delete_count.load(Ordering::SeqCst), 1);
-    }
-
-    /// Wrapper to allow using Arc<MockDnsProvider> as Box<dyn DnsProvider>.
-    struct MockDnsProviderWrapper(Arc<MockDnsProvider>);
-
-    #[async_trait]
-    impl DnsProvider for MockDnsProviderWrapper {
-        async fn set_record(&self, zone: &str, name: &str, value: &str, ttl: u32) -> Result<()> {
-            self.0.set_record(zone, name, value, ttl).await
+        #[test]
+        fn dns01_solver_dns_name_override() {
+            let provider = MockDnsProvider::new();
+            let mut solver = Dns01Solver::new(Box::new(provider));
+            solver.override_domain = Some("delegated.example.net.".to_string());
+            let name = solver.dns_name("example.com");
+            assert_eq!(name, "delegated.example.net.");
         }
-        async fn delete_record(&self, zone: &str, name: &str, value: &str) -> Result<()> {
-            self.0.delete_record(zone, name, value).await
+
+        #[tokio::test]
+        async fn dns01_present_and_cleanup() {
+            let provider = Arc::new(MockDnsProvider::new());
+            let provider_ref = Arc::clone(&provider);
+
+            let solver = Dns01Solver::new(Box::new(MockDnsProviderWrapper(provider_ref)));
+
+            solver
+                .present("example.com", "token", "key_auth")
+                .await
+                .unwrap();
+
+            // Verify the record was remembered.
+            {
+                let records = solver.records.read().await;
+                assert_eq!(records.len(), 1);
+            }
+
+            solver
+                .cleanup("example.com", "token", "key_auth")
+                .await
+                .unwrap();
+
+            // Record should be cleaned up.
+            {
+                let records = solver.records.read().await;
+                assert!(records.is_empty());
+            }
+
+            assert_eq!(provider.set_count.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.delete_count.load(Ordering::SeqCst), 1);
+        }
+
+        /// Wrapper to allow using Arc<MockDnsProvider> as Box<dyn DnsProvider>.
+        struct MockDnsProviderWrapper(Arc<MockDnsProvider>);
+
+        #[async_trait]
+        impl DnsProvider for MockDnsProviderWrapper {
+            async fn set_record(
+                &self,
+                zone: &str,
+                name: &str,
+                value: &str,
+                ttl: u32,
+            ) -> Result<()> {
+                self.0.set_record(zone, name, value, ttl).await
+            }
+            async fn delete_record(&self, zone: &str, name: &str, value: &str) -> Result<()> {
+                self.0.delete_record(zone, name, value).await
+            }
         }
     }
 }
