@@ -27,9 +27,9 @@
 //!   handshake lookups.
 //! - [`CertResolver`] implements [`rustls::server::ResolvesServerCert`] and plugs directly into a
 //!   `rustls::ServerConfig`.
-//! - [`Storage`] is the persistence abstraction; [`FileStorage`] is the default filesystem-backed
-//!   implementation.
-//! - [`http`] owns the single HTTP client every outbound request shares.
+//! - [`CertStore`] holds certificates; [`KeyValueCertStore`] adapts a [`Storage`].
+//! - [`Storage`] provides key-value persistence and cluster locks.
+//! - [`http`] owns the shared outbound HTTP client.
 //! - [`start_maintenance`] runs background loops that renew certificates and refresh OCSP staples.
 //! - [`Manager`] is an external certificate provider trait for custom sources.
 //! - [`PreChecker`] validates domains before ACME issuance is attempted.
@@ -52,6 +52,7 @@ pub mod acme_client;
 pub mod acme_issuer;
 pub mod async_jobs;
 pub mod cache;
+pub mod cert_store;
 pub mod certificates;
 pub mod crypto;
 #[cfg(feature = "dns-01")]
@@ -85,6 +86,7 @@ pub use acme_issuer::{
     AcmeIssuer, AcmeIssuerBuilder, CertIssuer, IssuedCertificate, Manager, PreChecker, Revoker,
 };
 pub use cache::{CacheOptions, CertCache};
+pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificates::Certificate;
 pub use crypto::{KeyType, PrivateKey};
 pub use error::{Error, Result};
