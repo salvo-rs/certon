@@ -96,7 +96,9 @@ pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redir
 pub use solvers::{
     DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
 };
-pub use storage::{CertificateResource, KeyInfo, Storage, StorageKeys};
+pub use storage::{
+    CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
+};
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
 // ---------------------------------------------------------------------------
