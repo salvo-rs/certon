@@ -1346,6 +1346,7 @@ impl Config {
     /// [`fallback_server_name`](Config::fallback_server_name) are
     /// configured, they are applied to the resolver.
     pub fn tls_config(&self) -> rustls::ServerConfig {
+        crate::install_default_crypto_provider();
         let mut resolver = CertResolver::new(self.cache.clone());
 
         // Apply default/fallback server names if configured.
@@ -1475,6 +1476,7 @@ impl Config {
     pub async fn client_tls_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
         let (cert_chain, pk_der) = self.client_credentials(domain).await?;
 
+        crate::install_default_crypto_provider();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_client_auth_cert(cert_chain, pk_der)
