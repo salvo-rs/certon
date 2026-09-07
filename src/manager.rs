@@ -1,7 +1,7 @@
 //! The certificate lifecycle: obtaining, renewing, revoking and serving.
 //!
 //! [`CertManager`] is the thing that does the work. What it *should* do lives
-//! in [`Policy`](crate::policy::Policy), separately, as data.
+//! in [`Policy`], separately, as data.
 //!
 //! The two used to be one type called `Config`, with twenty fields and
 //! fifteen async methods — settings, collaborators, hooks and a lifecycle
@@ -355,7 +355,7 @@ impl CertManager {
     /// a job queue is not something to duplicate — but everything else here is
     /// either a value or an `Arc`, so the copy is one place rather than a list
     /// somebody has to keep in step with the struct.
-    fn detached(&self, job_name: &'static str) -> Self {
+    pub(crate) fn detached(&self, job_name: &'static str) -> Self {
         Self {
             policy: self.policy.clone(),
             issuers: self.issuers.clone(),
@@ -1222,8 +1222,8 @@ impl CertManager {
     /// config's in-memory certificate cache, with ALPN protocols set to
     /// `["h2", "http/1.1"]`.
     ///
-    /// If [`default_server_name`](CertManager::default_server_name) or
-    /// [`fallback_server_name`](CertManager::fallback_server_name) are
+    /// If [`default_server_name`](Policy::default_server_name) or
+    /// [`fallback_server_name`](Policy::fallback_server_name) are
     /// configured, they are applied to the resolver.
     pub fn server_config(&self) -> rustls::ServerConfig {
         let mut resolver = CertResolver::new(self.cache.clone());

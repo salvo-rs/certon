@@ -226,34 +226,64 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
         storage: config.storage.clone(),
     };
 
-    // Build a renewal function that delegates to CertManager::renew.
-    // We need to clone the config's relevant parts into an Arc so the
-    // closure can be 'static + Send + Sync.
-    let config_storage = config.storage.clone();
-    let config_cache = config.cache.clone();
-    let config_issuers = config.issuers.clone();
-    let config_key_type = config.policy.key_type;
-    let config_ocsp = config.policy.ocsp.clone();
-    let config_renewal_ratio = config.policy.renewal_window_ratio;
-
-    let renew_func: Arc<maintain::RenewFn> = Arc::new(move |domain: String| {
-        let storage = config_storage.clone();
-        let cache = config_cache.clone();
-        let issuers = config_issuers.clone();
-        let key_type = config_key_type;
-        let ocsp_cfg = config_ocsp.clone();
-        let renewal_ratio = config_renewal_ratio;
-
-        Box::pin(async move {
-            // Reconstruct a minimal CertManager for renewal.
-            let cfg = CertManager::builder().storage(storage).build();
-            // NOTE: This is a simplified renewal path. In a full
-            // implementation the original CertManager would be shared via Arc.
-            // For now we call manage which handles obtain-or-renew.
-            let _ = (cache, issuers, key_type, ocsp_cfg, renewal_ratio);
-            cfg.manage(&[domain]).await
-        })
-    });
+    let renew_func = maintenance_renewal(config);
 
     maintain::start_maintenance(cache, maint_config, renew_func)
+}
+
+fn maintenance_renewal(config: &CertManager) -> Arc<maintain::RenewFn> {
+    let manager = Arc::new(config.detached("maintenance"));
+    Arc::new(move |domain: String| {
+        let manager = Arc::clone(&manager);
+        Box::pin(async move { manager.renew(&domain, false).await })
+    })
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    struct Issuer;
+    #[async_trait::async_trait]
+    impl CertIssuer for Issuer {
+        async fn issue(&self, _: &[u8], _: &[String]) -> Result<IssuedCertificate> {
+            Err(Error::Other("configured issuer reached".into()))
+        }
+        fn issuer_key(&self) -> String {
+            "test".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_the_issuer_and_renewal_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+        let cert = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        storage::store_certificate(
+            storage.as_ref(),
+            "test",
+            &CertificateResource {
+                sans: vec!["example.com".into()],
+                certificate_pem: cert.cert.pem().into_bytes(),
+                private_key_pem: cert.signing_key.serialize_pem().into_bytes(),
+                issuer_key: "test".into(),
+                issuer_data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let config = CertManager::builder()
+            .storage(storage)
+            .issuers(vec![Arc::new(Issuer)])
+            .interactive(true)
+            .renewal_window_ratio(1.0)
+            .build();
+        let error = maintenance_renewal(&config)("example.com".into())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("configured issuer reached"),
+            "{error}"
+        );
+    }
 }

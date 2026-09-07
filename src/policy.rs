@@ -5,9 +5,9 @@
 //! issuer, a storage backend, a cache and a job queue along with it.
 //!
 //! That distinction is the reason this module exists. What is now
-//! [`CertManager`](crate::manager::CertManager) used to be called `CertManager`,
+//! [`CertManager`](crate::manager::CertManager) used to be called `Config`,
 //! and held collaborators and a certificate lifecycle alongside these
-//! settings. A type named `CertManager` that can revoke a certificate is not a
+//! settings. A type named `Config` that can revoke a certificate is not a
 //! configuration, and the cost was not only the name: the settings could not
 //! be inspected, defaulted, compared or logged without the machinery, and the
 //! machinery could not be built without deciding every setting.
@@ -60,7 +60,7 @@ pub trait CertificateSelector: Send + Sync {
 /// };
 /// assert_eq!(policy.key_type, KeyType::EcdsaP384);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     /// The fraction of a certificate's lifetime that must remain before it is
     /// left alone. `1.0 / 3.0` means "renew when a third of the life is left".
@@ -106,10 +106,10 @@ pub struct Policy {
     /// This decides two things, and it is worth being explicit about both
     /// because the name only suggests one:
     ///
-    /// - A failure is returned straight away rather than retried with backoff.
-    ///   Somebody watching a terminal wants the error, not a wait.
-    /// - Checks that may ask a question, such as agreeing to a certificate
-    ///   authority's terms, are permitted.
+    /// - A failure is returned straight away rather than retried with backoff. Somebody watching a
+    ///   terminal wants the error, not a wait.
+    /// - Checks that may ask a question, such as agreeing to a certificate authority's terms, are
+    ///   permitted.
     ///
     /// Leave it `false` in a server. A background renewal that gives up on the
     /// first network blip is worse than one that waits.
