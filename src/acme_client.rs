@@ -27,10 +27,11 @@ use tracing::{debug, warn};
 
 use crate::crypto::PrivateKey;
 use crate::error::{AcmeError, Result};
-
 // ---------------------------------------------------------------------------
 // Configurable User-Agent
 // ---------------------------------------------------------------------------
+/// Set the user agent shared by all certon HTTP requests.
+pub use crate::http::set_user_agent;
 
 // ---------------------------------------------------------------------------
 // Well-known CA directory URLs

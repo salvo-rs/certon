@@ -41,6 +41,13 @@ compile_error!("Either the `aws-lc-rs` (default) or `ring` feature must be enabl
 
 use std::sync::Arc;
 
+/// Install a default rustls provider while preserving an embedder's choice.
+///
+/// Useful when building rustls configurations with both provider features enabled.
+pub fn install_default_crypto_provider() {
+    http::install_crypto_provider();
+}
+
 pub mod account;
 pub mod acme_client;
 pub mod acme_issuer;

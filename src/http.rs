@@ -56,9 +56,8 @@ pub fn set_user_agent(agent: impl Into<String>) {
 /// What certon currently identifies itself as.
 pub fn user_agent() -> &'static str {
     USER_AGENT
-        .get()
-        .map(String::as_str)
-        .unwrap_or(DEFAULT_USER_AGENT)
+        .get_or_init(|| DEFAULT_USER_AGENT.to_owned())
+        .as_str()
 }
 
 /// The client every module shares.
@@ -86,14 +85,9 @@ fn build() -> std::result::Result<reqwest::Client, String> {
 /// Make sure rustls has a process-wide provider, because `reqwest` requires
 /// one and will not choose.
 ///
-/// This is the one place certon touches process-global state, and it is here
-/// rather than anywhere else because this is the only thing that needs it:
-/// certon's own rustls configurations go through `rustls`'s builders, which
-/// select the provider from the crate features it was compiled with.
-///
 /// A provider the embedder installed first wins. That is deliberate — a host
 /// that has already chosen is not overruled by a library.
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     #[cfg(feature = "aws-lc-rs")]
     {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -119,8 +113,7 @@ mod tests {
 
     #[test]
     fn the_client_is_one_client() {
-        // Two callers must get the same connection pool. Two pools is how a
-        // rate limit gets hit twice as fast.
+        // Every caller shares the same connection pool.
         let first = client().expect("a client");
         let second = client().expect("a client");
         assert!(std::ptr::eq(first, second));
