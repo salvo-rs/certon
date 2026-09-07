@@ -22,8 +22,8 @@
 //!
 //! - [`Config`] is the central entry point that coordinates the certificate lifecycle (obtain,
 //!   renew, revoke, cache).
-//! - [`AcmeIssuer`] and [`ZeroSslIssuer`] implement the [`CertIssuer`] trait to obtain certificates
-//!   from ACME-compatible Certificate Authorities.
+//! - [`AcmeIssuer`] and `ZeroSslIssuer` (with the `zerossl` feature) implement the [`CertIssuer`]
+//!   trait to obtain certificates from ACME-compatible Certificate Authorities.
 //! - [`CertCache`] provides an in-memory certificate store indexed by domain name for fast TLS
 //!   handshake lookups.
 //! - [`CertResolver`] implements [`rustls::server::ResolvesServerCert`] and plugs directly into a

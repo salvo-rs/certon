@@ -76,3 +76,22 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --all-features --no-deps
+
+  feature-matrix:
+    name: Feature set - ${{ matrix.features }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [ring, 'ring,zerossl', 'ring,dns-01', 'ring,rsa-keys', aws-lc-rs]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo test --no-default-features --features "${{ matrix.features }}"
+      - run: cargo clippy --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      - run: cargo doc --no-default-features --features "${{ matrix.features }}" --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings

@@ -19,7 +19,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # compile time, in API surface, and in the dependency tree an auditor reads.
 default = ["aws-lc-rs", "zerossl", "dns-01", "rsa-keys"]
 
-# Exactly one cryptography provider must be chosen.
+# At least one cryptography provider must be chosen.
 aws-lc-rs = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "tokio-rustls/aws_lc_rs", "rcgen/aws_lc_rs", "reqwest/rustls", "x509-parser/verify-aws"]
 ring = ["dep:ring", "rustls/ring", "tokio-rustls/ring", "rcgen/ring", "reqwest/rustls-no-provider", "x509-parser/verify"]
 

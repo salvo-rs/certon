@@ -11,7 +11,7 @@
 //! |---|---|---|
 //! | [`Http01Solver`] | 80 | Serves `key_auth` at `/.well-known/acme-challenge/{token}` |
 //! | [`TlsAlpn01Solver`] | 443 | Presents a self-signed cert with the `acmeIdentifier` extension via `acme-tls/1` ALPN |
-//! | [`Dns01Solver`] | n/a | Creates a `_acme-challenge` TXT record via a [`DnsProvider`] |
+//! | `Dns01Solver` | n/a | Creates a `_acme-challenge` TXT record via a `DnsProvider` |
 //!
 //! # Distributed deployments
 //!
@@ -685,7 +685,7 @@ pub trait DnsProvider: Send + Sync {
 }
 
 /// Solves ACME DNS-01 challenges by creating a TXT record via a
-/// [`DnsProvider`] implementation and optionally waiting for propagation.
+/// `DnsProvider` implementation and optionally waiting for propagation.
 ///
 /// The DNS-01 challenge is the only challenge type that supports wildcard
 /// certificates. It works by placing a TXT record at

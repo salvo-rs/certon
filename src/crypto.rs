@@ -9,9 +9,9 @@
 //! |---|---|---|
 //! | [`KeyType::EcdsaP256`] | ECDSA P-256 | Default; smallest key, fastest |
 //! | [`KeyType::EcdsaP384`] | ECDSA P-384 | Larger curve, stronger security margin |
-//! | [`KeyType::Rsa2048`] | RSA 2048-bit | Broad compatibility |
-//! | [`KeyType::Rsa4096`] | RSA 4096-bit | Strong RSA |
-//! | [`KeyType::Rsa8192`] | RSA 8192-bit | Maximum RSA strength |
+//! | `KeyType::Rsa2048` (`rsa-keys`) | RSA 2048-bit | Broad compatibility |
+//! | `KeyType::Rsa4096` (`rsa-keys`) | RSA 4096-bit | Strong RSA |
+//! | `KeyType::Rsa8192` (`rsa-keys`) | RSA 8192-bit | Maximum RSA strength |
 //! | [`KeyType::Ed25519`] | Ed25519 | Modern EdDSA; compact, fast |
 //!
 //! # Key lifecycle
@@ -183,7 +183,6 @@ impl PrivateKey {
                 RcgenKeyPair::try_from(&pkcs8)
             }
             KeyType::Ed25519 => RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519),
-            #[cfg(feature = "rsa-keys")]
             #[cfg(feature = "rsa-keys")]
             KeyType::Rsa2048 | KeyType::Rsa4096 | KeyType::Rsa8192 => {
                 RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_RSA_SHA256)
@@ -421,7 +420,7 @@ pub fn decode_private_key_pem(pem_data: &str) -> Result<PrivateKey> {
         // is perfectly good, this build was asked not to carry RSA.
         #[cfg(not(feature = "rsa-keys"))]
         "RSA PRIVATE KEY" => Err(CryptoError::PemDecode(
-            "this is an RSA key, and this build of certon was compiled without the              `rsa-keys` feature"
+            "this is an RSA key, and this build of certon was compiled without the `rsa-keys` feature"
                 .into(),
         )
         .into()),
