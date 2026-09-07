@@ -41,6 +41,9 @@ use crate::storage::{
 ///
 /// A certificate is stored under the issuer that produced it, so two
 /// authorities issuing for the same name do not overwrite each other.
+/// Instances sharing this store must also share a compatible [`Storage`]
+/// lock backend; a database shared across hosts with host-local lock files
+/// does not prevent concurrent issuance.
 /// `Debug` is required because a `CertManager` prints what it is using, and
 /// "some store" is not a useful thing to read in a log. Name yours.
 #[async_trait]
