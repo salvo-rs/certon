@@ -482,10 +482,7 @@ fn extract_ca_issuer_urls_from_parsed(cert: &X509Certificate<'_>) -> Vec<String>
 /// The URL may return the certificate in either DER or PEM format.
 /// This function auto-detects the encoding and returns the DER bytes.
 async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| CertError::OcspFailed(format!("failed to build HTTP client: {e}")))?;
+    let client = crate::http::client()?;
 
     let response = client.get(url).send().await.map_err(|e| {
         CertError::OcspFailed(format!(
@@ -837,10 +834,7 @@ fn hash_issuer_public_key(issuer: &X509Certificate<'_>) -> Result<Vec<u8>> {
 
 /// Send an OCSP request to the given responder URL via HTTP POST.
 async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| CertError::OcspFailed(format!("failed to build HTTP client: {e}")))?;
+    let client = crate::http::client()?;
 
     let response = client
         .post(url)

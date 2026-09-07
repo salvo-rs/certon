@@ -28,8 +28,9 @@
 //!   handshake lookups.
 //! - [`CertResolver`] implements [`rustls::server::ResolvesServerCert`] and plugs directly into a
 //!   `rustls::ServerConfig`.
-//! - [`CertStore`] is where certificates go; [`KeyValueCertStore`] puts them in a [`Storage`].
-//! - [`Storage`] is a key-value store with cluster locking; [`FileStorage`] is the default.
+//! - [`CertStore`] holds certificates; [`KeyValueCertStore`] adapts a [`Storage`].
+//! - [`Storage`] provides key-value persistence and cluster locks.
+//! - [`http`] owns the shared outbound HTTP client.
 //! - [`start_maintenance`] runs background loops that renew certificates and refresh OCSP staples.
 //! - [`Manager`] is an external certificate provider trait for custom sources.
 //! - [`PreChecker`] validates domains before ACME issuance is attempted.
@@ -40,21 +41,11 @@ compile_error!("Either the `aws-lc-rs` (default) or `ring` feature must be enabl
 
 use std::sync::Arc;
 
-/// Install the default rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
-/// based on the enabled feature.
+/// Install a default rustls provider while preserving an embedder's choice.
 ///
-/// This is called automatically by [`CertManager`] and [`AcmeClient`](acme_client::AcmeClient),
-/// but you may call it early if you create rustls configurations before using certon.
-/// Subsequent calls are no-ops.
+/// Useful when building rustls configurations with both provider features enabled.
 pub fn install_default_crypto_provider() {
-    #[cfg(feature = "aws-lc-rs")]
-    {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
-    {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
+    http::install_crypto_provider();
 }
 
 pub mod account;
@@ -69,6 +60,7 @@ pub mod dns_util;
 pub mod error;
 pub mod file_storage;
 pub mod handshake;
+pub mod http;
 pub mod http_handler;
 pub mod maintain;
 pub mod manager;
@@ -99,6 +91,7 @@ pub use crypto::{KeyType, PrivateKey};
 pub use error::{Error, Result};
 pub use file_storage::FileStorage;
 pub use handshake::{CertResolver, OnDemandConfig};
+pub use http::set_user_agent;
 pub use maintain::MaintenanceConfig;
 pub use manager::{CertManager, CertManagerBuilder};
 pub use ocsp::OcspConfig;
@@ -107,7 +100,9 @@ pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redir
 pub use solvers::{
     DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
 };
-pub use storage::{CertificateResource, KeyInfo, Storage, StorageKeys};
+pub use storage::{
+    CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
+};
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
 // ---------------------------------------------------------------------------
@@ -141,7 +136,6 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 /// }
 /// ```
 pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
-    install_default_crypto_provider();
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
     let config = CertManager::builder().storage(storage).build();
     config.manage(domains).await?;

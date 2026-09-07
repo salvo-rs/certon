@@ -41,7 +41,7 @@ use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
-use crate::storage::{CertificateResource, Storage};
+use crate::storage::{CertificateResource, Storage, acquire};
 
 /// Callback invoked on notable lifecycle events.
 type EventCallback = Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>;
@@ -739,28 +739,17 @@ impl CertManager {
         info!(domain = %domain, "acquiring lock for certificate obtain");
 
         let lock_key = Self::lock_key(CERT_ISSUE_LOCK_OP, domain);
-        self.storage.lock(&lock_key).await?;
+        // Held until this guard is dropped, which happens on every path out of
+        // here including a panic and a cancelled future. It used to be a
+        // matching `unlock` below, and a cancelled future left the lock held
+        // for the life of the process.
+        let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
-        let result = if interactive {
+        if interactive {
             self.do_obtain(domain).await
         } else {
-            let storage = Arc::clone(&self.storage);
-            let res = do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await;
-            // Ensure lock is released even on retry exhaustion.
-            drop(storage);
-            res
-        };
-
-        info!(domain = %domain, "releasing lock for certificate obtain");
-        if let Err(unlock_err) = self.storage.unlock(&lock_key).await {
-            error!(
-                domain = %domain,
-                error = %unlock_err,
-                "failed to release lock after certificate obtain"
-            );
+            do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await
         }
-
-        result
     }
 
     /// The inner obtain logic, called once per attempt (with or without
@@ -1206,6 +1195,7 @@ impl CertManager {
     /// [`fallback_server_name`](Policy::fallback_server_name) are
     /// configured, they are applied to the resolver.
     pub fn server_config(&self) -> rustls::ServerConfig {
+        crate::install_default_crypto_provider();
         let mut resolver = CertResolver::new(self.cache.clone());
 
         // Apply default/fallback server names if configured.
@@ -1313,6 +1303,7 @@ impl CertManager {
     pub async fn client_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
         let (cert_chain, pk_der) = self.client_credentials(domain).await?;
 
+        crate::install_default_crypto_provider();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_client_auth_cert(cert_chain, pk_der)

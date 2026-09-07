@@ -33,14 +33,8 @@ const ZEROSSL_EAB_ENDPOINT: &str = "https://api.zerossl.com/acme/eab-credentials
 /// The issuer key prefix used for storage partitioning.
 const ZEROSSL_ISSUER_KEY: &str = "zerossl";
 
-/// Timeout for individual ZeroSSL API requests.
-const ZEROSSL_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn zerossl_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(ZEROSSL_HTTP_TIMEOUT)
-        .build()
-        .map_err(|e| Error::Other(format!("failed to build ZeroSSL HTTP client: {e}")))
+fn zerossl_client() -> Result<&'static reqwest::Client> {
+    crate::http::client()
 }
 
 fn zerossl_url(base: &str, api_key: &str) -> Result<Url> {
@@ -72,7 +66,7 @@ fn zerossl_request_error(action: &str, e: reqwest::Error) -> Error {
     if timeout {
         Error::Timeout(format!(
             "ZeroSSL {action} timed out after {:?}",
-            ZEROSSL_HTTP_TIMEOUT
+            crate::http::REQUEST_TIMEOUT
         ))
     } else {
         Error::Other(format!("failed to {action}: {e}"))
