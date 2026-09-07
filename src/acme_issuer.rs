@@ -45,7 +45,7 @@ use crate::crypto::{
 };
 use crate::error::{AcmeError, Error, Result};
 use crate::solvers::{DistributedSolver, Solver};
-use crate::storage::{Storage, issuer_key};
+use crate::storage::{Storage, acquire, issuer_key};
 
 /// Callback invoked on newly created accounts before CA registration.
 type NewAccountFunc = Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>;
@@ -704,13 +704,12 @@ impl AcmeIssuer {
 
         // Slow path: load from storage or register new account.
         let lock_key = format!("acme_account_{}", issuer_key(ca_url));
-        self.storage.lock(&lock_key).await?;
+        // The `?` on the old `unlock` reported a failure to release in place
+        // of the failure that mattered, and a cancelled future never reached
+        // it at all.
+        let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
-        let result = self.get_account_inner(client, ca_url).await;
-
-        self.storage.unlock(&lock_key).await?;
-
-        let acct = result?;
+        let acct = self.get_account_inner(client, ca_url).await?;
 
         // Cache the account.
         let mut guard = mutex.lock().await;
