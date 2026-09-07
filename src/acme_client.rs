@@ -8,7 +8,6 @@
 //! All requests use the JWS (JSON Web Signature) POST-as-GET convention
 //! required by RFC 8555. ECDSA P-256 (ES256) is used for signing.
 
-use std::sync::OnceLock;
 use std::time::Duration;
 
 #[cfg(feature = "aws-lc-rs")]
@@ -28,27 +27,11 @@ use tracing::{debug, warn};
 
 use crate::crypto::PrivateKey;
 use crate::error::{AcmeError, Result};
-
 // ---------------------------------------------------------------------------
 // Configurable User-Agent
 // ---------------------------------------------------------------------------
-
-/// Global user-agent string for ACME HTTP requests.
-static USER_AGENT: OnceLock<String> = OnceLock::new();
-
-/// Set the global user-agent string used by [`AcmeClient`] for all HTTP
-/// requests.
-///
-/// This must be called before creating an [`AcmeClient`] to take effect.
-/// If not called, the default `"certon/0.1"` is used.
-pub fn set_user_agent(ua: impl Into<String>) {
-    USER_AGENT.set(ua.into()).ok();
-}
-
-/// Return the configured user-agent string, or the default.
-fn get_user_agent() -> &'static str {
-    USER_AGENT.get().map(|s| s.as_str()).unwrap_or("certon/0.1")
-}
+/// Set the user agent shared by all certon HTTP requests.
+pub use crate::http::set_user_agent;
 
 // ---------------------------------------------------------------------------
 // Well-known CA directory URLs
@@ -602,8 +585,6 @@ impl AcmeClient {
     /// The CA URL must use HTTPS. HTTP is only allowed for localhost,
     /// `127.0.0.1`, `[::1]`, and `.internal` hosts (for testing/development).
     pub async fn new(directory_url: &str) -> Result<Self> {
-        crate::install_default_crypto_provider();
-
         // Validate that the directory URL uses HTTPS, unless it is a local
         // or internal address.
         if let Ok(parsed) = url::Url::parse(directory_url)
@@ -627,11 +608,7 @@ impl AcmeClient {
 
         debug!(directory_url, "fetching ACME directory");
 
-        let http = reqwest::Client::builder()
-            .user_agent(get_user_agent())
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| AcmeError::Directory(format!("failed to build HTTP client: {e}")))?;
+        let http = crate::http::client()?.clone();
 
         // Fetch directory.
         let resp = http
