@@ -101,7 +101,9 @@ pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redir
 pub use solvers::{DistributedSolver, Http01Solver, Solver, TlsAlpn01Solver};
 #[cfg(feature = "dns-01")]
 pub use solvers::{Dns01Solver, DnsProvider};
-pub use storage::{CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire};
+pub use storage::{
+    CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
+};
 #[cfg(feature = "zerossl")]
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
