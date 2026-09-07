@@ -113,7 +113,7 @@ Certon 支持两种加密后端，通过 feature flag 选择：
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ## 快速开始
