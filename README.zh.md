@@ -113,7 +113,7 @@ Certon 支持两种加密后端，通过 feature flag 选择：
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ## 快速开始
@@ -558,3 +558,20 @@ let issuer = AcmeIssuer::builder()
 ## 许可证
 
 Certon 采用 [Apache 许可证 2.0](LICENSE) 许可。
+
+
+## 可选功能
+
+默认启用 `aws-lc-rs`、`zerossl`、`dns-01` 和 `rsa-keys`，保留现有功能。
+仅使用 ACME 和 ECDSA 时，可以禁用默认功能：
+
+```toml
+certon = { version = "0.3", default-features = false, features = ["ring"] }
+```
+
+- `zerossl`：ZeroSSL issuer 和 REST API。
+- `dns-01`：DNS-01 solver 与 DNS 解析依赖。
+- `rsa-keys`：RSA 私钥生成与解析以及 `rsa` 依赖。
+
+必须启用至少一个加密 provider。按需添加上述功能；关闭 `rsa-keys`
+不会关闭 rustls 自身对 RSA 证书的支持。API 迁移请参阅 [MIGRATION.md](MIGRATION.md)。

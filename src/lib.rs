@@ -21,16 +21,15 @@
 //! ## Architecture
 //!
 //! - [`CertManager`] runs the certificate lifecycle: obtain, renew, revoke, cache, serve.
-//! - [`Policy`] is what it should do, as plain data — separate from the thing that does it.
-//! - [`AcmeIssuer`] and [`ZeroSslIssuer`] implement the [`CertIssuer`] trait to obtain certificates
-//!   from ACME-compatible Certificate Authorities.
+//! - [`Policy`] holds certificate management settings.
+//! - [`AcmeIssuer`] and `ZeroSslIssuer` (with `zerossl`) implement [`CertIssuer`].
 //! - [`CertCache`] provides an in-memory certificate store indexed by domain name for fast TLS
 //!   handshake lookups.
 //! - [`CertResolver`] implements [`rustls::server::ResolvesServerCert`] and plugs directly into a
 //!   `rustls::ServerConfig`.
-//! - [`Storage`] is the persistence abstraction; [`FileStorage`] is the default filesystem-backed
-//!   implementation.
-//! - [`http`] owns the single HTTP client every outbound request shares.
+//! - [`CertStore`] holds certificates; [`KeyValueCertStore`] adapts a [`Storage`].
+//! - [`Storage`] provides key-value persistence and cluster locks.
+//! - [`http`] owns the shared outbound HTTP client.
 //! - [`start_maintenance`] runs background loops that renew certificates and refresh OCSP staples.
 //! - [`Manager`] is an external certificate provider trait for custom sources.
 //! - [`PreChecker`] validates domains before ACME issuance is attempted.
@@ -53,8 +52,10 @@ pub mod acme_client;
 pub mod acme_issuer;
 pub mod async_jobs;
 pub mod cache;
+pub mod cert_store;
 pub mod certificates;
 pub mod crypto;
+#[cfg(feature = "dns-01")]
 pub mod dns_util;
 pub mod error;
 pub mod file_storage;
@@ -69,6 +70,7 @@ pub mod rate_limiter;
 pub mod redirect;
 pub mod solvers;
 pub mod storage;
+#[cfg(feature = "zerossl")]
 pub mod zerossl_issuer;
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ pub use acme_issuer::{
     AcmeIssuer, AcmeIssuerBuilder, CertIssuer, IssuedCertificate, Manager, PreChecker, Revoker,
 };
 pub use cache::{CacheOptions, CertCache};
+pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificates::Certificate;
 pub use crypto::{KeyType, PrivateKey};
 pub use error::{Error, Result};
@@ -95,12 +98,13 @@ pub use manager::{CertManager, CertManagerBuilder};
 pub use ocsp::OcspConfig;
 pub use policy::{CertificateSelector, IssuerPolicy, Policy};
 pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
-pub use solvers::{
-    DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
-};
+pub use solvers::{DistributedSolver, Http01Solver, Solver, TlsAlpn01Solver};
+#[cfg(feature = "dns-01")]
+pub use solvers::{Dns01Solver, DnsProvider};
 pub use storage::{
     CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
 };
+#[cfg(feature = "zerossl")]
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
 // ---------------------------------------------------------------------------

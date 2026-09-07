@@ -9,9 +9,9 @@
 //! |---|---|---|
 //! | [`KeyType::EcdsaP256`] | ECDSA P-256 | Default; smallest key, fastest |
 //! | [`KeyType::EcdsaP384`] | ECDSA P-384 | Larger curve, stronger security margin |
-//! | [`KeyType::Rsa2048`] | RSA 2048-bit | Broad compatibility |
-//! | [`KeyType::Rsa4096`] | RSA 4096-bit | Strong RSA |
-//! | [`KeyType::Rsa8192`] | RSA 8192-bit | Maximum RSA strength |
+//! | `KeyType::Rsa2048` (`rsa-keys`) | RSA 2048-bit | Broad compatibility |
+//! | `KeyType::Rsa4096` (`rsa-keys`) | RSA 4096-bit | Strong RSA |
+//! | `KeyType::Rsa8192` (`rsa-keys`) | RSA 8192-bit | Maximum RSA strength |
 //! | [`KeyType::Ed25519`] | Ed25519 | Modern EdDSA; compact, fast |
 //!
 //! # Key lifecycle
@@ -31,9 +31,11 @@ use crypto_provider::rand::SystemRandom;
 use crypto_provider::signature::{
     ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair, Ed25519KeyPair,
 };
+#[cfg(feature = "rsa-keys")]
+use rcgen::PKCS_RSA_SHA256;
 use rcgen::{
     CertificateParams, CustomExtension, KeyPair as RcgenKeyPair, PKCS_ECDSA_P256_SHA256,
-    PKCS_ECDSA_P384_SHA384, PKCS_ED25519, PKCS_RSA_SHA256,
+    PKCS_ECDSA_P384_SHA384, PKCS_ED25519,
 };
 #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
 use ring as crypto_provider;
@@ -84,10 +86,13 @@ pub enum KeyType {
     /// ECDSA using the NIST P-521 curve (a.k.a. `secp521r1`).
     EcdsaP521,
     /// RSA with a 2048-bit modulus.
+    #[cfg(feature = "rsa-keys")]
     Rsa2048,
     /// RSA with a 4096-bit modulus.
+    #[cfg(feature = "rsa-keys")]
     Rsa4096,
     /// RSA with an 8192-bit modulus.
+    #[cfg(feature = "rsa-keys")]
     Rsa8192,
     /// Ed25519 (Edwards-curve Digital Signature Algorithm).
     Ed25519,
@@ -99,8 +104,11 @@ impl fmt::Display for KeyType {
             Self::EcdsaP256 => write!(f, "p256"),
             Self::EcdsaP384 => write!(f, "p384"),
             Self::EcdsaP521 => write!(f, "p521"),
+            #[cfg(feature = "rsa-keys")]
             Self::Rsa2048 => write!(f, "rsa2048"),
+            #[cfg(feature = "rsa-keys")]
             Self::Rsa4096 => write!(f, "rsa4096"),
+            #[cfg(feature = "rsa-keys")]
             Self::Rsa8192 => write!(f, "rsa8192"),
             Self::Ed25519 => write!(f, "ed25519"),
         }
@@ -175,6 +183,7 @@ impl PrivateKey {
                 RcgenKeyPair::try_from(&pkcs8)
             }
             KeyType::Ed25519 => RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_ED25519),
+            #[cfg(feature = "rsa-keys")]
             KeyType::Rsa2048 | KeyType::Rsa4096 | KeyType::Rsa8192 => {
                 RcgenKeyPair::from_pkcs8_der_and_sign_algo(&pkcs8, &PKCS_RSA_SHA256)
             }
@@ -236,8 +245,11 @@ pub fn generate_private_key(key_type: KeyType) -> Result<PrivateKey> {
                 .map_err(|e| CryptoError::KeyGeneration(format!("Ed25519: {e}")))?;
             doc.as_ref().to_vec()
         }
+        #[cfg(feature = "rsa-keys")]
         KeyType::Rsa2048 => generate_rsa_pkcs8(2048)?,
+        #[cfg(feature = "rsa-keys")]
         KeyType::Rsa4096 => generate_rsa_pkcs8(4096)?,
+        #[cfg(feature = "rsa-keys")]
         KeyType::Rsa8192 => generate_rsa_pkcs8(8192)?,
     };
 
@@ -251,6 +263,7 @@ pub fn generate_private_key(key_type: KeyType) -> Result<PrivateKey> {
 ///
 /// Neither `ring` nor `aws-lc-rs` expose RSA key generation, so we
 /// delegate to the `rsa` crate and then serialise via `pkcs8`.
+#[cfg(feature = "rsa-keys")]
 fn generate_rsa_pkcs8(bits: usize) -> Result<Vec<u8>> {
     use rsa::RsaPrivateKey;
     use rsa::pkcs8::EncodePrivateKey;
@@ -287,6 +300,7 @@ fn generate_p521_pkcs8() -> Result<Vec<u8>> {
 fn pem_tag_for(key_type: KeyType) -> &'static str {
     match key_type {
         KeyType::EcdsaP256 | KeyType::EcdsaP384 | KeyType::EcdsaP521 => "EC PRIVATE KEY",
+        #[cfg(feature = "rsa-keys")]
         KeyType::Rsa2048 | KeyType::Rsa4096 | KeyType::Rsa8192 => "RSA PRIVATE KEY",
         KeyType::Ed25519 => "PRIVATE KEY",
     }
@@ -318,6 +332,7 @@ pub fn encode_private_key_pem(key: &PrivateKey) -> Result<String> {
             extract_ec_private_key_from_pkcs8(&key.pkcs8_der)
                 .unwrap_or_else(|| key.pkcs8_der.clone())
         }
+        #[cfg(feature = "rsa-keys")]
         KeyType::Rsa2048 | KeyType::Rsa4096 | KeyType::Rsa8192 => {
             // Attempt to extract the PKCS#1 RSA key from PKCS#8.
             extract_rsa_private_key_from_pkcs8(&key.pkcs8_der)
@@ -358,6 +373,7 @@ fn extract_ec_private_key_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Extracts the inner PKCS#1 `RSAPrivateKey` from a PKCS#8 wrapper.
+#[cfg(feature = "rsa-keys")]
 fn extract_rsa_private_key_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
     let (_, parsed) = x509_parser::der_parser::parse_der(pkcs8).ok()?;
     let seq = parsed.as_sequence().ok()?;
@@ -398,7 +414,16 @@ pub fn decode_private_key_pem(pem_data: &str) -> Result<PrivateKey> {
 
     match tag.as_str() {
         "EC PRIVATE KEY" => decode_ec_private_key(&der),
+        #[cfg(feature = "rsa-keys")]
         "RSA PRIVATE KEY" => decode_rsa_private_key(&der),
+        // Say which build refuses it, rather than "unknown key type": the key
+        // is perfectly good, this build was asked not to carry RSA.
+        #[cfg(not(feature = "rsa-keys"))]
+        "RSA PRIVATE KEY" => Err(CryptoError::PemDecode(
+            "this is an RSA key, and this build of certon was compiled without the `rsa-keys` feature"
+                .into(),
+        )
+        .into()),
         "PRIVATE KEY" | "ED25519 PRIVATE KEY" => decode_pkcs8_private_key(&der),
         _ => {
             // Try PKCS#8 as a fallback for any "*PRIVATE KEY" tag.
@@ -547,6 +572,7 @@ fn validate_ec_key(pkcs8_der: &[u8], key_type: KeyType) -> Result<()> {
 }
 
 /// Decode a PKCS#1 RSA private key and convert to PKCS#8 for internal storage.
+#[cfg(feature = "rsa-keys")]
 fn decode_rsa_private_key(pkcs1_der: &[u8]) -> Result<PrivateKey> {
     use rsa::RsaPrivateKey;
     use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -613,6 +639,7 @@ fn decode_pkcs8_private_key(pkcs8_der: &[u8]) -> Result<PrivateKey> {
     }
 
     // Try RSA.
+    #[cfg(feature = "rsa-keys")]
     {
         use rsa::RsaPrivateKey;
         use rsa::pkcs8::DecodePrivateKey;
@@ -908,6 +935,7 @@ mod tests {
         assert_eq!(decoded.key_type(), KeyType::Ed25519);
     }
 
+    #[cfg(feature = "rsa-keys")]
     #[test]
     fn test_generate_and_roundtrip_rsa2048() {
         let key = generate_private_key(KeyType::Rsa2048).unwrap();
@@ -975,14 +1003,30 @@ mod tests {
         assert_eq!(key.key_type(), KeyType::EcdsaP256);
     }
 
+    #[cfg(not(feature = "rsa-keys"))]
+    #[test]
+    fn an_rsa_key_says_which_build_refuses_it() {
+        // "unknown key type" would send somebody looking at their key. The key
+        // is fine; this build was asked not to carry RSA.
+        let pem = "-----BEGIN RSA PRIVATE KEY-----
+AAAA
+-----END RSA PRIVATE KEY-----
+";
+        let error = decode_private_key_pem(pem).unwrap_err().to_string();
+        assert!(error.contains("rsa-keys"), "{error}");
+    }
+
     #[test]
     fn test_key_type_display() {
         assert_eq!(KeyType::EcdsaP256.to_string(), "p256");
         assert_eq!(KeyType::EcdsaP384.to_string(), "p384");
         assert_eq!(KeyType::EcdsaP521.to_string(), "p521");
-        assert_eq!(KeyType::Rsa2048.to_string(), "rsa2048");
-        assert_eq!(KeyType::Rsa4096.to_string(), "rsa4096");
-        assert_eq!(KeyType::Rsa8192.to_string(), "rsa8192");
+        #[cfg(feature = "rsa-keys")]
+        {
+            assert_eq!(KeyType::Rsa2048.to_string(), "rsa2048");
+            assert_eq!(KeyType::Rsa4096.to_string(), "rsa4096");
+            assert_eq!(KeyType::Rsa8192.to_string(), "rsa8192");
+        }
         assert_eq!(KeyType::Ed25519.to_string(), "ed25519");
     }
 
