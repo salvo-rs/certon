@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     // The simplest way: one function call.
     //
     // `certon::manage` will:
-    //   1. Create a Config backed by the default FileStorage.
+    //   1. Create a CertManager backed by the default FileStorage.
     //   2. Obtain (or load from storage) certificates for every domain.
     //   3. Return a rustls::ServerConfig wired up with a CertResolver.
     let tls_config = certon::manage(&domains).await?;

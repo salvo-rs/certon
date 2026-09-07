@@ -1,21 +1,28 @@
-//! Central configuration hub and certificate lifecycle management.
+//! The certificate lifecycle: obtaining, renewing, revoking and serving.
 //!
-//! This module provides the [`Config`] struct, which is the primary entry
-//! point for managing TLS certificates. It coordinates certificate
-//! obtainment, renewal, revocation, and caching across multiple issuers
-//! and a persistent storage backend.
+//! [`CertManager`] is the thing that does the work. What it *should* do lives
+//! in [`Policy`], separately, as data.
 //!
+//! The two used to be one type called `Config`, with twenty fields and
+//! fifteen async methods — settings, collaborators, hooks and a lifecycle
+//! engine in one place. A type named `Config` that can revoke a certificate
+//! is not a configuration, and the name was the smaller half of the problem:
+//! nothing could be taken out. You could plug a storage backend *into* it;
+//! you could not get the settings out of it to compare two, or build the
+//! machinery without deciding every setting, or hand a background task a copy
+//! without writing out eighteen fields by hand — which is what the code did.
 //!
 //! # Usage
 //!
 //! ```ignore
-//! use certon::config::Config;
+//! use certon::{CertManager, Policy};
 //!
-//! let config = Config::builder()
+//! let manager = CertManager::builder()
 //!     .storage(my_storage)
+//!     .policy(Policy { must_staple: true, ..Policy::default() })
 //!     .build();
 //!
-//! config.manage_sync(&["example.com".into()]).await?;
+//! manager.manage(&["example.com".into()]).await?;
 //! ```
 
 use std::sync::Arc;
@@ -32,9 +39,10 @@ use crate::crypto::{
 use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
+use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
 use crate::storage::{
-    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
-    store_certificate,
+    CertificateResource, Storage, acquire, load_certificate, site_cert_key, site_meta_key,
+    site_private_key, store_certificate,
 };
 
 /// Callback invoked on notable lifecycle events.
@@ -42,39 +50,6 @@ type EventCallback = Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send +
 
 /// Transform applied to domain names before obtaining certificates.
 type SubjectTransformer = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
-
-// ---------------------------------------------------------------------------
-// IssuerPolicy
-// ---------------------------------------------------------------------------
-
-/// Controls how issuers are selected when obtaining or renewing certificates.
-#[derive(Debug, Clone, Copy, Default)]
-pub enum IssuerPolicy {
-    /// Use issuers in the order they were configured (first to last).
-    #[default]
-    UseFirstIssuer,
-    /// Shuffle issuers randomly before iterating, distributing load across CAs.
-    UseFirstRandomIssuer,
-}
-
-// ---------------------------------------------------------------------------
-// CertificateSelector trait
-// ---------------------------------------------------------------------------
-
-/// Trait for custom certificate selection logic during TLS handshakes.
-///
-/// Implementations can inspect the [`ClientHello`](rustls::server::ClientHello)
-/// and choose which certificate to present from the available options.
-pub trait CertificateSelector: Send + Sync {
-    /// Select a certificate from `choices` to present for the given TLS
-    /// handshake. Returns the index into `choices`, or `None` to fall
-    /// back to the default selection logic.
-    fn select_certificate(
-        &self,
-        hello: &rustls::server::ClientHello<'_>,
-        choices: &[&Certificate],
-    ) -> Option<usize>;
-}
 
 // ---------------------------------------------------------------------------
 // Event name constants
@@ -121,29 +96,21 @@ pub const EVENT_CACHED_MANAGED_CERT: &str = "cached_managed_cert";
 const CERT_ISSUE_LOCK_OP: &str = "issue_cert";
 
 // ---------------------------------------------------------------------------
-// Config
+// CertManager
 // ---------------------------------------------------------------------------
 
 /// Central configuration for automatic TLS certificate management.
 ///
-/// `Config` coordinates the full certificate lifecycle: obtainment, renewal,
+/// `CertManager` coordinates the full certificate lifecycle: obtainment, renewal,
 /// revocation, OCSP stapling, caching, and storage. It holds references to
 /// one or more [`CertIssuer`] implementations, a persistent [`Storage`] backend,
 /// and a shared in-memory [`CertCache`].
 ///
-/// Use [`Config::builder()`] to construct an instance with sensible defaults.
-pub struct Config {
-    /// Ratio of certificate lifetime at which to start renewal.
-    ///
-    /// A value of `1.0 / 3.0` means "renew when only 1/3 of the lifetime
-    /// remains". Defaults to [`crate::certificates::DEFAULT_RENEWAL_WINDOW_RATIO`].
-    pub renewal_window_ratio: f64,
-
-    /// On-demand TLS configuration (optional).
-    ///
-    /// When set, certificate operations may be deferred to TLS handshake
-    /// time for domains that are not yet managed.
-    pub on_demand: Option<Arc<OnDemandConfig>>,
+/// Use [`CertManager::builder()`] to construct an instance with sensible defaults.
+pub struct CertManager {
+    /// What should happen. Plain data, so it can be built, cloned, compared
+    /// and printed on its own.
+    pub policy: Policy,
 
     /// Certificate issuers, tried in order until one succeeds.
     ///
@@ -154,14 +121,12 @@ pub struct Config {
     /// Persistent storage backend for certificates, keys, and metadata.
     pub storage: Arc<dyn Storage>,
 
-    /// Key type for newly generated certificate private keys.
-    pub key_type: KeyType,
-
-    /// OCSP stapling configuration.
-    pub ocsp: OcspConfig,
-
     /// Shared in-memory certificate cache.
     pub cache: Arc<CertCache>,
+
+    /// On-demand TLS (optional). When set, certificate operations may be
+    /// deferred to TLS handshake time for domains that are not yet managed.
+    pub on_demand: Option<Arc<OnDemandConfig>>,
 
     /// Optional event callback invoked when notable lifecycle events occur.
     ///
@@ -172,119 +137,64 @@ pub struct Config {
     /// quickly as they are invoked synchronously.
     pub on_event: Option<EventCallback>,
 
-    /// Whether user interaction is allowed (e.g. for Terms of Service
-    /// acceptance prompts). When `true`, operations run synchronously in
-    /// the foreground; when `false`, operations run with automatic retries
-    /// in the background.
-    pub interactive: bool,
-
-    /// When `true`, request the OCSP Must-Staple extension on new
-    /// certificates. Defaults to `false`.
-    pub must_staple: bool,
-
-    /// When `true`, reuse the existing private key on certificate renewal
-    /// instead of generating a fresh one. Defaults to `false`.
-    pub reuse_private_keys: bool,
-
     /// Optional transform applied to domain names before obtaining
     /// certificates. Can be used for normalization, aliasing, etc.
     pub subject_transformer: Option<SubjectTransformer>,
 
-    /// Fallback server name used when the TLS client does not provide an
-    /// SNI value.
-    pub default_server_name: Option<String>,
-
-    /// Last-resort server name used when no certificate matches the
-    /// requested SNI.
-    pub fallback_server_name: Option<String>,
-
-    /// When `true`, skip the storage-health probe on startup.
-    /// Defaults to `true`.
-    pub disable_storage_check: bool,
-
-    /// Controls how issuers are iterated when obtaining or renewing
-    /// certificates. Defaults to [`IssuerPolicy::UseFirstIssuer`].
-    pub issuer_policy: IssuerPolicy,
-
-    /// When `true`, disable the ACME Renewal Information (ARI) extension.
-    /// Defaults to `false`.
-    pub disable_ari: bool,
-
     /// Optional custom certificate selector for TLS handshakes.
-    ///
-    /// When set, the selector is consulted to choose among multiple
-    /// matching certificates.
     pub cert_selection: Option<Arc<dyn CertificateSelector>>,
 
     /// Background job queue for async certificate operations.
-    ///
-    /// Used by `manage_async` to submit background obtain/renew jobs
-    /// with deduplication.
     job_queue: Arc<JobQueue>,
 }
 
-impl std::fmt::Debug for Config {
+impl std::fmt::Debug for CertManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Config")
-            .field("renewal_window_ratio", &self.renewal_window_ratio)
-            .field("key_type", &self.key_type)
-            .field("ocsp", &self.ocsp)
-            .field("interactive", &self.interactive)
-            .field("must_staple", &self.must_staple)
-            .field("reuse_private_keys", &self.reuse_private_keys)
-            .field("default_server_name", &self.default_server_name)
-            .field("fallback_server_name", &self.fallback_server_name)
-            .field("disable_storage_check", &self.disable_storage_check)
-            .field("issuer_policy", &self.issuer_policy)
-            .field("disable_ari", &self.disable_ari)
-            .field("issuers_count", &self.issuers.len())
-            .field("on_demand", &self.on_demand.as_ref().map(|_| "..."))
-            .field("on_event", &self.on_event.as_ref().map(|_| "..."))
-            .field(
-                "subject_transformer",
-                &self.subject_transformer.as_ref().map(|_| "..."),
-            )
-            .field(
-                "cert_selection",
-                &self.cert_selection.as_ref().map(|_| "..."),
-            )
+        // Eleven of the fields this used to list by hand now print themselves,
+        // because they are a value rather than a scattering of settings.
+        f.debug_struct("CertManager")
+            .field("policy", &self.policy)
+            .field("issuers", &self.issuers.len())
+            .field("on_demand", &self.on_demand.is_some())
+            .field("on_event", &self.on_event.is_some())
+            .field("subject_transformer", &self.subject_transformer.is_some())
+            .field("cert_selection", &self.cert_selection.is_some())
             .finish_non_exhaustive()
     }
 }
 
 // ---------------------------------------------------------------------------
-// ConfigBuilder
+// CertManagerBuilder
 // ---------------------------------------------------------------------------
 
-/// Builder for constructing a [`Config`] with sensible defaults.
+/// Builder for constructing a [`CertManager`] with sensible defaults.
 ///
-/// Created via [`Config::builder()`]. At a minimum, a [`Storage`]
-/// implementation must be provided before calling [`build()`](ConfigBuilder::build).
-pub struct ConfigBuilder {
-    renewal_window_ratio: f64,
+/// Created via [`CertManager::builder()`]. At a minimum, a [`Storage`]
+/// implementation must be provided before calling [`build()`](CertManagerBuilder::build).
+pub struct CertManagerBuilder {
+    policy: Policy,
     on_demand: Option<Arc<OnDemandConfig>>,
     issuers: Option<Vec<Arc<dyn CertIssuer>>>,
     storage: Option<Arc<dyn Storage>>,
-    key_type: KeyType,
-    ocsp: OcspConfig,
     cache: Option<Arc<CertCache>>,
     on_event: Option<EventCallback>,
-    interactive: bool,
-    must_staple: bool,
-    reuse_private_keys: bool,
     subject_transformer: Option<SubjectTransformer>,
-    default_server_name: Option<String>,
-    fallback_server_name: Option<String>,
-    disable_storage_check: bool,
-    issuer_policy: IssuerPolicy,
-    disable_ari: bool,
     cert_selection: Option<Arc<dyn CertificateSelector>>,
 }
 
-impl ConfigBuilder {
+impl CertManagerBuilder {
     /// Set the renewal window ratio.
+    /// Replace every setting at once.
+    ///
+    /// The individual setters below write into this, so calling it after them
+    /// discards what they set.
+    pub fn policy(mut self, policy: Policy) -> Self {
+        self.policy = policy;
+        self
+    }
+
     pub fn renewal_window_ratio(mut self, ratio: f64) -> Self {
-        self.renewal_window_ratio = ratio;
+        self.policy.renewal_window_ratio = ratio;
         self
     }
 
@@ -308,13 +218,13 @@ impl ConfigBuilder {
 
     /// Set the key type for new certificate private keys.
     pub fn key_type(mut self, key_type: KeyType) -> Self {
-        self.key_type = key_type;
+        self.policy.key_type = key_type;
         self
     }
 
     /// Set the OCSP configuration.
     pub fn ocsp(mut self, ocsp: OcspConfig) -> Self {
-        self.ocsp = ocsp;
+        self.policy.ocsp = ocsp;
         self
     }
 
@@ -335,19 +245,19 @@ impl ConfigBuilder {
 
     /// Set whether user interaction is allowed.
     pub fn interactive(mut self, interactive: bool) -> Self {
-        self.interactive = interactive;
+        self.policy.interactive = interactive;
         self
     }
 
     /// Request the OCSP Must-Staple extension on new certificates.
     pub fn must_staple(mut self, must_staple: bool) -> Self {
-        self.must_staple = must_staple;
+        self.policy.must_staple = must_staple;
         self
     }
 
     /// Reuse the existing private key on certificate renewal.
     pub fn reuse_private_keys(mut self, reuse: bool) -> Self {
-        self.reuse_private_keys = reuse;
+        self.policy.reuse_private_keys = reuse;
         self
     }
 
@@ -361,32 +271,32 @@ impl ConfigBuilder {
     /// Set the fallback server name used when the client does not
     /// provide an SNI value.
     pub fn default_server_name(mut self, name: impl Into<String>) -> Self {
-        self.default_server_name = Some(name.into());
+        self.policy.default_server_name = Some(name.into());
         self
     }
 
     /// Set the last-resort server name used when no certificate matches
     /// the requested SNI.
     pub fn fallback_server_name(mut self, name: impl Into<String>) -> Self {
-        self.fallback_server_name = Some(name.into());
+        self.policy.fallback_server_name = Some(name.into());
         self
     }
 
     /// Skip the storage-health probe on startup.
     pub fn disable_storage_check(mut self, disable: bool) -> Self {
-        self.disable_storage_check = disable;
+        self.policy.disable_storage_check = disable;
         self
     }
 
     /// Set the issuer selection policy.
     pub fn issuer_policy(mut self, policy: IssuerPolicy) -> Self {
-        self.issuer_policy = policy;
+        self.policy.issuer_policy = policy;
         self
     }
 
     /// Disable the ACME Renewal Information (ARI) extension.
     pub fn disable_ari(mut self, disable: bool) -> Self {
-        self.disable_ari = disable;
+        self.policy.disable_ari = disable;
         self
     }
 
@@ -396,17 +306,17 @@ impl ConfigBuilder {
         self
     }
 
-    /// Build the [`Config`].
+    /// Build the [`CertManager`].
     ///
     /// # Panics
     ///
     /// Panics if no `storage` has been provided.
-    pub fn build(self) -> Config {
+    pub fn build(self) -> CertManager {
         use crate::cache::CacheOptions;
 
-        let storage = self
-            .storage
-            .expect("Config requires a Storage implementation -- call .storage() on the builder");
+        let storage = self.storage.expect(
+            "CertManager requires a Storage implementation -- call .storage() on the builder",
+        );
 
         let cache = self
             .cache
@@ -414,24 +324,14 @@ impl ConfigBuilder {
 
         let issuers = self.issuers.unwrap_or_default();
 
-        Config {
-            renewal_window_ratio: self.renewal_window_ratio,
-            on_demand: self.on_demand,
+        CertManager {
+            policy: self.policy,
             issuers,
             storage,
-            key_type: self.key_type,
-            ocsp: self.ocsp,
             cache,
+            on_demand: self.on_demand,
             on_event: self.on_event,
-            interactive: self.interactive,
-            must_staple: self.must_staple,
-            reuse_private_keys: self.reuse_private_keys,
             subject_transformer: self.subject_transformer,
-            default_server_name: self.default_server_name,
-            fallback_server_name: self.fallback_server_name,
-            disable_storage_check: self.disable_storage_check,
-            issuer_policy: self.issuer_policy,
-            disable_ari: self.disable_ari,
             cert_selection: self.cert_selection,
             job_queue: Arc::new(JobQueue::new("cert_management")),
         }
@@ -439,46 +339,60 @@ impl ConfigBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// Config — construction
+// CertManager — construction
 // ---------------------------------------------------------------------------
 
-impl Config {
-    /// Create a new [`ConfigBuilder`] with sensible defaults.
+impl CertManager {
+    /// What this manager was told to do.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// A copy that can be moved into a background task.
     ///
-    /// Defaults:
-    /// - `renewal_window_ratio`: `1.0 / 3.0`
-    /// - `key_type`: [`KeyType::EcdsaP256`]
-    /// - `ocsp`: [`OcspConfig::default()`]
-    /// - `interactive`: `false`
-    pub fn builder() -> ConfigBuilder {
-        ConfigBuilder {
-            renewal_window_ratio: crate::certificates::DEFAULT_RENEWAL_WINDOW_RATIO,
+    /// This used to be eighteen fields cloned by hand at the call site, under
+    /// a comment explaining that `CertManager` is not `Clone`. It still is not —
+    /// a job queue is not something to duplicate — but everything else here is
+    /// either a value or an `Arc`, so the copy is one place rather than a list
+    /// somebody has to keep in step with the struct.
+    pub(crate) fn detached(&self, job_name: &'static str) -> Self {
+        Self {
+            policy: self.policy.clone(),
+            issuers: self.issuers.clone(),
+            storage: Arc::clone(&self.storage),
+            cache: Arc::clone(&self.cache),
+            on_demand: self.on_demand.clone(),
+            on_event: self.on_event.clone(),
+            subject_transformer: self.subject_transformer.clone(),
+            cert_selection: self.cert_selection.clone(),
+            job_queue: Arc::new(JobQueue::new(job_name)),
+        }
+    }
+
+    /// Create a new [`CertManagerBuilder`].
+    ///
+    /// Settings start at [`Policy::default()`], which documents what each one
+    /// is and why it defaults where it does. Everything else — issuers, cache,
+    /// hooks — starts empty, and a [`Storage`] must be given.
+    pub fn builder() -> CertManagerBuilder {
+        CertManagerBuilder {
+            policy: Policy::default(),
             on_demand: None,
             issuers: None,
             storage: None,
-            key_type: KeyType::default(),
-            ocsp: OcspConfig::default(),
             cache: None,
             on_event: None,
-            interactive: false,
-            must_staple: false,
-            reuse_private_keys: false,
             subject_transformer: None,
-            default_server_name: None,
-            fallback_server_name: None,
-            disable_storage_check: true,
-            issuer_policy: IssuerPolicy::default(),
-            disable_ari: false,
             cert_selection: None,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Config — event emission
+// CertManager — event emission
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Emit a lifecycle event to the configured callback, if any.
     ///
     /// Returns `Ok(())` if no callback is configured or the callback
@@ -492,10 +406,10 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — storage helpers
+// CertManager — storage helpers
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Build a lock key for a certificate operation on the given domain.
     fn lock_key(op: &str, domain: &str) -> String {
         format!("{op}_{domain}")
@@ -571,10 +485,10 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — certificate construction
+// CertManager — certificate construction
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Parse a [`CertificateResource`] into a [`Certificate`], applying OCSP
     /// stapling if enabled.
     ///
@@ -589,8 +503,8 @@ impl Config {
         let mut cert = Certificate::from_pem(&cert_res.certificate_pem, &cert_res.private_key_pem)?;
 
         // Apply OCSP stapling unless disabled.
-        if !self.ocsp.disable_stapling {
-            match staple_ocsp(self.storage.as_ref(), &mut cert, &self.ocsp).await {
+        if !self.policy.ocsp.disable_stapling {
+            match staple_ocsp(self.storage.as_ref(), &mut cert, &self.policy.ocsp).await {
                 Ok(_stapled) => {
                     debug!(
                         names = ?cert.names,
@@ -613,10 +527,10 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — manage
+// CertManager — manage
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Manage certificates for the given domain names synchronously.
     ///
     /// This is the primary entry point for certificate management. For each
@@ -628,22 +542,22 @@ impl Config {
     /// 4. If loaded from storage, check if renewal is needed and renew if so.
     ///
     /// "Synchronously" means that certificate operations are performed in
-    /// the foreground without background retries. Use [`Config::manage_async`]
+    /// the foreground without background retries. Use [`CertManager::manage_in_background`]
     /// instead if you want background retry behaviour.
     ///
     /// Returns on the first error encountered.
-    pub async fn manage_sync(&self, domains: &[String]) -> Result<()> {
+    pub async fn manage(&self, domains: &[String]) -> Result<()> {
         self.manage_all(domains, false).await
     }
 
     /// Manage certificates for the given domain names asynchronously.
     ///
-    /// Same as [`manage_sync`](Config::manage_sync), but ACME operations
+    /// Same as [`manage`](CertManager::manage), but ACME operations
     /// (obtain, renew) are submitted as background tasks via the
     /// [`JobQueue`]. This method returns as soon as each domain's
     /// management task has been submitted -- certificates may not yet be
     /// ready when this method returns.
-    pub async fn manage_async(&self, domains: &[String]) -> Result<()> {
+    pub async fn manage_in_background(&self, domains: &[String]) -> Result<()> {
         for domain in domains {
             let domain = domain.to_lowercase();
 
@@ -659,52 +573,12 @@ impl Config {
             // domain are coalesced.
             let job_name = format!("manage_{domain}");
             // We need to clone the parts of self that the closure needs.
-            // Since Config is not Clone/Arc-wrapped here, we clone the
-            // individual fields required for manage_one.
-            let storage = Arc::clone(&self.storage);
-            let cache = Arc::clone(&self.cache);
-            let issuers = self.issuers.clone();
-            let key_type = self.key_type;
-            let ocsp = self.ocsp.clone();
-            let renewal_ratio = self.renewal_window_ratio;
-            let on_event = self.on_event.clone();
-            let on_demand = self.on_demand.clone();
-            let interactive = self.interactive;
-            let must_staple = self.must_staple;
-            let reuse_private_keys = self.reuse_private_keys;
-            let default_server_name = self.default_server_name.clone();
-            let fallback_server_name = self.fallback_server_name.clone();
-            let disable_storage_check = self.disable_storage_check;
-            let subject_transformer = self.subject_transformer.clone();
-            let issuer_policy = self.issuer_policy;
-            let disable_ari = self.disable_ari;
-            let cert_selection = self.cert_selection.clone();
+            let detached = self.detached("bg_manage");
             let domain_owned = domain.clone();
 
             self.job_queue
                 .submit(job_name, move || async move {
-                    // Reconstruct a minimal Config for background work.
-                    let cfg = Config {
-                        renewal_window_ratio: renewal_ratio,
-                        on_demand,
-                        issuers,
-                        storage,
-                        key_type,
-                        ocsp,
-                        cache,
-                        on_event,
-                        interactive,
-                        must_staple,
-                        reuse_private_keys,
-                        subject_transformer,
-                        default_server_name,
-                        fallback_server_name,
-                        disable_storage_check,
-                        issuer_policy,
-                        disable_ari,
-                        cert_selection,
-                        job_queue: Arc::new(JobQueue::new("bg_manage")),
-                    };
+                    let cfg = detached;
                     if let Err(e) = cfg.manage_one(&domain_owned, true).await {
                         error!(
                             domain = %domain_owned,
@@ -738,10 +612,10 @@ impl Config {
         }
 
         // Try loading from storage.
-        match self.cache_managed_certificate(domain).await {
+        match self.cache_certificate(domain).await {
             Ok(cert) => {
                 // Certificate was loaded from storage and cached.
-                let mut needs_action = cert.needs_renewal(self.renewal_window_ratio);
+                let mut needs_action = cert.needs_renewal(self.policy.renewal_window_ratio);
 
                 // Task 7: Check OCSP revocation status. If the certificate
                 // has been revoked, trigger a renewal.
@@ -755,12 +629,12 @@ impl Config {
 
                 if needs_action {
                     if r#async {
-                        self.renew_cert_async(domain, false).await?;
+                        self.renew_in_background(domain, false).await?;
                     } else {
-                        self.renew_cert_sync(domain, false).await?;
+                        self.renew(domain, false).await?;
                     }
                     // Reload the renewed certificate into cache.
-                    let _ = self.cache_managed_certificate(domain).await;
+                    let _ = self.cache_certificate(domain).await;
                 }
                 Ok(())
             }
@@ -773,9 +647,9 @@ impl Config {
 
                 // Not in storage -- obtain a new certificate.
                 if r#async {
-                    self.obtain_cert_async(domain).await
+                    self.obtain_in_background(domain).await
                 } else {
-                    self.obtain_cert_sync(domain).await
+                    self.obtain(domain).await
                 }
             }
         }
@@ -783,7 +657,7 @@ impl Config {
 
     /// Load a managed certificate from storage and add it to the in-memory
     /// cache.
-    pub async fn cache_managed_certificate(&self, domain: &str) -> Result<Certificate> {
+    pub async fn cache_certificate(&self, domain: &str) -> Result<Certificate> {
         let cert = self.load_managed_certificate(domain).await?;
         self.cache.add(cert.clone()).await;
         let _ = self.emit(
@@ -808,7 +682,7 @@ impl Config {
     /// Tries all configured issuers in order and returns the first
     /// successfully loaded certificate. Returns `Some(Certificate)` if
     /// found, `None` if not in storage for any issuer.
-    pub async fn load_cert_from_storage(&self, domain: &str) -> Result<Option<Certificate>> {
+    pub async fn load_certificate(&self, domain: &str) -> Result<Option<Certificate>> {
         match self.load_managed_certificate(domain).await {
             Ok(cert) => Ok(Some(cert)),
             Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
@@ -818,26 +692,26 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — obtain
+// CertManager — obtain
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Obtain a new certificate synchronously (foreground, no retries).
     ///
     /// Generates a new private key and CSR, then tries each configured
     /// issuer in order until one succeeds. The resulting certificate, key,
     /// and metadata are persisted to storage. A distributed lock is held
     /// during the operation to prevent duplicate issuance.
-    pub async fn obtain_cert_sync(&self, domain: &str) -> Result<()> {
+    pub async fn obtain(&self, domain: &str) -> Result<()> {
         self.obtain_cert(domain, true).await
     }
 
     /// Obtain a new certificate asynchronously (background, with retries).
     ///
-    /// Same as [`Config::obtain_cert_sync`] but wraps the
+    /// Same as [`CertManager::obtain`] but wraps the
     /// operation in [`do_with_retry`],
     /// automatically retrying transient failures with exponential backoff.
-    pub async fn obtain_cert_async(&self, domain: &str) -> Result<()> {
+    pub async fn obtain_in_background(&self, domain: &str) -> Result<()> {
         self.obtain_cert(domain, false).await
     }
 
@@ -873,28 +747,17 @@ impl Config {
         info!(domain = %domain, "acquiring lock for certificate obtain");
 
         let lock_key = Self::lock_key(CERT_ISSUE_LOCK_OP, domain);
-        self.storage.lock(&lock_key).await?;
+        // Held until this guard is dropped, which happens on every path out of
+        // here including a panic and a cancelled future. It used to be a
+        // matching `unlock` below, and a cancelled future left the lock held
+        // for the life of the process.
+        let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
-        let result = if interactive {
+        if interactive {
             self.do_obtain(domain).await
         } else {
-            let storage = Arc::clone(&self.storage);
-            let res = do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await;
-            // Ensure lock is released even on retry exhaustion.
-            drop(storage);
-            res
-        };
-
-        info!(domain = %domain, "releasing lock for certificate obtain");
-        if let Err(unlock_err) = self.storage.unlock(&lock_key).await {
-            error!(
-                domain = %domain,
-                error = %unlock_err,
-                "failed to release lock after certificate obtain"
-            );
+            do_with_retry(&RetryConfig::default(), |_| self.do_obtain(domain)).await
         }
-
-        result
     }
 
     /// The inner obtain logic, called once per attempt (with or without
@@ -930,21 +793,24 @@ impl Config {
         )?;
 
         // Generate or reuse private key (Task 5).
-        let (private_key, private_key_pem) = if self.reuse_private_keys {
+        let (private_key, private_key_pem) = if self.policy.reuse_private_keys {
             self.load_or_generate_private_key(domain).await?
         } else {
-            let pk = generate_private_key(self.key_type)?;
+            let pk = generate_private_key(self.policy.key_type)?;
             let pem = encode_private_key_pem(&pk)?;
             (pk, pem)
         };
 
         // Generate CSR.
         let domains = vec![domain.to_string()];
-        let csr_der = generate_csr(&private_key, &domains, self.must_staple)?;
+        let csr_der = generate_csr(&private_key, &domains, self.policy.must_staple)?;
 
         // Build issuer list, applying IssuerPolicy (Task 5).
         let mut issuers: Vec<Arc<dyn CertIssuer>> = self.issuers.clone();
-        if matches!(self.issuer_policy, IssuerPolicy::UseFirstRandomIssuer) {
+        if matches!(
+            self.policy.issuer_policy,
+            IssuerPolicy::UseFirstRandomIssuer
+        ) {
             use rand::seq::SliceRandom;
             issuers.shuffle(&mut rand::rng());
         }
@@ -1048,33 +914,33 @@ impl Config {
         }
 
         // No existing key found; generate a new one.
-        let pk = generate_private_key(self.key_type)?;
+        let pk = generate_private_key(self.policy.key_type)?;
         let pem = encode_private_key_pem(&pk)?;
         Ok((pk, pem))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Config — renew
+// CertManager — renew
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Renew a certificate synchronously (foreground, no retries).
     ///
     /// Loads the existing certificate from storage, checks if renewal is
     /// needed (unless `force` is `true`), generates a new key and CSR,
     /// and tries each configured issuer in order. A distributed lock is
     /// held during the operation.
-    pub async fn renew_cert_sync(&self, domain: &str, force: bool) -> Result<()> {
+    pub async fn renew(&self, domain: &str, force: bool) -> Result<()> {
         self.renew_cert(domain, force, true).await
     }
 
     /// Renew a certificate asynchronously (background, with retries).
     ///
-    /// Same as [`Config::renew_cert_sync`] but wraps the
+    /// Same as [`CertManager::renew`] but wraps the
     /// operation in [`do_with_retry`],
     /// automatically retrying transient failures with exponential backoff.
-    pub async fn renew_cert_async(&self, domain: &str, force: bool) -> Result<()> {
+    pub async fn renew_in_background(&self, domain: &str, force: bool) -> Result<()> {
         self.renew_cert(domain, force, false).await
     }
 
@@ -1126,7 +992,7 @@ impl Config {
         // (Task 6). Another instance may have renewed it while we were
         // waiting for the lock.
         let cert = self.make_certificate_with_ocsp(&cert_res).await?;
-        let needs_renewal = cert.needs_renewal(self.renewal_window_ratio);
+        let needs_renewal = cert.needs_renewal(self.policy.renewal_window_ratio);
 
         if !needs_renewal && !force {
             info!(
@@ -1161,21 +1027,24 @@ impl Config {
         )?;
 
         // Generate or reuse private key.
-        let (private_key, private_key_pem) = if self.reuse_private_keys {
+        let (private_key, private_key_pem) = if self.policy.reuse_private_keys {
             self.load_or_generate_private_key(domain).await?
         } else {
-            let pk = generate_private_key(self.key_type)?;
+            let pk = generate_private_key(self.policy.key_type)?;
             let pem = encode_private_key_pem(&pk)?;
             (pk, pem)
         };
 
         // Generate CSR.
         let domains = vec![domain.to_string()];
-        let csr_der = generate_csr(&private_key, &domains, self.must_staple)?;
+        let csr_der = generate_csr(&private_key, &domains, self.policy.must_staple)?;
 
         // Build issuer list, applying IssuerPolicy.
         let mut issuers: Vec<Arc<dyn CertIssuer>> = self.issuers.clone();
-        if matches!(self.issuer_policy, IssuerPolicy::UseFirstRandomIssuer) {
+        if matches!(
+            self.policy.issuer_policy,
+            IssuerPolicy::UseFirstRandomIssuer
+        ) {
             use rand::seq::SliceRandom;
             issuers.shuffle(&mut rand::rng());
         }
@@ -1244,17 +1113,17 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — revoke
+// CertManager — revoke
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Revoke the certificate for `domain`.
     ///
     /// Iterates over configured issuers, attempting revocation for each.
     /// After successful revocation, the certificate assets are deleted from
     /// storage to prevent reuse. The optional `reason` is an RFC 5280
     /// revocation reason code (0-10).
-    pub async fn revoke_cert(&self, domain: &str, reason: Option<u8>) -> Result<()> {
+    pub async fn revoke(&self, domain: &str, reason: Option<u8>) -> Result<()> {
         for (i, issuer) in self.issuers.iter().enumerate() {
             let ik = issuer.issuer_key();
 
@@ -1331,10 +1200,10 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
-// Config — TLS configuration
+// CertManager — TLS configuration
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Build a [`rustls::ServerConfig`] wired up to serve certificates from
     /// this config's cache.
     ///
@@ -1342,18 +1211,19 @@ impl Config {
     /// config's in-memory certificate cache, with ALPN protocols set to
     /// `["h2", "http/1.1"]`.
     ///
-    /// If [`default_server_name`](Config::default_server_name) or
-    /// [`fallback_server_name`](Config::fallback_server_name) are
+    /// If [`default_server_name`](Policy::default_server_name) or
+    /// [`fallback_server_name`](Policy::fallback_server_name) are
     /// configured, they are applied to the resolver.
-    pub fn tls_config(&self) -> rustls::ServerConfig {
+    pub fn server_config(&self) -> rustls::ServerConfig {
+        crate::install_default_crypto_provider();
         let mut resolver = CertResolver::new(self.cache.clone());
 
         // Apply default/fallback server names if configured.
-        if self.default_server_name.is_some() {
-            resolver.set_default_server_name(self.default_server_name.clone());
+        if self.policy.default_server_name.is_some() {
+            resolver.set_default_server_name(self.policy.default_server_name.clone());
         }
-        if self.fallback_server_name.is_some() {
-            resolver.set_fallback_server_name(self.fallback_server_name.clone());
+        if self.policy.fallback_server_name.is_some() {
+            resolver.set_fallback_server_name(self.policy.fallback_server_name.clone());
         }
 
         let mut tls_config = rustls::ServerConfig::builder()
@@ -1371,7 +1241,7 @@ impl Config {
 // Client TLS credentials (mTLS)
 // ---------------------------------------------------------------------------
 
-impl Config {
+impl CertManager {
     /// Build TLS client credentials from a managed certificate.
     ///
     /// Loads the certificate and private key for `domain` from the cache (or
@@ -1472,9 +1342,10 @@ impl Config {
     ///
     /// Returns an error if no suitable certificate is found or if TLS
     /// configuration fails.
-    pub async fn client_tls_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
+    pub async fn client_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
         let (cert_chain, pk_der) = self.client_credentials(domain).await?;
 
+        crate::install_default_crypto_provider();
         let config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_client_auth_cert(cert_chain, pk_der)
@@ -1580,20 +1451,20 @@ mod tests {
     #[test]
     fn test_config_builder_defaults() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        assert!((config.renewal_window_ratio - 1.0 / 3.0).abs() < f64::EPSILON);
-        assert_eq!(config.key_type, KeyType::EcdsaP256);
-        assert!(!config.interactive);
+        assert!((config.policy.renewal_window_ratio - 1.0 / 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.policy.key_type, KeyType::EcdsaP256);
+        assert!(!config.policy.interactive);
         assert!(config.issuers.is_empty());
         assert!(config.on_demand.is_none());
         assert!(config.on_event.is_none());
     }
 
     #[test]
-    #[should_panic(expected = "Config requires a Storage")]
+    #[should_panic(expected = "CertManager requires a Storage")]
     fn test_config_builder_panics_without_storage() {
-        let _config = Config::builder().build();
+        let _config = CertManager::builder().build();
     }
 
     #[test]
@@ -1601,7 +1472,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         let cache = CertCache::new(CacheOptions::default());
 
-        let config = Config::builder()
+        let config = CertManager::builder()
             .storage(storage)
             .cache(cache)
             .key_type(KeyType::EcdsaP384)
@@ -1609,23 +1480,23 @@ mod tests {
             .interactive(true)
             .build();
 
-        assert_eq!(config.key_type, KeyType::EcdsaP384);
-        assert!((config.renewal_window_ratio - 0.5).abs() < f64::EPSILON);
-        assert!(config.interactive);
+        assert_eq!(config.policy.key_type, KeyType::EcdsaP384);
+        assert!((config.policy.renewal_window_ratio - 0.5).abs() < f64::EPSILON);
+        assert!(config.policy.interactive);
     }
 
     #[test]
     fn test_config_debug() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
         let debug_str = format!("{:?}", config);
-        assert!(debug_str.contains("Config"));
+        assert!(debug_str.contains("CertManager"));
         assert!(debug_str.contains("renewal_window_ratio"));
     }
 
     #[test]
     fn test_lock_key_format() {
-        let key = Config::lock_key("issue_cert", "example.com");
+        let key = CertManager::lock_key("issue_cert", "example.com");
         assert_eq!(key, "issue_cert_example.com");
     }
 
@@ -1642,7 +1513,7 @@ mod tests {
     #[tokio::test]
     async fn test_storage_has_no_cert_resources() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
         let has = config
             .storage_has_cert_resources_any_issuer("example.com")
@@ -1653,9 +1524,9 @@ mod tests {
     #[tokio::test]
     async fn test_load_cert_from_storage_not_found() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        let result = config.load_cert_from_storage("example.com").await;
+        let result = config.load_certificate("example.com").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -1668,7 +1539,7 @@ mod tests {
         let count_clone = Arc::clone(&call_count);
 
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder()
+        let config = CertManager::builder()
             .storage(storage)
             .on_event(Arc::new(move |event, _data| {
                 assert_eq!(event, "test_event");
@@ -1684,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn test_emit_without_callback() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
         // Should not panic when no callback is set.
         config.emit("test_event", &serde_json::json!({})).unwrap();
@@ -1693,9 +1564,9 @@ mod tests {
     #[tokio::test]
     async fn test_obtain_cert_no_issuers() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        let result = config.obtain_cert_sync("example.com").await;
+        let result = config.obtain("example.com").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no issuers configured"));
@@ -1706,7 +1577,7 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
         // Create a config with a dummy issuer list (though the domain check
         // should fail before trying any issuer).
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
         // ".invalid" starts with a dot, so it should fail validation.
         // But first, the issuers check runs -- let us handle that by noting
@@ -1718,9 +1589,9 @@ mod tests {
     #[tokio::test]
     async fn test_renew_cert_no_issuers() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        let result = config.renew_cert_sync("example.com", false).await;
+        let result = config.renew("example.com", false).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("no issuers configured"));
@@ -1729,20 +1600,20 @@ mod tests {
     #[tokio::test]
     async fn test_manage_sync_no_issuers_no_storage() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        // With no issuers and nothing in storage, manage_sync should fail
+        // With no issuers and nothing in storage, manage should fail
         // because it tries to obtain a cert but has no issuers.
-        let result = config.manage_sync(&["example.com".to_string()]).await;
+        let result = config.manage(&["example.com".to_string()]).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_revoke_cert_nothing_in_storage() {
         let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
-        let config = Config::builder().storage(storage).build();
+        let config = CertManager::builder().storage(storage).build();
 
-        let result = config.revoke_cert("example.com", None).await;
+        let result = config.revoke("example.com", None).await;
         assert!(result.is_err());
     }
 
@@ -1765,7 +1636,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = Config::builder().storage(storage_trait).build();
+        let config = CertManager::builder().storage(storage_trait).build();
 
         // delete_site_assets uses storage key builders which may produce
         // different keys than the raw ones above. This test simply

@@ -1,6 +1,6 @@
-//! Custom configuration with the ConfigBuilder.
+//! Custom configuration with the CertManagerBuilder.
 //!
-//! This example shows how to use `Config::builder()` with custom settings,
+//! This example shows how to use `CertManager::builder()` with custom settings,
 //! multiple issuers, a specific key type, OCSP configuration, and event
 //! callbacks. It also demonstrates starting background certificate maintenance.
 //!
@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use certon::{
-    AcmeIssuer, CertResolver, Config, FileStorage, KeyType, LETS_ENCRYPT_STAGING, OcspConfig,
+    AcmeIssuer, CertManager, CertResolver, FileStorage, KeyType, LETS_ENCRYPT_STAGING, OcspConfig,
     Result, Storage,
 };
 
@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
         .cert_key_type(KeyType::EcdsaP256)
         .build();
 
-    // You can configure multiple issuers. The Config will try each one in
+    // You can configure multiple issuers. The CertManager will try each one in
     // order until one succeeds.
     let issuers: Vec<Arc<dyn certon::acme_issuer::CertIssuer>> = vec![Arc::new(le_staging)];
 
@@ -52,8 +52,8 @@ async fn main() -> Result<()> {
         Ok(())
     });
 
-    // -- Build the Config ------------------------------------------------------
-    let config = Config::builder()
+    // -- Build the CertManager ------------------------------------------------------
+    let manager = CertManager::builder()
         .storage(storage)
         .issuers(issuers)
         .key_type(KeyType::EcdsaP256)
@@ -65,29 +65,29 @@ async fn main() -> Result<()> {
 
     // -- Manage domains --------------------------------------------------------
     let domains = vec!["example.com".into(), "www.example.com".into()];
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
 
     // -- Build the TLS server config -------------------------------------------
-    let resolver = CertResolver::new(config.cache.clone());
+    let resolver = CertResolver::new(manager.cache.clone());
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
 
     println!("TLS config ready with custom settings");
-    println!("  Key type: {:?}", config.key_type);
-    println!("  Renewal ratio: {}", config.renewal_window_ratio);
-    println!("  Issuers: {}", config.issuers.len());
+    println!("  Key type: {:?}", manager.policy.key_type);
+    println!("  Renewal ratio: {}", manager.policy.renewal_window_ratio);
+    println!("  Issuers: {}", manager.issuers.len());
 
     // -- Start background maintenance ------------------------------------------
     // This spawns a task that periodically renews certificates and refreshes
     // OCSP staples.
-    let _maintenance_handle = certon::start_maintenance(&config);
+    let _maintenance_handle = certon::start_maintenance(&manager);
 
     // Keep the process alive for certificate maintenance.
     tokio::signal::ctrl_c().await.ok();
 
     // Gracefully stop maintenance when shutting down.
-    config.cache.stop();
+    manager.cache.stop();
 
     Ok(())
 }

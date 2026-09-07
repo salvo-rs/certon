@@ -12,7 +12,7 @@
 Certon brings production-grade automatic certificate management to Rust programs: obtain, renew, and serve TLS certificates from any ACME-compatible Certificate Authority, with just a few lines of code.
 
 ```rust
-use certon::Config;
+use certon::CertManager;
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
@@ -69,7 +69,7 @@ async fn main() -> certon::Result<()> {
 - **File system storage with atomic writes** -- default `FileStorage` uses write-to-temp-then-rename for crash safety; distributed lock files with background keepalive for cluster coordination
 - **Custom storage backends** -- implement the `Storage` trait to use databases, KV stores, or any other persistence layer
 - **Event callbacks** -- observe certificate lifecycle events (`cert_obtaining`, `cert_obtained`, `cert_renewed`, `cert_failed`, `cert_revoked`, etc.)
-- **Builder pattern** -- ergonomic `Config::builder()`, `AcmeIssuer::builder()`, and `ZeroSslIssuer::builder()` for easy configuration
+- **Builder pattern** -- ergonomic `CertManager::builder()`, `AcmeIssuer::builder()`, and `ZeroSslIssuer::builder()` for easy configuration
 - **External Account Binding (EAB)** -- first-class support for CAs that require EAB (e.g., ZeroSSL)
 - **Certificate chain preference** -- select preferred chains by root/issuer Common Name or chain size
 - **Certificate revocation** -- revoke compromised certificates via the ACME protocol
@@ -150,7 +150,7 @@ rather than a puzzling "unknown key type".
 The simplest way to get started -- one function call manages everything:
 
 ```rust
-use certon::Config;
+use certon::CertManager;
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
@@ -176,20 +176,20 @@ This will:
 
 ```rust
 use std::sync::Arc;
-use certon::{Config, FileStorage, Storage};
+use certon::{CertManager, FileStorage, Storage};
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = Config::builder()
+    let manager = CertManager::builder()
         .storage(storage)
         .build();
 
     let domains = vec!["example.com".into(), "www.example.com".into()];
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
 
     // Start background maintenance (renewal + OCSP refresh).
-    let _handle = certon::start_maintenance(&config);
+    let _handle = certon::start_maintenance(&manager);
 
     Ok(())
 }
@@ -200,7 +200,7 @@ async fn main() -> certon::Result<()> {
 ```rust
 use std::sync::Arc;
 use certon::{
-    AcmeIssuer, Config, FileStorage, Storage,
+    AcmeIssuer, CertManager, FileStorage, Storage,
     LETS_ENCRYPT_STAGING,
 };
 
@@ -213,7 +213,7 @@ let issuer = AcmeIssuer::builder()
     .storage(storage.clone())
     .build();
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .issuers(vec![Arc::new(issuer)])
     .build();
@@ -275,7 +275,7 @@ ZeroSSL provides free certificates via ACME with External Account Binding. Certo
 
 ```rust
 use std::sync::Arc;
-use certon::{Config, FileStorage, Storage, ZeroSslIssuer};
+use certon::{CertManager, FileStorage, Storage, ZeroSslIssuer};
 
 let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
 
@@ -286,7 +286,7 @@ let issuer = ZeroSslIssuer::builder()
     .build()
     .await?;
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .issuers(vec![Arc::new(issuer)])
     .build();
@@ -363,10 +363,10 @@ let on_demand = Arc::new(OnDemandConfig {
     ])),
     decision_func: None,
     rate_limit: None,
-    obtain_func: None, // Wired up by Config internally
+    obtain_func: None, // Wired up by CertManager internally
 });
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .on_demand(on_demand)
     .build();
@@ -379,7 +379,7 @@ Subscribe to certificate lifecycle events for logging, monitoring, or alerting:
 ```rust
 use std::sync::Arc;
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .on_event(Arc::new(|event: &str, data: &serde_json::Value| {
         println!("Certificate event: {} {:?}", event, data);
@@ -399,7 +399,7 @@ Events emitted include:
 
 ```
                     +-----------+
-                    |  Config   |  Central coordinator
+                    |  CertManager   |  Runs the lifecycle
                     +-----+-----+
                           |
           +---------------+---------------+
@@ -427,7 +427,8 @@ Events emitted include:
 
 | Component | Role |
 |---|---|
-| `Config` | Central entry point; coordinates obtain, renew, revoke, and cache operations |
+| `CertManager` | Runs the certificate lifecycle: obtain, renew, revoke, cache, serve |
+| `Policy` | What it should do, as plain data |
 | `AcmeIssuer` / `ZeroSslIssuer` | Implement the `Issuer` trait; drive the ACME protocol flow |
 | `AcmeClient` | Low-level ACME HTTP client (directory, nonce, JWS signing, order management) |
 | `CertCache` | In-memory certificate store indexed by domain name (with wildcard matching) |
@@ -528,13 +529,13 @@ Certon runs background maintenance via `certon::start_maintenance()`, which spaw
 Both loops respect the `CertCache::stop()` signal for graceful shutdown.
 
 ```rust
-let config = Config::builder().storage(storage).build();
+let manager = CertManager::builder().storage(storage).build();
 
 // Start background maintenance.
-let handle = certon::start_maintenance(&config);
+let handle = certon::start_maintenance(&manager);
 
 // ... later, to stop gracefully:
-// config.cache.stop();
+// manager.cache.stop();
 // handle.await;
 ```
 
@@ -561,7 +562,7 @@ Full API documentation is available on [docs.rs](https://docs.rs/certon).
 Key entry points:
 
 - [`certon::manage()`](https://docs.rs/certon/latest/certon/fn.manage.html) -- highest-level function, returns a ready-to-use `rustls::ServerConfig`
-- [`Config::builder()`](https://docs.rs/certon/latest/certon/struct.ConfigBuilder.html) -- configure and build a `Config`
+- [`CertManager::builder()`](https://docs.rs/certon/latest/certon/struct.CertManagerBuilder.html) -- configure and build a `CertManager`
 - [`AcmeIssuer::builder()`](https://docs.rs/certon/latest/certon/struct.AcmeIssuerBuilder.html) -- configure an ACME issuer
 - [`Storage` trait](https://docs.rs/certon/latest/certon/trait.Storage.html) -- implement custom storage backends
 - [`Solver` trait](https://docs.rs/certon/latest/certon/trait.Solver.html) -- implement custom challenge solvers
