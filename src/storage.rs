@@ -141,8 +141,8 @@ pub trait Storage: Send + Sync {
 pub struct LockGuard {
     storage: Arc<dyn Storage>,
     name: String,
-    /// Set once the lock is known to be released, so `Drop` does not release
-    /// it a second time.
+    /// Set when an owned release task takes responsibility for cleanup, so
+    /// `Drop` does not release the same lock a second time.
     released: bool,
     runtime: tokio::runtime::Handle,
 }
@@ -871,18 +871,19 @@ mod lock_guard_tests {
     /// Wait for a lock to become free, so a test does not race the spawned
     /// release. A failure here means it never became free.
     async fn becomes_free(storage: &Arc<dyn Storage>, name: &str) -> bool {
-        for _ in 0..50 {
-            if storage
-                .try_lock(name, Duration::from_millis(50))
-                .await
-                .unwrap_or(false)
-            {
-                let _ = storage.unlock(name).await;
-                return true;
+        // A short, repeatedly cancelled file operation can itself leave a
+        // partially acquired lock awaiting stale recovery on slow filesystems.
+        // Wait once, allowing acquisition to finish before releasing it.
+        let guard = try_acquire(Arc::clone(storage), name, Duration::from_secs(5))
+            .await
+            .expect("lock acquisition should not fail");
+        match guard {
+            Some(guard) => {
+                guard.release().await.expect("release the probe lock");
+                true
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            None => false,
         }
-        false
     }
 
     #[tokio::test]
