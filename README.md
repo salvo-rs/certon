@@ -113,7 +113,7 @@ The default `aws-lc-rs` backend requires no extra configuration. To use `ring` i
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ### Optional Features
