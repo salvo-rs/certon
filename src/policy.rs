@@ -106,10 +106,10 @@ pub struct Policy {
     /// This decides two things, and it is worth being explicit about both
     /// because the name only suggests one:
     ///
-    /// - A failure is returned straight away rather than retried with backoff.
-    ///   Somebody watching a terminal wants the error, not a wait.
-    /// - Checks that may ask a question, such as agreeing to a certificate
-    ///   authority's terms, are permitted.
+    /// - A failure is returned straight away rather than retried with backoff. Somebody watching a
+    ///   terminal wants the error, not a wait.
+    /// - Checks that may ask a question, such as agreeing to a certificate authority's terms, are
+    ///   permitted.
     ///
     /// Leave it `false` in a server. A background renewal that gives up on the
     /// first network blip is worse than one that waits.
