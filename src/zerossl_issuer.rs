@@ -476,10 +476,10 @@ mod tests {
         let storage: Arc<dyn Storage> = Arc::new(crate::file_storage::FileStorage::default());
         let issuer = ZeroSslApiIssuer::new("test_key", storage)
             .with_validity_days(365)
-            .with_key_type(KeyType::Rsa2048)
+            .with_key_type(KeyType::EcdsaP384)
             .with_poll_interval(Duration::from_secs(10));
         assert_eq!(issuer.validity_days, 365);
-        assert_eq!(issuer.key_type, KeyType::Rsa2048);
+        assert_eq!(issuer.key_type, KeyType::EcdsaP384);
         assert_eq!(issuer.poll_interval, Duration::from_secs(10));
     }
 

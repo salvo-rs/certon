@@ -7,7 +7,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use certon::Config;
+//! use certon::CertManager;
 //!
 //! #[tokio::main]
 //! async fn main() -> certon::Result<()> {
@@ -20,17 +20,16 @@
 //!
 //! ## Architecture
 //!
-//! - [`Config`] is the central entry point that coordinates the certificate lifecycle (obtain,
-//!   renew, revoke, cache).
-//! - [`AcmeIssuer`] and [`ZeroSslIssuer`] implement the [`CertIssuer`] trait to obtain certificates
-//!   from ACME-compatible Certificate Authorities.
+//! - [`CertManager`] runs the certificate lifecycle: obtain, renew, revoke, cache, serve.
+//! - [`Policy`] holds certificate management settings.
+//! - [`AcmeIssuer`] and `ZeroSslIssuer` (with `zerossl`) implement [`CertIssuer`].
 //! - [`CertCache`] provides an in-memory certificate store indexed by domain name for fast TLS
 //!   handshake lookups.
 //! - [`CertResolver`] implements [`rustls::server::ResolvesServerCert`] and plugs directly into a
 //!   `rustls::ServerConfig`.
-//! - [`Storage`] is the persistence abstraction; [`FileStorage`] is the default filesystem-backed
-//!   implementation.
-//! - [`http`] owns the single HTTP client every outbound request shares.
+//! - [`CertStore`] holds certificates; [`KeyValueCertStore`] adapts a [`Storage`].
+//! - [`Storage`] provides key-value persistence and cluster locks.
+//! - [`http`] owns the shared outbound HTTP client.
 //! - [`start_maintenance`] runs background loops that renew certificates and refresh OCSP staples.
 //! - [`Manager`] is an external certificate provider trait for custom sources.
 //! - [`PreChecker`] validates domains before ACME issuance is attempted.
@@ -53,9 +52,10 @@ pub mod acme_client;
 pub mod acme_issuer;
 pub mod async_jobs;
 pub mod cache;
+pub mod cert_store;
 pub mod certificates;
-pub mod config;
 pub mod crypto;
+#[cfg(feature = "dns-01")]
 pub mod dns_util;
 pub mod error;
 pub mod file_storage;
@@ -63,11 +63,14 @@ pub mod handshake;
 pub mod http;
 pub mod http_handler;
 pub mod maintain;
+pub mod manager;
 pub mod ocsp;
+pub mod policy;
 pub mod rate_limiter;
 pub mod redirect;
 pub mod solvers;
 pub mod storage;
+#[cfg(feature = "zerossl")]
 pub mod zerossl_issuer;
 
 // ---------------------------------------------------------------------------
@@ -83,22 +86,25 @@ pub use acme_issuer::{
     AcmeIssuer, AcmeIssuerBuilder, CertIssuer, IssuedCertificate, Manager, PreChecker, Revoker,
 };
 pub use cache::{CacheOptions, CertCache};
+pub use cert_store::{CertStore, KeyValueCertStore};
 pub use certificates::Certificate;
-pub use config::{CertificateSelector, Config, ConfigBuilder, IssuerPolicy};
 pub use crypto::{KeyType, PrivateKey};
 pub use error::{Error, Result};
 pub use file_storage::FileStorage;
 pub use handshake::{CertResolver, OnDemandConfig};
 pub use http::set_user_agent;
 pub use maintain::MaintenanceConfig;
+pub use manager::{CertManager, CertManagerBuilder};
 pub use ocsp::OcspConfig;
+pub use policy::{CertificateSelector, IssuerPolicy, Policy};
 pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
-pub use solvers::{
-    DistributedSolver, Dns01Solver, DnsProvider, Http01Solver, Solver, TlsAlpn01Solver,
-};
+pub use solvers::{DistributedSolver, Http01Solver, Solver, TlsAlpn01Solver};
+#[cfg(feature = "dns-01")]
+pub use solvers::{Dns01Solver, DnsProvider};
 pub use storage::{
     CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
 };
+#[cfg(feature = "zerossl")]
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
 // ---------------------------------------------------------------------------
@@ -109,8 +115,8 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 ///
 /// This is the highest-level entry point. It:
 ///
-/// 1. Creates a [`Config`] backed by the default [`FileStorage`].
-/// 2. Calls [`Config::manage_sync`] to obtain (or load from storage) and cache certificates for
+/// 1. Creates a [`CertManager`] backed by the default [`FileStorage`].
+/// 2. Calls [`CertManager::manage`] to obtain (or load from storage) and cache certificates for
 ///    every domain.
 /// 3. Returns a [`rustls::ServerConfig`] wired up with a [`CertResolver`] that serves the managed
 ///    certificates.
@@ -134,8 +140,8 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
     install_default_crypto_provider();
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = Config::builder().storage(storage).build();
-    config.manage_sync(domains).await?;
+    let config = CertManager::builder().storage(storage).build();
+    config.manage(domains).await?;
 
     // Build a rustls ServerConfig with the CertResolver backed by the
     // config's in-memory certificate cache.
@@ -144,18 +150,6 @@ pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
     Ok(tls_config)
-}
-
-/// Create a TLS configuration for the given domains.
-///
-/// This is an alias for [`manage`] — it obtains/loads certificates for
-/// `domains` and returns a ready-to-use [`rustls::ServerConfig`].
-///
-/// # Errors
-///
-/// See [`manage`] for error conditions.
-pub async fn tls_config(domains: &[String]) -> Result<rustls::ServerConfig> {
-    manage(domains).await
 }
 
 /// Obtain/load certificates for `domains` and bind a TLS listener on `addr`.
@@ -175,32 +169,31 @@ pub async fn listen(domains: &[String], addr: &str) -> Result<tokio_rustls::TlsA
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)))
 }
 
-/// Synchronous-style certificate management for the given domains.
+/// Obtain or load certificates for `domains`, and wait for it.
 ///
-/// Obtains/loads certificates using a default configuration and waits for
-/// completion. This is a convenience wrapper around
-/// [`Config::manage_sync`].
+/// Use this when you already have a `rustls::ServerConfig` and only need the
+/// certificates to exist; [`manage`] is the one that hands you a server
+/// configuration as well.
 ///
 /// # Errors
 ///
 /// Returns an error if certificate management fails.
-pub async fn manage_sync(domains: &[String]) -> Result<()> {
+pub async fn obtain(domains: &[String]) -> Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = Config::builder().storage(storage).build();
-    config.manage_sync(domains).await
+    let config = CertManager::builder().storage(storage).build();
+    config.manage(domains).await
 }
 
-/// Asynchronous certificate management for the given domains.
+/// Obtain or load certificates for `domains` without waiting.
 ///
-/// Spawns certificate management as a background task and returns
-/// immediately. The returned [`tokio::task::JoinHandle`] can be awaited
-/// to wait for completion.
-pub fn manage_async(domains: &[String]) -> tokio::task::JoinHandle<Result<()>> {
+/// The returned handle can be awaited if you later decide you do want to
+/// know how it went.
+pub fn obtain_in_background(domains: &[String]) -> tokio::task::JoinHandle<Result<()>> {
     let domains = domains.to_vec();
-    tokio::spawn(async move { manage_sync(&domains).await })
+    tokio::spawn(async move { obtain(&domains).await })
 }
 
-/// Start background certificate maintenance for a [`Config`].
+/// Start background certificate maintenance for a [`CertManager`].
 ///
 /// Spawns a tokio task that periodically:
 /// - Checks all managed certificates in the config's cache for renewal.
@@ -214,52 +207,82 @@ pub fn manage_async(domains: &[String]) -> tokio::task::JoinHandle<Result<()>> {
 ///
 /// ```rust,no_run
 /// # use std::sync::Arc;
-/// # use certon::{Config, FileStorage, Storage};
+/// # use certon::{CertManager, FileStorage, Storage};
 /// # fn example() {
 /// let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-/// let config = Config::builder().storage(storage).build();
+/// let config = CertManager::builder().storage(storage).build();
 /// let handle = certon::start_maintenance(&config);
 /// // ... later, to stop:
 /// // config.cache.stop();
 /// # }
 /// ```
-pub fn start_maintenance(config: &Config) -> tokio::task::JoinHandle<()> {
+pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
     let cache = config.cache.clone();
     let maint_config = MaintenanceConfig {
         renew_check_interval: maintain::DEFAULT_RENEW_CHECK_INTERVAL,
         ocsp_check_interval: maintain::DEFAULT_OCSP_CHECK_INTERVAL,
-        ocsp: config.ocsp.clone(),
+        ocsp: config.policy.ocsp.clone(),
         storage: config.storage.clone(),
     };
 
-    // Build a renewal function that delegates to Config::renew_cert_sync.
-    // We need to clone the config's relevant parts into an Arc so the
-    // closure can be 'static + Send + Sync.
-    let config_storage = config.storage.clone();
-    let config_cache = config.cache.clone();
-    let config_issuers = config.issuers.clone();
-    let config_key_type = config.key_type;
-    let config_ocsp = config.ocsp.clone();
-    let config_renewal_ratio = config.renewal_window_ratio;
-
-    let renew_func: Arc<maintain::RenewFn> = Arc::new(move |domain: String| {
-        let storage = config_storage.clone();
-        let cache = config_cache.clone();
-        let issuers = config_issuers.clone();
-        let key_type = config_key_type;
-        let ocsp_cfg = config_ocsp.clone();
-        let renewal_ratio = config_renewal_ratio;
-
-        Box::pin(async move {
-            // Reconstruct a minimal Config for renewal.
-            let cfg = Config::builder().storage(storage).build();
-            // NOTE: This is a simplified renewal path. In a full
-            // implementation the original Config would be shared via Arc.
-            // For now we call manage_sync which handles obtain-or-renew.
-            let _ = (cache, issuers, key_type, ocsp_cfg, renewal_ratio);
-            cfg.manage_sync(&[domain]).await
-        })
-    });
+    let renew_func = maintenance_renewal(config);
 
     maintain::start_maintenance(cache, maint_config, renew_func)
+}
+
+fn maintenance_renewal(config: &CertManager) -> Arc<maintain::RenewFn> {
+    let manager = Arc::new(config.detached("maintenance"));
+    Arc::new(move |domain: String| {
+        let manager = Arc::clone(&manager);
+        Box::pin(async move { manager.renew(&domain, false).await })
+    })
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+
+    struct Issuer;
+    #[async_trait::async_trait]
+    impl CertIssuer for Issuer {
+        async fn issue(&self, _: &[u8], _: &[String]) -> Result<IssuedCertificate> {
+            Err(Error::Other("configured issuer reached".into()))
+        }
+        fn issuer_key(&self) -> String {
+            "test".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_the_issuer_and_renewal_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+        let cert = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        storage::store_certificate(
+            storage.as_ref(),
+            "test",
+            &CertificateResource {
+                sans: vec!["example.com".into()],
+                certificate_pem: cert.cert.pem().into_bytes(),
+                private_key_pem: cert.signing_key.serialize_pem().into_bytes(),
+                issuer_key: "test".into(),
+                issuer_data: None,
+            },
+        )
+        .await
+        .unwrap();
+        let config = CertManager::builder()
+            .storage(storage)
+            .issuers(vec![Arc::new(Issuer)])
+            .interactive(true)
+            .renewal_window_ratio(1.0)
+            .build();
+        let error = maintenance_renewal(&config)("example.com".into())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("configured issuer reached"),
+            "{error}"
+        );
+    }
 }

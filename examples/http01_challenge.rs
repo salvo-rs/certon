@@ -14,8 +14,8 @@
 use std::sync::Arc;
 
 use certon::{
-    AcmeIssuer, CertResolver, Config, FileStorage, Http01Solver, KeyType, LETS_ENCRYPT_STAGING,
-    Result, Storage,
+    AcmeIssuer, CertManager, CertResolver, FileStorage, Http01Solver, KeyType,
+    LETS_ENCRYPT_STAGING, Result, Storage,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -47,8 +47,8 @@ async fn main() -> Result<()> {
         .disable_tlsalpn_challenge(true)
         .build();
 
-    // -- Config ----------------------------------------------------------------
-    let config = Config::builder()
+    // -- CertManager ----------------------------------------------------------------
+    let manager = CertManager::builder()
         .storage(storage)
         .issuers(vec![Arc::new(issuer)])
         .key_type(KeyType::EcdsaP256)
@@ -60,11 +60,11 @@ async fn main() -> Result<()> {
         "Obtaining certificate for {:?} via HTTP-01 challenge...",
         domains
     );
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
     println!("Certificate obtained successfully!");
 
     // -- Build the TLS config --------------------------------------------------
-    let resolver = CertResolver::new(config.cache.clone());
+    let resolver = CertResolver::new(manager.cache.clone());
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     println!("HTTPS server listening on 0.0.0.0:443");
 
     // Start background maintenance for certificate renewal.
-    let _maintenance = certon::start_maintenance(&config);
+    let _maintenance = certon::start_maintenance(&manager);
 
     loop {
         let (stream, peer_addr) = listener

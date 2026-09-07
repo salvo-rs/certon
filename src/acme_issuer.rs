@@ -90,11 +90,11 @@ const DEFAULT_ORDER_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// Implementors know how to obtain a certificate for a set of domain names
 /// given a CSR (Certificate Signing Request) in DER format. Multiple issuers
-/// can be configured in a [`Config`](crate::config::Config) -- they are
+/// can be configured in a [`CertManager`](crate::manager::CertManager) -- they are
 /// tried in order until one succeeds.
 ///
 /// The built-in implementations are [`AcmeIssuer`] (Let's Encrypt and other
-/// generic ACME CAs) and [`ZeroSslIssuer`](crate::zerossl_issuer::ZeroSslIssuer).
+/// generic ACME CAs) and `ZeroSslIssuer` (with the `zerossl` feature).
 #[async_trait]
 pub trait CertIssuer: Send + Sync {
     /// Issue a certificate for the given CSR.

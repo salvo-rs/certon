@@ -12,7 +12,7 @@
 Certon 为 Rust 程序提供生产级的自动证书管理：从任何 ACME 兼容的证书颁发机构（CA）自动获取、续期和服务 TLS 证书，只需几行代码。
 
 ```rust
-use certon::Config;
+use certon::CertManager;
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
@@ -69,7 +69,7 @@ async fn main() -> certon::Result<()> {
 - **文件系统存储与原子写入** -- 默认的 `FileStorage` 使用先写临时文件再重命名的方式确保崩溃安全；分布式锁文件通过后台保活任务实现集群协调
 - **自定义存储后端** -- 实现 `Storage` trait 即可使用数据库、KV 存储或任何其他持久化层
 - **事件回调** -- 监听证书生命周期事件（`cert_obtaining`、`cert_obtained`、`cert_renewed`、`cert_failed`、`cert_revoked` 等）
-- **Builder 模式** -- 人性化的 `Config::builder()`、`AcmeIssuer::builder()` 和 `ZeroSslIssuer::builder()` 简化配置
+- **Builder 模式** -- 人性化的 `CertManager::builder()`、`AcmeIssuer::builder()` 和 `ZeroSslIssuer::builder()` 简化配置
 - **外部账户绑定（EAB）** -- 一等支持需要 EAB 的 CA（如 ZeroSSL）
 - **证书链偏好** -- 按根证书/颁发者 Common Name 或链大小选择首选证书链
 - **证书吊销** -- 通过 ACME 协议吊销受损的证书
@@ -113,7 +113,7 @@ Certon 支持两种加密后端，通过 feature flag 选择：
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ## 快速开始
@@ -121,7 +121,7 @@ certon = { version = "0.2", default-features = false, features = ["ring"] }
 最简单的使用方式 -- 一个函数调用管理一切：
 
 ```rust
-use certon::Config;
+use certon::CertManager;
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
@@ -147,20 +147,20 @@ async fn main() -> certon::Result<()> {
 
 ```rust
 use std::sync::Arc;
-use certon::{Config, FileStorage, Storage};
+use certon::{CertManager, FileStorage, Storage};
 
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = Config::builder()
+    let manager = CertManager::builder()
         .storage(storage)
         .build();
 
     let domains = vec!["example.com".into(), "www.example.com".into()];
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
 
     // 启动后台维护（续期 + OCSP 刷新）
-    let _handle = certon::start_maintenance(&config);
+    let _handle = certon::start_maintenance(&manager);
 
     Ok(())
 }
@@ -171,7 +171,7 @@ async fn main() -> certon::Result<()> {
 ```rust
 use std::sync::Arc;
 use certon::{
-    AcmeIssuer, Config, FileStorage, Storage,
+    AcmeIssuer, CertManager, FileStorage, Storage,
     LETS_ENCRYPT_STAGING,
 };
 
@@ -184,7 +184,7 @@ let issuer = AcmeIssuer::builder()
     .storage(storage.clone())
     .build();
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .issuers(vec![Arc::new(issuer)])
     .build();
@@ -246,7 +246,7 @@ ZeroSSL 通过 ACME 协议提供免费证书，需要外部账户绑定（EAB）
 
 ```rust
 use std::sync::Arc;
-use certon::{Config, FileStorage, Storage, ZeroSslIssuer};
+use certon::{CertManager, FileStorage, Storage, ZeroSslIssuer};
 
 let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
 
@@ -257,7 +257,7 @@ let issuer = ZeroSslIssuer::builder()
     .build()
     .await?;
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .issuers(vec![Arc::new(issuer)])
     .build();
@@ -334,10 +334,10 @@ let on_demand = Arc::new(OnDemandConfig {
     ])),
     decision_func: None,
     rate_limit: None,
-    obtain_func: None, // 由 Config 内部自动连接
+    obtain_func: None, // 由 CertManager 内部自动连接
 });
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .on_demand(on_demand)
     .build();
@@ -350,7 +350,7 @@ let config = Config::builder()
 ```rust
 use std::sync::Arc;
 
-let config = Config::builder()
+let manager = CertManager::builder()
     .storage(storage)
     .on_event(Arc::new(|event: &str, data: &serde_json::Value| {
         println!("证书事件: {} {:?}", event, data);
@@ -370,7 +370,7 @@ let config = Config::builder()
 
 ```
                     +-----------+
-                    |  Config   |  中心协调器
+                    |  CertManager   |  中心协调器
                     +-----+-----+
                           |
           +---------------+---------------+
@@ -398,7 +398,7 @@ let config = Config::builder()
 
 | 组件 | 职责 |
 |---|---|
-| `Config` | 中心入口；协调获取、续期、吊销和缓存操作 |
+| `CertManager` | 中心入口；协调获取、续期、吊销和缓存操作 |
 | `AcmeIssuer` / `ZeroSslIssuer` | 实现 `Issuer` trait；驱动 ACME 协议流程 |
 | `AcmeClient` | 底层 ACME HTTP 客户端（目录、nonce、JWS 签名、订单管理） |
 | `CertCache` | 内存证书存储，按域名索引（支持通配符匹配） |
@@ -499,10 +499,10 @@ Certon 通过 `certon::start_maintenance()` 运行后台维护，它会生成一
 两个循环都遵循 `CertCache::stop()` 信号以实现优雅关闭。
 
 ```rust
-let config = Config::builder().storage(storage).build();
+let manager = CertManager::builder().storage(storage).build();
 
 // 启动后台维护
-let handle = certon::start_maintenance(&config);
+let handle = certon::start_maintenance(&manager);
 
 // ... 稍后优雅停止：
 // config.cache.stop().await;
@@ -532,7 +532,7 @@ let handle = certon::start_maintenance(&config);
 关键入口点：
 
 - [`certon::manage()`](https://docs.rs/certon/latest/certon/fn.manage.html) -- 最高层函数，返回可直接使用的 `rustls::ServerConfig`
-- [`Config::builder()`](https://docs.rs/certon/latest/certon/struct.ConfigBuilder.html) -- 配置并构建 `Config`
+- [`CertManager::builder()`](https://docs.rs/certon/latest/certon/struct.CertManagerBuilder.html) -- 配置并构建 `CertManager`
 - [`AcmeIssuer::builder()`](https://docs.rs/certon/latest/certon/struct.AcmeIssuerBuilder.html) -- 配置 ACME 颁发者
 - [`Storage` trait](https://docs.rs/certon/latest/certon/trait.Storage.html) -- 实现自定义存储后端
 - [`Solver` trait](https://docs.rs/certon/latest/certon/trait.Solver.html) -- 实现自定义验证求解器
@@ -558,3 +558,20 @@ let issuer = AcmeIssuer::builder()
 ## 许可证
 
 Certon 采用 [Apache 许可证 2.0](LICENSE) 许可。
+
+
+## 可选功能
+
+默认启用 `aws-lc-rs`、`zerossl`、`dns-01` 和 `rsa-keys`，保留现有功能。
+仅使用 ACME 和 ECDSA 时，可以禁用默认功能：
+
+```toml
+certon = { version = "0.3", default-features = false, features = ["ring"] }
+```
+
+- `zerossl`：ZeroSSL issuer 和 REST API。
+- `dns-01`：DNS-01 solver 与 DNS 解析依赖。
+- `rsa-keys`：RSA 私钥生成与解析以及 `rsa` 依赖。
+
+必须启用至少一个加密 provider。按需添加上述功能；关闭 `rsa-keys`
+不会关闭 rustls 自身对 RSA 证书的支持。API 迁移请参阅 [MIGRATION.md](MIGRATION.md)。

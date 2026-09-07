@@ -2,10 +2,10 @@
 #[test]
 fn tls_configuration_before_http_is_supported() {
     let directory = tempfile::tempdir().unwrap();
-    let config = certon::Config::builder()
+    let config = certon::CertManager::builder()
         .storage(std::sync::Arc::new(certon::FileStorage::new(
             directory.path(),
         )))
         .build();
-    let _ = config.tls_config();
+    let _ = config.server_config();
 }
