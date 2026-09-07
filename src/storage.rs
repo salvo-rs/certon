@@ -131,7 +131,11 @@ pub trait Storage: Send + Sync {
 ///
 /// Dropping this releases the lock. Because releasing is asynchronous and
 /// `Drop` is not, the release is spawned; call [`release`](Self::release) to
-/// wait for it and to see a failure.
+/// wait for it and to see a failure. Acquisition and release finish in owned
+/// tasks even if their callers are cancelled. The acquiring Tokio runtime
+/// must remain running until release completes; runtime shutdown cannot
+/// guarantee asynchronous cleanup. Cancelled acquisition may keep waiting
+/// until the backend timeout, then releases any acquired lock.
 ///
 /// [`FileStorage`]: crate::file_storage::FileStorage
 pub struct LockGuard {
@@ -140,6 +144,7 @@ pub struct LockGuard {
     /// Set once the lock is known to be released, so `Drop` does not release
     /// it a second time.
     released: bool,
+    runtime: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for LockGuard {
@@ -162,7 +167,12 @@ impl LockGuard {
     /// reporting. Use this where a caller can act on the failure.
     pub async fn release(mut self) -> Result<()> {
         self.released = true;
-        self.storage.unlock(&self.name).await
+        let storage = Arc::clone(&self.storage);
+        let name = self.name.clone();
+        self.runtime
+            .spawn(async move { storage.unlock(&name).await })
+            .await
+            .map_err(|e| crate::error::Error::Other(format!("lock release task failed: {e}")))?
     }
 }
 
@@ -173,24 +183,11 @@ impl Drop for LockGuard {
         }
         let storage = Arc::clone(&self.storage);
         let name = std::mem::take(&mut self.name);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(error) = storage.unlock(&name).await {
-                        warn!(lock = %name, %error, "failed to release a lock on drop");
-                    }
-                });
+        self.runtime.spawn(async move {
+            if let Err(error) = storage.unlock(&name).await {
+                warn!(lock = %name, %error, "failed to release a lock on drop");
             }
-            // Nothing useful is possible here, and it is worth seeing. The
-            // lock will be recovered by whatever staleness rule the backend
-            // has, which is slower than releasing it but not permanent.
-            Err(_) => {
-                warn!(
-                    lock = %name,
-                    "a lock was dropped outside a runtime and could not be released"
-                );
-            }
-        }
+        });
     }
 }
 
@@ -199,12 +196,22 @@ impl Drop for LockGuard {
 /// The lock is held until the returned guard is dropped or
 /// [`released`](LockGuard::release).
 pub async fn acquire(storage: Arc<dyn Storage>, name: &str) -> Result<LockGuard> {
-    storage.lock(name).await?;
-    Ok(LockGuard {
-        storage,
-        name: name.to_string(),
-        released: false,
-    })
+    let runtime = tokio::runtime::Handle::current();
+    let name = name.to_owned();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    runtime.clone().spawn(async move {
+        let result = storage.lock(&name).await.map(|()| LockGuard {
+            storage,
+            name,
+            released: false,
+            runtime,
+        });
+        // If acquisition was cancelled, dropping the undelivered guard releases it.
+        let _ = send.send(result);
+    });
+    receive
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("lock acquisition task failed: {e}")))?
 }
 
 /// Take the lock named `name` if it becomes available within `timeout`.
@@ -216,15 +223,23 @@ pub async fn try_acquire(
     name: &str,
     timeout: Duration,
 ) -> Result<Option<LockGuard>> {
-    if storage.try_lock(name, timeout).await? {
-        Ok(Some(LockGuard {
-            storage,
-            name: name.to_string(),
-            released: false,
-        }))
-    } else {
-        Ok(None)
-    }
+    let runtime = tokio::runtime::Handle::current();
+    let name = name.to_owned();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    runtime.clone().spawn(async move {
+        let result = storage.try_lock(&name, timeout).await.map(|locked| {
+            locked.then(|| LockGuard {
+                storage,
+                name,
+                released: false,
+                runtime,
+            })
+        });
+        let _ = send.send(result);
+    });
+    receive
+        .await
+        .map_err(|e| crate::error::Error::Other(format!("lock acquisition task failed: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -847,12 +862,10 @@ mod lock_guard_tests {
     use super::*;
     use crate::file_storage::FileStorage;
 
-    fn storage() -> Arc<dyn Storage> {
+    fn storage() -> (tempfile::TempDir, Arc<dyn Storage>) {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        // Leaked on purpose: the guard's release is spawned, so the directory
-        // has to outlive the test body rather than the handle.
-        let path = directory.keep();
-        Arc::new(FileStorage::new(path))
+        let storage = Arc::new(FileStorage::new(directory.path()));
+        (directory, storage)
     }
 
     /// Wait for a lock to become free, so a test does not race the spawned
@@ -874,7 +887,7 @@ mod lock_guard_tests {
 
     #[tokio::test]
     async fn a_guard_holds_the_lock_while_it_lives() {
-        let storage = storage();
+        let (_directory, storage) = storage();
         let guard = acquire(Arc::clone(&storage), "held").await.unwrap();
         assert_eq!(guard.name(), "held");
         assert!(
@@ -884,12 +897,12 @@ mod lock_guard_tests {
                 .unwrap(),
             "somebody else took a lock that is held"
         );
-        drop(guard);
+        guard.release().await.unwrap();
     }
 
     #[tokio::test]
     async fn dropping_a_guard_releases_the_lock() {
-        let storage = storage();
+        let (_directory, storage) = storage();
         {
             let _guard = acquire(Arc::clone(&storage), "dropped").await.unwrap();
         }
@@ -903,7 +916,7 @@ mod lock_guard_tests {
         // the release — and a `FileStorage` lock is kept fresh by a background
         // task, so it did not go stale either. The lock was held for the life
         // of the process, and no instance anywhere could take it again.
-        let storage = storage();
+        let (_directory, storage) = storage();
         let held = Arc::clone(&storage);
 
         let work = async move {
@@ -926,7 +939,7 @@ mod lock_guard_tests {
 
     #[tokio::test]
     async fn releasing_explicitly_reports_a_failure_to_release() {
-        let storage = storage();
+        let (_directory, storage) = storage();
         let guard = acquire(Arc::clone(&storage), "explicit").await.unwrap();
         guard.release().await.expect("releasing works");
         assert!(becomes_free(&storage, "explicit").await);
@@ -934,11 +947,97 @@ mod lock_guard_tests {
 
     #[tokio::test]
     async fn try_acquire_says_no_rather_than_waiting_for_ever() {
-        let storage = storage();
-        let _held = acquire(Arc::clone(&storage), "busy").await.unwrap();
+        let (_directory, storage) = storage();
+        let held = acquire(Arc::clone(&storage), "busy").await.unwrap();
         let second = try_acquire(Arc::clone(&storage), "busy", Duration::from_millis(200))
             .await
             .unwrap();
         assert!(second.is_none(), "it is somebody else's turn");
+        held.release().await.unwrap();
+    }
+    struct PausedStorage {
+        entered: tokio::sync::Notify,
+        proceed: tokio::sync::Notify,
+        released: tokio::sync::Notify,
+        pause_acquire: bool,
+    }
+
+    #[async_trait]
+    impl Storage for PausedStorage {
+        async fn store(&self, _: &str, _: &[u8]) -> Result<()> {
+            unreachable!()
+        }
+        async fn load(&self, _: &str) -> Result<Vec<u8>> {
+            unreachable!()
+        }
+        async fn delete(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn exists(&self, _: &str) -> Result<bool> {
+            unreachable!()
+        }
+        async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        async fn stat(&self, _: &str) -> Result<KeyInfo> {
+            unreachable!()
+        }
+        async fn lock(&self, _: &str) -> Result<()> {
+            if self.pause_acquire {
+                self.entered.notify_one();
+                self.proceed.notified().await;
+            }
+            Ok(())
+        }
+        async fn unlock(&self, _: &str) -> Result<()> {
+            if !self.pause_acquire {
+                self.entered.notify_one();
+                self.proceed.notified().await;
+            }
+            self.released.notify_one();
+            Ok(())
+        }
+    }
+
+    async fn cancellation_during_transition(pause_acquire: bool) {
+        let backend = Arc::new(PausedStorage {
+            entered: Default::default(),
+            proceed: Default::default(),
+            released: Default::default(),
+            pause_acquire,
+        });
+        let storage: Arc<dyn Storage> = backend.clone();
+        let task = tokio::spawn(async move {
+            let guard = acquire(storage, "transition").await.unwrap();
+            guard.release().await.unwrap();
+        });
+        backend.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        backend.proceed.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), backend.released.notified())
+            .await
+            .expect("cancellation must not strand the lock");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_acquisition_releases_the_delivered_lock() {
+        cancellation_during_transition(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_explicit_release_finishes_unlocking() {
+        cancellation_during_transition(false).await;
+    }
+
+    #[test]
+    fn dropping_outside_the_runtime_uses_the_acquiring_runtime() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (_directory, storage) = storage();
+        let guard = runtime
+            .block_on(acquire(storage.clone(), "outside"))
+            .unwrap();
+        drop(guard);
+        assert!(runtime.block_on(becomes_free(&storage, "outside")));
     }
 }

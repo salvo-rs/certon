@@ -413,11 +413,9 @@ impl FileStorage {
             match Self::create_lock_file(&filename).await {
                 Ok(true) => {
                     // Lock acquired — start keepalive.
+                    let mut keepalives = self.lock_keepalives.lock().await;
                     let handle = Self::spawn_keepalive(filename);
-                    self.lock_keepalives
-                        .lock()
-                        .await
-                        .insert(name.to_string(), handle);
+                    keepalives.insert(name.to_string(), handle);
                     return Ok(());
                 }
                 Ok(false) => {
