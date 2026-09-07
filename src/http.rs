@@ -43,7 +43,7 @@ static USER_AGENT: OnceLock<String> = OnceLock::new();
 
 /// Set the user agent certon sends.
 ///
-/// Must be called before the first request, because the client is built once
+/// Must be called before the first client is created, because the client is built once
 /// and shared. Calling it afterwards is ignored rather than an error, which is
 /// what a `OnceLock` gives; there is nothing useful to do about it.
 ///
@@ -56,8 +56,9 @@ pub fn set_user_agent(agent: impl Into<String>) {
 /// What certon currently identifies itself as.
 pub fn user_agent() -> &'static str {
     USER_AGENT
-        .get_or_init(|| DEFAULT_USER_AGENT.to_owned())
-        .as_str()
+        .get()
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_USER_AGENT)
 }
 
 /// The client every module shares.
@@ -76,7 +77,11 @@ pub fn client() -> Result<&'static reqwest::Client> {
 fn build() -> std::result::Result<reqwest::Client, String> {
     install_crypto_provider();
     reqwest::Client::builder()
-        .user_agent(user_agent())
+        .user_agent(
+            USER_AGENT
+                .get_or_init(|| DEFAULT_USER_AGENT.to_owned())
+                .as_str(),
+        )
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|error| error.to_string())
