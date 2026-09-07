@@ -41,9 +41,7 @@ use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
-use crate::storage::{
-    CertificateResource, Storage, site_cert_key, site_meta_key, site_private_key,
-};
+use crate::storage::{CertificateResource, Storage};
 
 /// Callback invoked on notable lifecycle events.
 type EventCallback = Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>;
@@ -220,7 +218,6 @@ impl CertManagerBuilder {
         self
     }
 
-    /// Set the persistent storage backend.
     /// Put certificates somewhere other than the key-value storage.
     ///
     /// Without this they go into `storage` under certon's own key layout,
@@ -232,6 +229,7 @@ impl CertManagerBuilder {
         self
     }
 
+    /// Set storage for accounts, locks, OCSP and the default certificate store.
     pub fn storage(mut self, storage: Arc<dyn Storage>) -> Self {
         self.storage = Some(storage);
         self
@@ -443,35 +441,14 @@ impl CertManager {
         format!("{op}_{domain}")
     }
 
-    /// Check whether storage has all three certificate resources (cert, key,
-    /// meta) for `domain` from `issuer`.
-    async fn storage_has_cert_resources(
-        storage: &dyn Storage,
-        issuer: &dyn CertIssuer,
-        domain: &str,
-    ) -> bool {
-        let issuer_key = issuer.issuer_key();
-        let cert_key = site_cert_key(&issuer_key, domain);
-        let key_key = site_private_key(&issuer_key, domain);
-        let meta_key = site_meta_key(&issuer_key, domain);
-
-        let cert_ok = storage.exists(&cert_key).await.unwrap_or(false);
-        let key_ok = storage.exists(&key_key).await.unwrap_or(false);
-        let meta_ok = storage.exists(&meta_key).await.unwrap_or(false);
-
-        cert_ok && key_ok && meta_ok
-    }
-
-    /// Check whether storage has cert resources from any configured issuer.
-    async fn storage_has_cert_resources_any_issuer(&self, domain: &str) -> bool {
+    /// Check the certificate store, propagating backend failures.
+    async fn storage_has_cert_resources_any_issuer(&self, domain: &str) -> Result<bool> {
         for issuer in &self.issuers {
-            if Self::storage_has_cert_resources(self.storage.as_ref(), issuer.as_ref(), domain)
-                .await
-            {
-                return true;
+            if self.certificates.has(&issuer.issuer_key(), domain).await? {
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Load a certificate resource from storage, trying all configured
@@ -495,16 +472,7 @@ impl CertManager {
     /// Delete certificate assets (cert, key, meta) for `domain` under
     /// `issuer_key` from storage.
     async fn delete_site_assets(&self, issuer_key: &str, domain: &str) -> Result<()> {
-        self.storage
-            .delete(&site_cert_key(issuer_key, domain))
-            .await?;
-        self.storage
-            .delete(&site_private_key(issuer_key, domain))
-            .await?;
-        self.storage
-            .delete(&site_meta_key(issuer_key, domain))
-            .await?;
-        Ok(())
+        self.certificates.remove(issuer_key, domain).await
     }
 }
 
@@ -763,7 +731,7 @@ impl CertManager {
         }
 
         // If storage already has all resources, this is a no-op.
-        if self.storage_has_cert_resources_any_issuer(domain).await {
+        if self.storage_has_cert_resources_any_issuer(domain).await? {
             debug!(domain = %domain, "certificate already exists in storage; skipping obtain");
             return Ok(());
         }
@@ -814,7 +782,7 @@ impl CertManager {
 
         // Re-check storage: another instance may have obtained the cert
         // while we were waiting for the lock.
-        if self.storage_has_cert_resources_any_issuer(domain).await {
+        if self.storage_has_cert_resources_any_issuer(domain).await? {
             info!(domain = %domain, "certificate already exists in storage (obtained by another instance)");
             return Ok(());
         }
@@ -928,23 +896,12 @@ impl CertManager {
         &self,
         domain: &str,
     ) -> Result<(crate::crypto::PrivateKey, String)> {
-        // Try each issuer's key path.
         for issuer in &self.issuers {
-            let key_path = site_private_key(&issuer.issuer_key(), domain);
-            match self.storage.load(&key_path).await {
-                Ok(pem_bytes) => {
-                    if let Ok(pem_str) = std::str::from_utf8(&pem_bytes)
-                        && let Ok(pk) = decode_private_key_pem(pem_str)
-                    {
-                        debug!(
-                            domain = %domain,
-                            issuer = %issuer.issuer_key(),
-                            "reusing existing private key from storage"
-                        );
-                        return Ok((pk, pem_str.to_string()));
-                    }
-                }
-                Err(_) => continue,
+            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
+                let pem = String::from_utf8(resource.private_key_pem)
+                    .map_err(|e| Error::Config(format!("invalid private key PEM: {e}")))?;
+                let key = decode_private_key_pem(&pem)?;
+                return Ok((key, pem));
             }
         }
 
@@ -1302,30 +1259,8 @@ impl CertManager {
         let cert = match self.cache.get_by_name(domain).await {
             Some(c) => c,
             None => {
-                // Try loading from storage.
-                let mut found = None;
-                for issuer in &self.issuers {
-                    let ik = issuer.issuer_key();
-                    let cert_key = crate::storage::site_cert_key(&ik, domain);
-                    let key_key = crate::storage::site_private_key(&ik, domain);
-
-                    if let (Ok(cert_pem), Ok(key_pem)) = (
-                        self.storage.load(&cert_key).await,
-                        self.storage.load(&key_key).await,
-                    ) && let Ok(c) = Certificate::from_pem(&cert_pem, &key_pem)
-                    {
-                        found = Some(c);
-                        break;
-                    }
-                }
-                match found {
-                    Some(c) => c,
-                    None => {
-                        return Err(Error::Config(format!(
-                            "no certificate found for domain '{domain}' in cache or storage"
-                        )));
-                    }
-                }
+                let resource = self.load_cert_resource_any_issuer(domain).await?;
+                Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?
             }
         };
 
@@ -1550,7 +1485,7 @@ mod tests {
         let has = config
             .storage_has_cert_resources_any_issuer("example.com")
             .await;
-        assert!(!has);
+        assert!(!has.unwrap());
     }
 
     #[tokio::test]
@@ -1675,5 +1610,44 @@ mod tests {
         // verifies the method runs without error.
         // The actual key format is determined by the storage module.
         let _result = config.delete_site_assets("test", "example.com").await;
+    }
+    #[tokio::test]
+    async fn private_key_reuse_reads_the_custom_certificate_store() {
+        struct Issuer;
+        #[async_trait::async_trait]
+        impl CertIssuer for Issuer {
+            async fn issue(&self, _: &[u8], _: &[String]) -> Result<crate::IssuedCertificate> {
+                unreachable!()
+            }
+            fn issuer_key(&self) -> String {
+                "ca".into()
+            }
+        }
+        let store = Arc::new(crate::cert_store::tests::InMemory::default());
+        let key = generate_private_key(KeyType::EcdsaP256).unwrap();
+        let pem = encode_private_key_pem(&key).unwrap();
+        store
+            .save(
+                "ca",
+                &CertificateResource {
+                    sans: vec!["example.com".into()],
+                    certificate_pem: vec![],
+                    private_key_pem: pem.as_bytes().to_vec(),
+                    issuer_data: None,
+                    issuer_key: "ca".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let manager = CertManager::builder()
+            .storage(Arc::new(MemoryStorage::new()))
+            .certificates(store)
+            .issuers(vec![Arc::new(Issuer)])
+            .build();
+        let (_, reused) = manager
+            .load_or_generate_private_key("example.com")
+            .await
+            .unwrap();
+        assert_eq!(reused, pem);
     }
 }

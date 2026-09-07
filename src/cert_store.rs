@@ -54,10 +54,13 @@ pub trait CertStore: Send + Sync + std::fmt::Debug {
     /// `Err(_)` and carrying on.
     async fn load(&self, issuer: &str, domain: &str) -> Result<Option<CertificateResource>>;
 
-    /// Write a certificate, its key and its metadata as one unit.
+    /// Save a certificate, its key and its metadata.
     ///
-    /// The domain comes from the resource's own names, so it cannot disagree
-    /// with what is inside the certificate.
+    /// Atomicity depends on the backend. The key-value adapter writes three
+    /// separate entries; callers must coordinate writers with shared locks.
+    ///
+    /// The storage name is `resource.names_key()` (the first SAN). Callers
+    /// must supply names consistent with the certificate.
     async fn save(&self, issuer: &str, resource: &CertificateResource) -> Result<()>;
 
     /// Whether a complete set is held.
@@ -100,17 +103,17 @@ impl KeyValueCertStore {
 #[async_trait]
 impl CertStore for KeyValueCertStore {
     async fn load(&self, issuer: &str, domain: &str) -> Result<Option<CertificateResource>> {
-        let key = match self.read(&site_private_key(issuer, domain)).await? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
-        let certificate = match self.read(&site_cert_key(issuer, domain)).await? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
-        };
-        let metadata = match self.read(&site_meta_key(issuer, domain)).await? {
-            Some(bytes) => bytes,
-            None => return Ok(None),
+        let key = self.read(&site_private_key(issuer, domain)).await?;
+        let certificate = self.read(&site_cert_key(issuer, domain)).await?;
+        let metadata = self.read(&site_meta_key(issuer, domain)).await?;
+        let (key, certificate, metadata) = match (key, certificate, metadata) {
+            (None, None, None) => return Ok(None),
+            (Some(key), Some(certificate), Some(metadata)) => (key, certificate, metadata),
+            _ => {
+                return Err(Error::Storage(StorageError::Deserialize(format!(
+                    "incomplete certificate resources for {domain} under {issuer}"
+                ))));
+            }
         };
 
         let mut resource: CertificateResource = serde_json::from_slice(&metadata).map_err(|e| {
@@ -129,16 +132,23 @@ impl CertStore for KeyValueCertStore {
     }
 
     async fn has(&self, issuer: &str, domain: &str) -> Result<bool> {
+        let mut present = 0;
         for key in [
             site_cert_key(issuer, domain),
             site_private_key(issuer, domain),
             site_meta_key(issuer, domain),
         ] {
-            if !self.storage.exists(&key).await? {
-                return Ok(false);
+            if self.storage.exists(&key).await? {
+                present += 1;
             }
         }
-        Ok(true)
+        match present {
+            0 => Ok(false),
+            3 => Ok(true),
+            _ => Err(Error::Storage(StorageError::Deserialize(format!(
+                "incomplete certificate resources for {domain} under {issuer}"
+            )))),
+        }
     }
 
     async fn remove(&self, issuer: &str, domain: &str) -> Result<()> {
@@ -147,7 +157,10 @@ impl CertStore for KeyValueCertStore {
             site_private_key(issuer, domain),
             site_meta_key(issuer, domain),
         ] {
-            self.storage.delete(&key).await?;
+            match self.storage.delete(&key).await {
+                Ok(()) | Err(Error::Storage(StorageError::NotFound(_))) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -166,13 +179,14 @@ impl KeyValueCertStore {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::file_storage::FileStorage;
 
-    fn store() -> KeyValueCertStore {
+    fn store() -> (tempfile::TempDir, KeyValueCertStore) {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        KeyValueCertStore::new(Arc::new(FileStorage::new(directory.keep())))
+        let store = KeyValueCertStore::new(Arc::new(FileStorage::new(directory.path())));
+        (directory, store)
     }
 
     fn resource(domain: &str) -> CertificateResource {
@@ -195,7 +209,7 @@ mod tests {
     /// implementing `Storage`, which is six key-value methods plus a
     /// distributed lock protocol, and then working out certon's key layout.
     #[derive(Debug, Default)]
-    struct InMemory {
+    pub(crate) struct InMemory {
         held: std::sync::Mutex<std::collections::HashMap<(String, String), CertificateResource>>,
     }
 
@@ -251,7 +265,7 @@ mod tests {
         // another. One decision no longer forces the other.
         let directory = tempfile::tempdir().expect("a temporary directory");
         let manager = crate::CertManager::builder()
-            .storage(Arc::new(FileStorage::new(directory.keep())))
+            .storage(Arc::new(FileStorage::new(directory.path())))
             .certificates(Arc::new(InMemory::default()))
             .build();
         assert!(format!("{manager:?}").contains("InMemory"));
@@ -261,14 +275,14 @@ mod tests {
     async fn nothing_stored_is_none_rather_than_an_error() {
         // The distinction the old signature could not make. A first run and a
         // broken disk used to look the same to a caller matching on `Err(_)`.
-        let store = store();
+        let (_directory, store) = store();
         assert!(store.load("ca", "example.com").await.unwrap().is_none());
         assert!(!store.has("ca", "example.com").await.unwrap());
     }
 
     #[tokio::test]
     async fn what_was_saved_comes_back() {
-        let store = store();
+        let (_directory, store) = store();
         store.save("ca", &resource("example.com")).await.unwrap();
 
         let loaded = store
@@ -293,7 +307,7 @@ mod tests {
     async fn two_issuers_do_not_overwrite_each_other() {
         // Both authorities can hold a certificate for one name, which is what
         // makes falling back from one to the other possible.
-        let store = store();
+        let (_directory, store) = store();
         let mut first = resource("example.com");
         first.certificate_pem = b"first".to_vec();
         let mut second = resource("example.com");
@@ -312,7 +326,7 @@ mod tests {
     async fn removing_forgets_everything_including_the_key() {
         // A certificate removed with its private key left behind is a private
         // key nobody is looking after any more.
-        let store = store();
+        let (_directory, store) = store();
         store.save("ca", &resource("example.com")).await.unwrap();
         store.remove("ca", "example.com").await.unwrap();
 
@@ -322,15 +336,14 @@ mod tests {
 
     #[tokio::test]
     async fn removing_what_is_not_there_is_not_an_error() {
-        let store = store();
+        let (_directory, store) = store();
         store.remove("ca", "absent.example.com").await.unwrap();
     }
 
     #[tokio::test]
     async fn a_half_written_certificate_is_not_a_certificate() {
-        // If only some of the three pieces survived, `load` must say there is
-        // nothing rather than hand back a resource with an empty key.
-        let store = store();
+        // Partial writes are corruption, not absence that permits reissuance.
+        let (_directory, store) = store();
         store.save("ca", &resource("example.com")).await.unwrap();
         store
             .storage()
@@ -338,7 +351,92 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.load("ca", "example.com").await.unwrap().is_none());
+        assert!(store.load("ca", "example.com").await.is_err());
+        assert!(store.has("ca", "example.com").await.is_err());
+    }
+    struct TestIssuer;
+    #[async_trait]
+    impl crate::CertIssuer for TestIssuer {
+        async fn issue(&self, _: &[u8], _: &[String]) -> Result<crate::IssuedCertificate> {
+            panic!("an existing certificate must not be issued again")
+        }
+        fn issuer_key(&self) -> String {
+            "ca".into()
+        }
+        fn as_revoker(&self) -> Option<&dyn crate::Revoker> {
+            Some(self)
+        }
+    }
+    #[async_trait]
+    impl crate::Revoker for TestIssuer {
+        async fn revoke(&self, _: &[u8], _: Option<u8>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_store_supports_obtain_mtls_and_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(InMemory::default());
+        let cert = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let mut resource = resource("example.com");
+        resource.certificate_pem = cert.cert.pem().into_bytes();
+        resource.private_key_pem = cert.signing_key.serialize_pem().into_bytes();
+        store.save("ca", &resource).await.unwrap();
+        let manager = crate::CertManager::builder()
+            .storage(Arc::new(FileStorage::new(directory.path())))
+            .certificates(store.clone())
+            .issuers(vec![Arc::new(TestIssuer)])
+            .interactive(true)
+            .build();
+        manager.obtain("example.com").await.unwrap();
+        let (chain, _) = manager.client_credentials("example.com").await.unwrap();
+        assert_eq!(chain[0].as_ref(), cert.cert.der().as_ref());
+        manager.revoke("example.com", None).await.unwrap();
         assert!(!store.has("ca", "example.com").await.unwrap());
+        assert!(
+            manager
+                .load_certificate("example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[derive(Debug)]
+    struct BrokenStore;
+    #[async_trait]
+    impl CertStore for BrokenStore {
+        async fn load(&self, _: &str, _: &str) -> Result<Option<CertificateResource>> {
+            Err(Error::Other("backend offline".into()))
+        }
+        async fn has(&self, _: &str, _: &str) -> Result<bool> {
+            Err(Error::Other("backend offline".into()))
+        }
+        async fn save(&self, _: &str, _: &CertificateResource) -> Result<()> {
+            unreachable!()
+        }
+        async fn remove(&self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_failures_are_not_absence_or_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = crate::CertManager::builder()
+            .storage(Arc::new(FileStorage::new(directory.path())))
+            .certificates(Arc::new(BrokenStore))
+            .issuers(vec![Arc::new(TestIssuer)])
+            .interactive(true)
+            .build();
+        for result in [
+            manager.obtain("example.com").await,
+            manager.revoke("example.com", None).await,
+            manager.load_certificate("example.com").await.map(|_| ()),
+            manager.client_credentials("example.com").await.map(|_| ()),
+        ] {
+            assert!(result.unwrap_err().to_string().contains("backend offline"));
+        }
     }
 }
