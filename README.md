@@ -116,6 +116,35 @@ The default `aws-lc-rs` backend requires no extra configuration. To use `ring` i
 certon = { version = "0.2", default-features = false, features = ["ring"] }
 ```
 
+### Optional Features
+
+Everything below is on by default, so nothing changes unless you ask. Turning
+one off is how you stop paying for something you do not use -- in compile
+time, in API surface, and in the dependency tree somebody has to audit.
+
+| Feature | What it adds | Cost when on |
+|---|---|---|
+| `zerossl` | `ZeroSslIssuer` and `ZeroSslApiIssuer` | no extra crates |
+| `dns-01` | `Dns01Solver` and `DnsProvider`, for wildcard certificates | 24 crates (a DNS resolver) |
+| `rsa-keys` | `KeyType::Rsa2048` / `Rsa4096` / `Rsa8192` | 24 crates, **and [RUSTSEC-2023-0071]** |
+
+[RUSTSEC-2023-0071]: https://rustsec.org/advisories/RUSTSEC-2023-0071
+
+The `rsa` crate carries the Marvin attack -- a timing side channel in
+private-key operations -- and has no fixed version. A deployment that only
+issues ECDSA or Ed25519 keys, which is most of them, should not have to carry
+an advisory for a code path it never reaches. Turning `rsa-keys` off removes
+the crate, and with it the finding:
+
+```toml
+[dependencies]
+certon = { version = "0.2", default-features = false, features = ["ring"] }
+```
+
+That build is 172 crates against 220 with everything on. A certificate in an
+`RSA PRIVATE KEY` PEM is then refused with a message naming the feature,
+rather than a puzzling "unknown key type".
+
 ## Quick Start
 
 The simplest way to get started -- one function call manages everything:
