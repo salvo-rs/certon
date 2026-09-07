@@ -134,6 +134,7 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 /// }
 /// ```
 pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
+    install_default_crypto_provider();
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
     let config = CertManager::builder().storage(storage).build();
     config.manage(domains).await?;
