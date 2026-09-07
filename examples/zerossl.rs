@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use certon::{CertResolver, Config, FileStorage, KeyType, Result, Storage, ZeroSslIssuer};
+use certon::{CertManager, CertResolver, FileStorage, KeyType, Result, Storage, ZeroSslIssuer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
 
     println!("ZeroSSL issuer created successfully (EAB credentials obtained)");
 
-    // -- Config ----------------------------------------------------------------
-    let config = Config::builder()
+    // -- CertManager ----------------------------------------------------------------
+    let manager = CertManager::builder()
         .storage(storage)
         .issuers(vec![Arc::new(zerossl_issuer)])
         .key_type(KeyType::EcdsaP256)
@@ -61,11 +61,11 @@ async fn main() -> Result<()> {
     // -- Manage certificates ---------------------------------------------------
     let domains = vec!["example.com".into()];
     println!("Obtaining certificate from ZeroSSL for {:?}...", domains);
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
     println!("Certificate obtained from ZeroSSL!");
 
     // -- Build the TLS config --------------------------------------------------
-    let resolver = CertResolver::new(config.cache.clone());
+    let resolver = CertResolver::new(manager.cache.clone());
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
@@ -73,11 +73,11 @@ async fn main() -> Result<()> {
     println!("TLS config ready with ZeroSSL certificate");
 
     // Start background maintenance for certificate renewal.
-    let _maintenance = certon::start_maintenance(&config);
+    let _maintenance = certon::start_maintenance(&manager);
 
     // Keep the process alive for certificate maintenance.
     tokio::signal::ctrl_c().await.ok();
-    config.cache.stop();
+    manager.cache.stop();
 
     Ok(())
 }

@@ -534,7 +534,7 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        // Should have been called only once (no retries for Config errors).
+        // Should have been called only once (no retries for CertManager errors).
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 

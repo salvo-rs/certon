@@ -19,8 +19,8 @@
 //! # Decoupling
 //!
 //! The renewal logic is decoupled from `config.rs` by accepting a callback
-//! (`renew_func`) rather than depending on the `Config` type directly. This
-//! avoids circular dependencies while still allowing the `Config` to wire up
+//! (`renew_func`) rather than depending on the `CertManager` type directly. This
+//! avoids circular dependencies while still allowing the `CertManager` to wire up
 //! its `renew_cert` method as the renewal implementation.
 
 use std::future::Future;

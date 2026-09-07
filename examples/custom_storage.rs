@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use certon::{CertResolver, Config, KeyInfo, Result, Storage};
+use certon::{CertManager, CertResolver, KeyInfo, Result, Storage};
 use chrono::Utc;
 use tokio::sync::RwLock;
 
@@ -151,16 +151,16 @@ async fn main() -> Result<()> {
     // -- Create the custom storage backend -------------------------------------
     let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
-    // -- Build the Config with our custom storage ------------------------------
-    let config = Config::builder().storage(storage).build();
+    // -- Build the CertManager with our custom storage ------------------------------
+    let manager = CertManager::builder().storage(storage).build();
 
     // -- Manage certificates ---------------------------------------------------
     let domains = vec!["example.com".into()];
     println!("Managing certificates with in-memory storage backend...");
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
 
     // -- Build the TLS config --------------------------------------------------
-    let resolver = CertResolver::new(config.cache.clone());
+    let resolver = CertResolver::new(manager.cache.clone());
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));

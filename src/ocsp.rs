@@ -44,7 +44,7 @@ use crate::storage::{self, Storage};
 /// an OCSP responder URL, and cached on disk. Changing these defaults is
 /// **strongly discouraged** unless you have a compelling reason to put
 /// clients at greater risk and reduce their privacy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OcspConfig {
     /// Whether to disable OCSP stapling entirely.
     ///

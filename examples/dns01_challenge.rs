@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use certon::{
-    AcmeIssuer, CertResolver, Config, Dns01Solver, DnsProvider, FileStorage, KeyType,
+    AcmeIssuer, CertManager, CertResolver, Dns01Solver, DnsProvider, FileStorage, KeyType,
     LETS_ENCRYPT_STAGING, Result, Storage,
 };
 use tokio::sync::RwLock;
@@ -113,8 +113,8 @@ async fn main() -> Result<()> {
         .disable_tlsalpn_challenge(true)
         .build();
 
-    // -- Config ----------------------------------------------------------------
-    let config = Config::builder()
+    // -- CertManager ----------------------------------------------------------------
+    let manager = CertManager::builder()
         .storage(storage)
         .issuers(vec![Arc::new(issuer)])
         .key_type(KeyType::EcdsaP256)
@@ -127,11 +127,11 @@ async fn main() -> Result<()> {
         "Obtaining wildcard certificate for {:?} via DNS-01...",
         domains
     );
-    config.manage_sync(&domains).await?;
+    manager.manage(&domains).await?;
     println!("Certificate obtained successfully!");
 
     // -- Build the TLS config --------------------------------------------------
-    let resolver = CertResolver::new(config.cache.clone());
+    let resolver = CertResolver::new(manager.cache.clone());
     let _tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
@@ -139,11 +139,11 @@ async fn main() -> Result<()> {
     println!("TLS config ready for wildcard domain");
 
     // Start background maintenance for certificate renewal.
-    let _maintenance = certon::start_maintenance(&config);
+    let _maintenance = certon::start_maintenance(&manager);
 
     // Keep the process alive for certificate maintenance.
     tokio::signal::ctrl_c().await.ok();
-    config.cache.stop();
+    manager.cache.stop();
 
     Ok(())
 }
