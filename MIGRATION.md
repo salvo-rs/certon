@@ -1,6 +1,6 @@
 # Migrating to CertManager and Policy
 
-This breaking API change belongs in a 0.3 release, not a 0.2 patch.
+Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
 Replace `Config` / `ConfigBuilder` with `CertManager` / `CertManagerBuilder`.
 Settings such as `config.key_type` and `config.ocsp` now live under

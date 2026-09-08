@@ -96,7 +96,7 @@ Add `certon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-certon = "0.2"
+certon = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -113,7 +113,7 @@ The default `aws-lc-rs` backend requires no extra configuration. To use `ring` i
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
+certon = { version = "0.3", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ### Optional Features
@@ -138,7 +138,7 @@ the crate, and with it the finding:
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring"] }
+certon = { version = "0.3", default-features = false, features = ["ring"] }
 ```
 
 That build is 172 crates against 220 with everything on. A certificate in an

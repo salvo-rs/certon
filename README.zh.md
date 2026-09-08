@@ -96,7 +96,7 @@ async fn main() -> certon::Result<()> {
 
 ```toml
 [dependencies]
-certon = "0.2"
+certon = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -113,7 +113,7 @@ Certon 支持两种加密后端，通过 feature flag 选择：
 
 ```toml
 [dependencies]
-certon = { version = "0.2", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
+certon = { version = "0.3", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ## 快速开始
