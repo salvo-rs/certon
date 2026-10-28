@@ -97,6 +97,17 @@ async fn unregister_active_challenge(identifier: &str) {
     map.remove(identifier);
 }
 
+/// Remove only the authorization owned by this HTTP cleanup operation.
+async fn unregister_active_challenge_if_matching(identifier: &str, key_auth: &str) {
+    let mut map = active_challenges().write().await;
+    if map
+        .get(identifier)
+        .is_some_and(|current| current == key_auth)
+    {
+        map.remove(identifier);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Solver trait
 // ---------------------------------------------------------------------------
@@ -159,7 +170,8 @@ pub struct Http01Solver {
     challenges: Arc<RwLock<HashMap<String, String>>>,
     /// The port to listen on (default: 80).
     pub port: u16,
-    /// Handle to the background HTTP server task, if running.
+    /// Serializes HTTP challenge publication, cleanup and listener lifetime.
+    /// Holds the background HTTP server task while it is running.
     server_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -183,8 +195,7 @@ impl Http01Solver {
     /// logged and `Ok(())` is returned under the assumption that an existing
     /// listener (e.g. from a previous solver or external process) can handle
     /// the challenge requests.
-    async fn ensure_server_running(&self) -> Result<()> {
-        let mut handle = self.server_handle.lock().await;
+    async fn ensure_server_running(&self, handle: &mut Option<JoinHandle<()>>) -> Result<()> {
         if handle.is_some() {
             return Ok(());
         }
@@ -342,30 +353,36 @@ impl std::fmt::Debug for Http01Solver {
 #[async_trait]
 impl Solver for Http01Solver {
     async fn present(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        // The listener lock covers the map and global registration as well as
+        // startup, so cleanup cannot stop the listener after a new publication.
+        let mut handle = self.server_handle.lock().await;
         {
             let mut challenges = self.challenges.write().await;
             challenges.insert(token.to_string(), key_auth.to_string());
         }
         register_active_challenge(token, key_auth).await;
-        self.ensure_server_running().await?;
+        self.ensure_server_running(&mut handle).await?;
         debug!(token = token, "HTTP-01 challenge presented");
         Ok(())
     }
 
-    async fn cleanup(&self, _domain: &str, token: &str, _key_auth: &str) -> Result<()> {
+    async fn cleanup(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        let mut handle = self.server_handle.lock().await;
         let should_stop = {
             let mut challenges = self.challenges.write().await;
-            challenges.remove(token);
+            if challenges
+                .get(token)
+                .is_some_and(|current| current == key_auth)
+            {
+                challenges.remove(token);
+            }
             challenges.is_empty()
         };
-        unregister_active_challenge(token).await;
+        unregister_active_challenge_if_matching(token, key_auth).await;
 
-        if should_stop {
-            let mut handle = self.server_handle.lock().await;
-            if let Some(jh) = handle.take() {
-                jh.abort();
-                debug!("HTTP-01 challenge server stopped (no more challenges)");
-            }
+        if should_stop && let Some(jh) = handle.take() {
+            jh.abort();
+            debug!("HTTP-01 challenge server stopped (no more challenges)");
         }
         Ok(())
     }
@@ -966,7 +983,8 @@ impl Solver for DistributedSolver {
         let data = crate::challenge::encode(&canonical, token, key_auth)?;
         let key = crate::challenge::key(&self.storage_key_issuer_prefix, &canonical, token);
         let _guard =
-            crate::storage::acquire(self.storage.clone(), &format!("challenge/{key}")).await?;
+            crate::storage::acquire(self.storage.clone(), &crate::challenge::lock_key(&key))
+                .await?;
         self.storage.store(&key, &data).await?;
         self.inner.present(domain, token, key_auth).await
     }
@@ -981,15 +999,19 @@ impl Solver for DistributedSolver {
         let storage_result: Result<()> = async {
             let key = crate::challenge::key(&self.storage_key_issuer_prefix, &canonical, token);
             let _guard =
-                crate::storage::acquire(self.storage.clone(), &format!("challenge/{key}")).await?;
+                crate::storage::acquire(self.storage.clone(), &crate::challenge::lock_key(&key))
+                    .await?;
             // Retire legacy entries under a separate shared domain lock. New writers
             // never update the old map, so different v2 tokens remain independent.
             let legacy = crate::challenge::legacy_key(&self.storage_key_issuer_prefix, &canonical);
             let legacy_compatible = crate::challenge::legacy_compatible(&canonical);
             let _legacy_guard = if legacy_compatible {
                 Some(
-                    crate::storage::acquire(self.storage.clone(), &format!("challenge/{legacy}"))
-                        .await?,
+                    crate::storage::acquire(
+                        self.storage.clone(),
+                        &crate::challenge::lock_key(&legacy),
+                    )
+                    .await?,
                 )
             } else {
                 None
@@ -1084,6 +1106,133 @@ mod tests {
     fn http01_solver_custom_port() {
         let solver = Http01Solver::new(8080);
         assert_eq!(solver.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn http01_stale_cleanup_preserves_new_local_authorization_and_listener() {
+        let solver = Http01Solver::new(0);
+        let token = "http-local-stale-cleanup";
+        solver
+            .present("example.com", token, "old-auth")
+            .await
+            .unwrap();
+        let original_task = solver.server_handle.lock().await.as_ref().unwrap().id();
+        solver
+            .present("example.com", token, "new-auth")
+            .await
+            .unwrap();
+        solver
+            .cleanup("example.com", token, "old-auth")
+            .await
+            .unwrap();
+        assert_eq!(
+            solver
+                .challenges
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        assert_eq!(
+            active_challenges()
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        let handle = solver.server_handle.lock().await;
+        let task = handle
+            .as_ref()
+            .expect("new challenge must keep its listener");
+        assert_eq!(task.id(), original_task);
+        assert!(!task.is_finished());
+        drop(handle);
+        solver
+            .cleanup("example.com", token, "new-auth")
+            .await
+            .unwrap();
+        assert!(solver.server_handle.lock().await.is_none());
+        assert!(!active_challenges().read().await.contains_key(token));
+    }
+
+    #[tokio::test]
+    async fn http01_cleanup_of_another_solver_preserves_new_global_registration() {
+        let old = Http01Solver::new(0);
+        let new = Http01Solver::new(0);
+        let token = "http-global-stale-cleanup";
+        old.present("example.com", token, "old-auth").await.unwrap();
+        new.present("example.com", token, "new-auth").await.unwrap();
+        old.cleanup("example.com", token, "old-auth").await.unwrap();
+        assert_eq!(
+            active_challenges()
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        assert!(old.server_handle.lock().await.is_none());
+        assert!(new.server_handle.lock().await.is_some());
+        new.cleanup("example.com", token, "new-auth").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http01_concurrent_last_cleanup_and_present_keep_new_listener() {
+        let solver = Arc::new(Http01Solver::new(0));
+        for iteration in 0..32 {
+            let old = format!("http-lifetime-old-{iteration}");
+            let new = format!("http-lifetime-new-{iteration}");
+            solver
+                .present("example.com", &old, "old-auth")
+                .await
+                .unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let cleanup = {
+                let solver = solver.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    solver
+                        .cleanup("example.com", &old, "old-auth")
+                        .await
+                        .unwrap();
+                })
+            };
+            let present = {
+                let solver = solver.clone();
+                let barrier = barrier.clone();
+                let new = new.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    solver
+                        .present("example.com", &new, "new-auth")
+                        .await
+                        .unwrap();
+                })
+            };
+            barrier.wait().await;
+            cleanup.await.unwrap();
+            present.await.unwrap();
+            assert_eq!(
+                solver.challenges.read().await.get(&new).map(String::as_str),
+                Some("new-auth")
+            );
+            assert!(
+                !solver
+                    .server_handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("new challenge requires a listener")
+                    .is_finished()
+            );
+            solver
+                .cleanup("example.com", &new, "new-auth")
+                .await
+                .unwrap();
+        }
     }
 
     // -- TlsAlpn01Solver ---------------------------------------------------

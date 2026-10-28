@@ -106,13 +106,20 @@ fn base(prefix: &str) -> String {
     }
 }
 
+fn hash(value: &str) -> String {
+    Sha256::digest(value)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Lock backends may flatten a lock name into one filesystem component.
+/// Hash the entire identity, including its issuer prefix, to keep it bounded.
+pub(crate) fn lock_key(storage_key: &str) -> String {
+    format!("challenge-{}", hash(storage_key))
+}
+
 pub(crate) fn key(prefix: &str, domain: &str, token: &str) -> String {
-    fn hash(value: &str) -> String {
-        Sha256::digest(value)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
     format!("{}/v2/{}/{}.json", base(prefix), hash(domain), hash(token))
 }
 

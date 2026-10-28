@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use certon::http_handler::HttpChallengeHandler;
-use certon::{DistributedSolver, FileStorage, Solver, Storage};
+use certon::{DistributedSolver, FileStorage, Http01Solver, Solver, Storage};
 use tokio::sync::RwLock;
 
 struct Noop;
@@ -278,7 +278,7 @@ async fn legacy_read_cleanup_and_canonical_v2_priority() {
         )
         .await
         .unwrap();
-    let solver = DistributedSolver::new(Box::new(Noop), storage.clone());
+    let solver = DistributedSolver::new(Box::new(Http01Solver::new(0)), storage.clone());
     let handler = HttpChallengeHandler::new(Arc::default(), Some(storage.clone()));
     let path = "/.well-known/acme-challenge/Token";
     assert_eq!(
@@ -287,6 +287,10 @@ async fn legacy_read_cleanup_and_canonical_v2_priority() {
             .await,
         Some((200, "Token.legacy".into()))
     );
+    solver
+        .present("example.com", "Token", "Token.legacy")
+        .await
+        .unwrap();
     solver
         .present("example.com", "Token", "Token.new")
         .await
@@ -306,6 +310,10 @@ async fn legacy_read_cleanup_and_canonical_v2_priority() {
             .handle_http_request("GET", "example.com", path)
             .await,
         Some((200, "Token.new".into()))
+    );
+    assert_eq!(
+        certon::solvers::get_active_challenge("Token").as_deref(),
+        Some("Token.new")
     );
     let old: HashMap<String, String> =
         serde_json::from_slice(&storage.load(legacy).await.unwrap()).unwrap();
@@ -511,6 +519,48 @@ async fn ambiguous_legacy_alias_is_neither_read_nor_removed() {
             storage.load(&legacy).await.unwrap(),
             old,
             "legacy alias for {domain} must survive"
+        );
+    }
+}
+
+#[tokio::test]
+async fn long_domain_and_issuer_prefix_can_present_and_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let domain = format!(
+        "{}.{}.{}.co.uk",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63)
+    );
+    assert_eq!(domain.len(), 197);
+    for prefix in [
+        "acme/acme-v02.api.letsencrypt.org-directory".to_string(),
+        format!("issuer-{}", "p".repeat(220)),
+    ] {
+        let solver =
+            DistributedSolver::with_prefix(Box::new(Noop), storage.clone(), prefix.clone());
+        let handler =
+            HttpChallengeHandler::with_prefix(Arc::default(), Some(storage.clone()), prefix);
+        solver
+            .present(&domain, "Token", "Token.auth")
+            .await
+            .unwrap();
+        assert_eq!(
+            handler
+                .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+                .await,
+            Some((200, "Token.auth".into()))
+        );
+        solver
+            .cleanup(&domain, "Token", "Token.auth")
+            .await
+            .unwrap();
+        assert_eq!(
+            handler
+                .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+                .await,
+            Some((404, String::new()))
         );
     }
 }
