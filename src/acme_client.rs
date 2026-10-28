@@ -8,6 +8,7 @@
 //! All requests use the JWS (JSON Web Signature) POST-as-GET convention
 //! required by RFC 8555. ECDSA P-256 (ES256) is used for signing.
 
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 #[cfg(feature = "aws-lc-rs")]
@@ -51,6 +52,155 @@ pub const GOOGLE_TRUST_STAGING: &str = "https://dv.acme-v02.test-api.pki.goog/di
 
 /// Google Trust Services production ACME directory.
 pub const GOOGLE_TRUST_PRODUCTION: &str = "https://dv.acme-v02.api.pki.goog/directory";
+
+/// Maximum alternate-chain requests made by one download operation.
+pub const MAX_ALTERNATE_CHAINS: usize = 8;
+const MAX_CERTIFICATE_CHAIN_BYTES: usize = 1024 * 1024;
+
+fn certificate_chain_leaf(pem: &str) -> Result<Vec<u8>> {
+    let certificates = crate::crypto::parse_certs_from_pem_bundle(pem)?;
+    for der in &certificates {
+        let (remainder, _) = x509_parser::parse_x509_certificate(der).map_err(|error| {
+            AcmeError::Certificate(format!("invalid certificate in downloaded chain: {error}"))
+        })?;
+        if !remainder.is_empty() {
+            return Err(
+                AcmeError::Certificate("trailing data in downloaded certificate".into()).into(),
+            );
+        }
+    }
+    Ok(certificates
+        .into_iter()
+        .next()
+        .expect("PEM parser requires a certificate"))
+}
+
+fn enqueue_alternate_chains(
+    links: Vec<String>,
+    seen: &mut HashSet<String>,
+    pending: &mut VecDeque<String>,
+    limit: usize,
+) {
+    for link in links {
+        if seen.len() > limit {
+            break;
+        }
+        if seen.insert(link.clone()) {
+            pending.push_back(link);
+        }
+    }
+}
+
+// Split RFC 8288 lists/parameters only outside URI references and quoted
+// strings. In particular commas inside <URI> or title="a,b" are not separators.
+fn split_link_parts(value: &str, separator: char) -> Vec<&str> {
+    let (mut quoted, mut escaped, mut target, mut start) = (false, false, false, 0);
+    let mut parts = Vec::new();
+    for (index, character) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if target {
+            if character == '>' {
+                target = false;
+            }
+        } else {
+            match character {
+                '"' => quoted = true,
+                '<' => target = true,
+                c if c == separator => {
+                    parts.push(value[start..index].trim());
+                    start = index + c.len_utf8();
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn link_parameter(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.starts_with('"') {
+        return Some(value.to_owned());
+    }
+    let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut decoded = String::new();
+    let mut characters = quoted.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            decoded.push(characters.next()?);
+        } else if character == '"' {
+            return None;
+        } else {
+            decoded.push(character);
+        }
+    }
+    Some(decoded)
+}
+
+fn alternate_certificate_links(
+    headers: &reqwest::header::HeaderMap,
+    base: &url::Url,
+) -> Vec<String> {
+    let mut links = Vec::new();
+    for header in headers.get_all(reqwest::header::LINK) {
+        let Ok(value) = header.to_str() else {
+            continue;
+        };
+        for link in split_link_parts(value, ',') {
+            let parts = split_link_parts(link, ';');
+            let Some(target) = parts
+                .first()
+                .and_then(|part| part.strip_prefix('<'))
+                .and_then(|part| part.strip_suffix('>'))
+            else {
+                continue;
+            };
+            let mut alternate = false;
+            let mut anchored = false;
+            for parameter in parts.iter().skip(1) {
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("anchor") {
+                    anchored = true;
+                }
+                if name.trim().eq_ignore_ascii_case("rel") {
+                    alternate = link_parameter(value).is_some_and(|relations| {
+                        relations
+                            .split_ascii_whitespace()
+                            .any(|relation| relation.eq_ignore_ascii_case("alternate"))
+                    });
+                }
+            }
+            if !alternate || anchored {
+                continue;
+            }
+            let Ok(mut target) = base.join(target) else {
+                continue;
+            };
+            if !matches!(target.scheme(), "http" | "https")
+                || !target.username().is_empty()
+                || target.password().is_some()
+            {
+                continue;
+            }
+            target.set_fragment(None);
+            links.push(target.to_string());
+            if links.len() == MAX_ALTERNATE_CHAINS {
+                return links;
+            }
+        }
+    }
+    links
+}
 
 // ---------------------------------------------------------------------------
 // ACME Directory
@@ -1250,35 +1400,113 @@ impl AcmeClient {
     // Certificate download
     // -----------------------------------------------------------------------
 
-    /// Download the certificate chain (PEM) from the given certificate URL.
+    /// Download only the CA's default certificate chain (PEM).
+    /// The response body is limited to 1 MiB. Alternate links are not followed.
     pub async fn download_certificate(
         &self,
         account_key: &PrivateKey,
         account_url: &str,
         cert_url: &str,
     ) -> Result<String> {
-        debug!(cert_url, "downloading certificate");
+        self.download_certificate_response(account_key, account_url, cert_url)
+            .await
+            .map(|(pem, _)| pem)
+    }
 
-        let resp = self
+    /// Download the default PEM chain and up to `max_alternates` alternatives
+    /// advertised with `Link: ...; rel="alternate"`. The request count is capped
+    /// at eight alternates even if a larger limit is supplied. Each response is
+    /// limited to 1 MiB, duplicate/cyclic URLs are fetched at most once, and
+    /// failed or malformed alternatives are ignored. Alternatives must contain
+    /// the same leaf certificate as the default chain. Chain order is preserved.
+    pub async fn download_certificate_chains(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+        max_alternates: usize,
+    ) -> Result<Vec<String>> {
+        let limit = max_alternates.min(MAX_ALTERNATE_CHAINS);
+        let (default, links) = self
+            .download_certificate_response(account_key, account_url, cert_url)
+            .await?;
+        let leaf = certificate_chain_leaf(&default)?;
+        let mut chains = vec![default];
+        let mut seen = HashSet::new();
+        if let Ok(mut primary) = url::Url::parse(cert_url) {
+            primary.set_fragment(None);
+            seen.insert(primary.to_string());
+        }
+        let mut pending = VecDeque::new();
+        enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
+        while let Some(url) = pending.pop_front() {
+            match self
+                .download_certificate_response(account_key, account_url, &url)
+                .await
+            {
+                Ok((pem, links)) => match certificate_chain_leaf(&pem) {
+                    Ok(alternate_leaf) if alternate_leaf == leaf => {
+                        if !chains.contains(&pem) {
+                            chains.push(pem);
+                        }
+                        enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
+                    }
+                    _ => warn!(
+                        url,
+                        "ignoring alternate chain with an invalid or different leaf certificate"
+                    ),
+                },
+                Err(error) => {
+                    warn!(url, %error, "ignoring unavailable alternate certificate chain")
+                }
+            }
+        }
+        Ok(chains)
+    }
+
+    async fn download_certificate_response(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+    ) -> Result<(String, Vec<String>)> {
+        debug!(cert_url, "downloading certificate");
+        let mut response = self
             .acme_post(account_key, Some(account_url), cert_url, None)
             .await?;
-
-        if !resp.status().is_success() {
+        if !response.status().is_success() {
             return Err(AcmeError::Certificate(format!(
                 "certificate download returned HTTP {}",
-                resp.status()
+                response.status()
             ))
             .into());
         }
-
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AcmeError::Certificate(format!("failed to read certificate body: {e}")))?;
-
-        debug!(cert_url, len = body.len(), "certificate downloaded");
-
-        Ok(body)
+        let links = alternate_certificate_links(response.headers(), response.url());
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_CERTIFICATE_CHAIN_BYTES as u64)
+        {
+            return Err(
+                AcmeError::Certificate("certificate response exceeds 1 MiB limit".into()).into(),
+            );
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            AcmeError::Certificate(format!("failed to read certificate body: {error}"))
+        })? {
+            if chunk.len() > MAX_CERTIFICATE_CHAIN_BYTES - body.len() {
+                return Err(AcmeError::Certificate(
+                    "certificate response exceeds 1 MiB limit".into(),
+                )
+                .into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let pem = String::from_utf8(body).map_err(|error| {
+            AcmeError::Certificate(format!("certificate response is not UTF-8 PEM: {error}"))
+        })?;
+        debug!(cert_url, len = pem.len(), "certificate downloaded");
+        Ok((pem, links))
     }
 
     // -----------------------------------------------------------------------

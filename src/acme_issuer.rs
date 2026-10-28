@@ -269,8 +269,9 @@ impl std::fmt::Debug for IssuedCertificate {
 /// Preferences for selecting an alternate certificate chain when the CA
 /// offers more than one.
 ///
-/// The first matching criterion wins. If no chain matches, the first
-/// (default) chain is used.
+/// Root Common Names are tried in preference order, then any issuer Common
+/// Names, then the size preference. If no criterion matches, the default chain
+/// is used. Certificate order within the selected chain is preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChainPreference {
     /// When `true`, prefer chains with the fewest bytes.
@@ -279,7 +280,8 @@ pub struct ChainPreference {
     pub smallest: Option<bool>,
 
     /// Select the first chain whose root certificate has one of these
-    /// Common Names.
+    /// Common Names (the issuer CN of the final certificate, since ACME
+    /// servers usually omit the self-signed root).
     #[serde(default)]
     pub root_common_name: Vec<String>,
 
@@ -1135,27 +1137,23 @@ impl AcmeIssuer {
             AcmeError::Certificate("order is valid but has no certificate URL".into())
         })?;
 
-        let cert_pem = client
-            .download_certificate(&account_key, &acct.location, &cert_url)
-            .await?;
-
-        info!(
-            domains = ?domains,
-            ca = %ca_url,
-            cert_url = %cert_url,
-            "certificate issued successfully"
-        );
-
-        // Step 8: select preferred chain if applicable.
-        // The ACME protocol can offer alternate chains via Link headers, but
-        // most Rust ACME clients return a single chain. For now we apply
-        // chain preference filtering if we detect multiple certificates in
-        // the PEM bundle.
-        let final_pem = if let Some(ref pref) = self.preferred_chains {
-            self.select_preferred_chain(&cert_pem, pref)
+        let final_pem = if let Some(ref preference) = self.preferred_chains {
+            let chains = client
+                .download_certificate_chains(
+                    &account_key,
+                    &acct.location,
+                    &cert_url,
+                    crate::acme_client::MAX_ALTERNATE_CHAINS,
+                )
+                .await?;
+            self.select_preferred_chain(&chains, preference)
         } else {
-            cert_pem.clone()
+            client
+                .download_certificate(&account_key, &acct.location, &cert_url)
+                .await?
         };
+
+        info!(domains = ?domains, ca = %ca_url, cert_url = %cert_url, "certificate issued successfully");
 
         let metadata = serde_json::json!({
             "ca": ca_url,
@@ -1177,114 +1175,57 @@ impl AcmeIssuer {
     // Chain preference selection
     // -----------------------------------------------------------------------
 
-    /// Given a PEM certificate chain, apply the chain preference rules.
-    ///
-    /// In typical ACME usage there is only one chain. This method is a
-    /// simplified version that parses the PEM bundle and checks CN matching
-    /// when preferences are specified.
-    fn select_preferred_chain(&self, cert_pem: &str, pref: &ChainPreference) -> String {
-        // Parse certs from the bundle for inspection.
-        let cert_ders = match parse_certs_from_pem_bundle(cert_pem) {
-            Ok(ders) => ders,
-            Err(e) => {
-                warn!(error = %e, "failed to parse certificate chain for preference selection");
-                return cert_pem.to_owned();
-            }
-        };
-
-        if cert_ders.is_empty() {
-            return cert_pem.to_owned();
-        }
-
-        // Parse each certificate with x509-parser to check Common Names.
-        // We store the owned DER bytes alongside the parsed certificate
-        // reference via indices, since x509-parser borrows from the DER slice.
-        //
-        // Helper: extract the issuer CN from a DER-encoded certificate.
-        fn issuer_cn_from_der(der: &[u8]) -> Option<String> {
-            let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-
-            cert.issuer()
-                .iter_common_name()
-                .next()
-                .and_then(|attr| attr.as_str().ok())
-                .map(|s| s.to_owned())
-        }
-
-        // Check any_common_name: match any certificate's issuer CN.
-        if !pref.any_common_name.is_empty() {
-            for pref_cn in &pref.any_common_name {
-                for der in &cert_ders {
-                    if let Some(cn) = issuer_cn_from_der(der)
-                        && cn == *pref_cn
-                    {
-                        debug!(
-                            preferred_cn = %pref_cn,
-                            "found certificate matching any_common_name preference"
-                        );
-                        return cert_pem.to_owned();
-                    }
-                }
-            }
-        }
-
-        // Check root_common_name: match the last certificate's issuer CN.
-        if !pref.root_common_name.is_empty()
-            && let Some(root_der) = cert_ders.last()
-            && let Some(cn) = issuer_cn_from_der(root_der)
-        {
-            for pref_cn in &pref.root_common_name {
-                if cn == *pref_cn {
-                    debug!(
-                        preferred_cn = %pref_cn,
-                        "found certificate matching root_common_name preference"
+    /// Select a complete independent chain; never reorder its certificates.
+    /// Root CN preferences take priority, followed by any issuer CN, then size.
+    fn select_preferred_chain(&self, chains: &[String], preference: &ChainPreference) -> String {
+        let inspected: Vec<_> = chains
+            .iter()
+            .filter_map(|pem| {
+                let certificates = parse_certs_from_pem_bundle(pem).ok()?;
+                let mut names = Vec::new();
+                for der in &certificates {
+                    let (_, certificate) =
+                        x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+                    names.push(
+                        certificate
+                            .issuer()
+                            .iter_common_name()
+                            .filter_map(|attribute| attribute.as_str().ok().map(str::to_owned))
+                            .collect::<Vec<_>>(),
                     );
-                    return cert_pem.to_owned();
                 }
+                Some((pem, names))
+            })
+            .collect();
+        for wanted in &preference.root_common_name {
+            if let Some((pem, _)) = inspected
+                .iter()
+                .find(|(_, names)| names.last().is_some_and(|root| root.contains(wanted)))
+            {
+                return (*pem).clone();
             }
         }
-
-        // Check smallest preference: sort by PEM size.
-        if let Some(want_smallest) = pref.smallest {
-            // We only have a single chain here (the PEM bundle). In a
-            // scenario with multiple alternate chains from the CA, we
-            // would sort across all of them. For now, this is a no-op
-            // since there is only one chain, but we implement the sorting
-            // logic for future multi-chain support. We split the PEM
-            // bundle by certificate boundaries and re-assemble sorted.
-            let _pem_items = match pem::parse_many(cert_pem) {
-                Ok(items) if items.len() > 1 => items,
-                _ => return cert_pem.to_owned(),
-            };
-
-            // Treat the whole PEM as a single "chain" — sorting a single
-            // chain is a no-op. The sorting becomes meaningful when
-            // multiple alternate chains are available. We return the
-            // original PEM unchanged.
-            let mut chains: Vec<String> = vec![cert_pem.to_owned()];
-
-            chains.sort_by(|a, b| {
-                if want_smallest {
+        for wanted in &preference.any_common_name {
+            if let Some((pem, _)) = inspected
+                .iter()
+                .find(|(_, names)| names.iter().flatten().any(|name| name == wanted))
+            {
+                return (*pem).clone();
+            }
+        }
+        if let Some(smallest) = preference.smallest {
+            let selected = inspected.iter().min_by(|(a, _), (b, _)| {
+                if smallest {
                     a.len().cmp(&b.len())
                 } else {
                     b.len().cmp(&a.len())
                 }
             });
-
-            debug!(
-                smallest = want_smallest,
-                chain_count = chains.len(),
-                "applied chain size sorting preference"
-            );
-
-            return chains
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| cert_pem.to_owned());
+            if let Some((pem, _)) = selected {
+                return (*pem).clone();
+            }
         }
-
-        // No preference matched — return the original chain.
-        cert_pem.to_owned()
+        chains.first().cloned().unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
