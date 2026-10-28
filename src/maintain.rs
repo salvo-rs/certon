@@ -292,17 +292,41 @@ async fn maintenance_loop(
         }
     };
     let ocsp = async {
+        // Subscribe before reading deadlines so a concurrent publication cannot
+        // be lost between computing the next wake-up and starting to wait.
+        let mut changed = cache.subscribe_ocsp();
         loop {
-            ocsp_ticker.tick().await;
+            let deadline = if config.ocsp.disable_stapling {
+                None
+            } else {
+                cache.next_ocsp_deadline()
+            };
+            let due = async {
+                match deadline {
+                    Some(deadline) => {
+                        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                        tokio::time::sleep(delay).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let periodic = tokio::select! {
+                _ = ocsp_ticker.tick() => true,
+                _ = due => false,
+                _ = changed.changed() => continue,
+            };
             debug!("maintenance: running OCSP staple check");
-            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+            if periodic
+                && let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await
+            {
                 warn!(%error, "maintenance: failed to refresh revocation intent");
             }
-            update_ocsp_staples(
+            update_ocsp_staples_for(
                 &cache,
                 config.storage.as_ref(),
                 &config.ocsp,
                 policy.renew.as_ref(),
+                periodic,
             )
             .await;
         }
@@ -496,8 +520,10 @@ async fn try_reload_from_storage(
             new_hash = %stored_cert.hash,
             "maintenance: certificate already renewed by another instance; reloading from storage",
         );
-        cache.replace(&cached_cert.hash, stored_cert).await;
-        return true;
+        return cache
+            .replace_managed(&cached_cert.hash, stored_cert, domain)
+            .await
+            .is_ok();
     }
 
     false
@@ -519,18 +545,29 @@ async fn try_reload_from_storage(
 ///
 /// If a certificate's OCSP status is `Revoked` and `config.replace_revoked`
 /// is enabled, a force-renewal is triggered via `renew_func`.
+#[cfg(test)]
 async fn update_ocsp_staples(
     cache: &CertCache,
     storage: &dyn Storage,
     config: &OcspConfig,
     renew_func: &ReasonedRenewFn,
 ) {
+    update_ocsp_staples_for(cache, storage, config, renew_func, true).await;
+}
+
+async fn update_ocsp_staples_for(
+    cache: &CertCache,
+    storage: &dyn Storage,
+    config: &OcspConfig,
+    renew_func: &ReasonedRenewFn,
+    periodic: bool,
+) {
     if config.disable_stapling {
         debug!("maintenance: OCSP stapling is disabled; skipping update");
         return;
     }
 
-    let all_certs = cache.maintenance_snapshot(false);
+    let all_certs = cache.ocsp_snapshot(periodic);
 
     if all_certs.is_empty() {
         debug!("maintenance: no certificates to check for OCSP updates");
@@ -543,7 +580,7 @@ async fn update_ocsp_staples(
     );
 
     for cert in all_certs {
-        let needs_update = needs_ocsp_refresh(&cert);
+        let needs_update = cache.ocsp_refresh_due(&cert.hash);
 
         if !needs_update {
             continue;
@@ -603,54 +640,6 @@ async fn update_ocsp_staples(
             }
         }
     }
-}
-
-/// Determine whether a certificate's OCSP staple needs refreshing.
-///
-/// Returns `true` if:
-/// - The certificate has no OCSP response at all, OR
-/// - The existing OCSP response needs updating (per [`ocsp::ocsp_needs_update`]).
-fn needs_ocsp_refresh(cert: &crate::certificates::Certificate) -> bool {
-    match &cert.ocsp_response {
-        None => {
-            // No staple at all -- try to fetch one.
-            true
-        }
-        Some(raw) => {
-            // Try to parse the raw OCSP response to check freshness.
-            // If parsing fails, we should refresh.
-            match try_parse_ocsp_for_freshness(raw) {
-                Some(parsed) => ocsp::ocsp_needs_update(&parsed),
-                None => true,
-            }
-        }
-    }
-}
-
-/// Attempt to parse raw OCSP response bytes into an [`OcspResponse`] for
-/// freshness checking.
-///
-/// Returns `None` if the response cannot be parsed (in which case a refresh
-/// is warranted).
-fn try_parse_ocsp_for_freshness(raw: &[u8]) -> Option<ocsp::OcspResponse> {
-    // We try to extract minimal information from the raw DER-encoded OCSP
-    // response. The full parsing is done by `staple_ocsp` internally; here
-    // we only need enough to call `ocsp_needs_update`.
-    //
-    // Since `parse_ocsp_response_raw` is private to the ocsp module, we
-    // use the public `OcspResponse` struct fields. If the raw bytes are
-    // the complete DER response, we can parse with x509_parser's OCSP
-    // parsing. However, to keep things simple and avoid duplicating parsing
-    // logic, if the cert has an OCSP response set we assume it was valid
-    // at some point. We check via a conservative heuristic: if we cannot
-    // determine freshness, we flag for refresh.
-    //
-    // For now, return None to always trigger a refresh check via staple_ocsp
-    // which handles all the caching/freshness logic internally.
-    // This is safe because staple_ocsp checks its own cache first and will
-    // short-circuit if the staple is still fresh.
-    let _ = raw;
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +920,7 @@ mod tests {
     /// Pause the actual OCSP cache read while another lifecycle operation runs.
     struct GatedOcspStorage {
         files: crate::FileStorage,
+        loads: AtomicUsize,
         block_next_load: AtomicBool,
         offline: AtomicBool,
         entered: tokio::sync::Notify,
@@ -941,6 +931,7 @@ mod tests {
         fn new(path: &std::path::Path) -> Self {
             Self {
                 files: crate::FileStorage::new(path),
+                loads: AtomicUsize::new(0),
                 block_next_load: AtomicBool::new(false),
                 offline: AtomicBool::new(false),
                 entered: tokio::sync::Notify::new(),
@@ -952,6 +943,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Storage for GatedOcspStorage {
         async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             if self.block_next_load.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -1005,6 +997,215 @@ mod tests {
         )
     }
 
+    async fn read_ocsp_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "OCSP client closed before sending its request");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 8192);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn certificates_without_ocsp_support_keep_the_periodic_hour_poll() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut cert, _) = signed_certificate();
+        cert.managed = false;
+        cache.add(cert).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(GatedOcspStorage::new(directory.path()));
+        // Make storage failure immediate; with no AIA or responder override it
+        // must not convert the ordinary periodic poll into a short retry timer.
+        storage.offline.store(true, Ordering::SeqCst);
+        let maintenance = start_maintenance(
+            cache.clone(),
+            MaintenanceConfig {
+                renew_check_interval: DEFAULT_RENEW_CHECK_INTERVAL,
+                ocsp_check_interval: DEFAULT_OCSP_CHECK_INTERVAL,
+                ocsp: OcspConfig::default(),
+                storage: storage.clone(),
+            },
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 0);
+        tokio::time::advance(DEFAULT_OCSP_CHECK_INTERVAL - Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 1);
+        assert!(cache.next_ocsp_deadline().is_none());
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 1);
+        cache.stop_and_wait().await;
+        maintenance.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_maintenance_refreshes_a_new_short_ttl_staple_before_expiry() {
+        use tokio::io::AsyncWriteExt;
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut cert, issuer) = signed_certificate();
+        cert.managed = false;
+        let old = crate::cache::tests::signed_staple(&cert, &issuer, 8);
+        let replacement = crate::cache::tests::signed_staple(&cert, &issuer, 3600);
+        cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(old.clone());
+        let hash = cert.hash.clone();
+        let domain = cert.names[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(crate::FileStorage::new(directory.path()));
+        storage
+            .store(&crate::storage::ocsp_key(&domain, &hash), &old)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server_response = replacement.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_ocsp_request(&mut socket).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        server_response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&server_response).await.unwrap();
+        });
+        let mut ocsp = OcspConfig::default();
+        ocsp.responder_overrides.insert(domain.clone(), url);
+        let maintenance = start_maintenance(
+            cache.clone(),
+            MaintenanceConfig {
+                renew_check_interval: DEFAULT_RENEW_CHECK_INTERVAL,
+                ocsp_check_interval: DEFAULT_OCSP_CHECK_INTERVAL,
+                ocsp,
+                storage,
+            },
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        );
+        // Publish after the idle loop is running: the watch must recompute its
+        // original one-hour wait instead of missing this new short deadline.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        cache.add(cert).await;
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if cache.resolve(&domain).unwrap().key.ocsp.as_ref() == Some(&replacement) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("one-hour maintenance interval missed the signed staple's deadline");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            cache.resolve(&domain).unwrap().key.ocsp.as_ref(),
+            Some(&replacement)
+        );
+        cache.stop_and_wait().await;
+        maintenance.await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchanged_good_and_failed_responses_back_off_and_retain_only_fresh_staples() {
+        use tokio::io::AsyncWriteExt;
+        for available in [false, true] {
+            let cache = CertCache::new(CacheOptions::default());
+            let (mut cert, issuer) = signed_certificate();
+            cert.managed = false;
+            let response = crate::ocsp::tests::signed_response(
+                &cert.cert_chain,
+                &issuer,
+                0,
+                Utc::now() - ChronoDuration::hours(1),
+                Utc::now() + ChronoDuration::seconds(10),
+            );
+            cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+            cert.ocsp_response = Some(response.clone());
+            let hash = cert.hash.clone();
+            let domain = cert.names[0].clone();
+            let directory = tempfile::tempdir().unwrap();
+            let storage = Arc::new(crate::FileStorage::new(directory.path()));
+            storage
+                .store(&crate::storage::ocsp_key(&domain, &hash), &response)
+                .await
+                .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let server_response = response.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    read_ocsp_request(&mut socket).await;
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = if available {
+                        ("200 OK", server_response.as_slice())
+                    } else {
+                        ("503 Unavailable", b"offline".as_slice())
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                }
+            });
+            let mut ocsp = OcspConfig::default();
+            ocsp.responder_overrides.insert(domain.clone(), url);
+            cache.add(cert).await;
+            update_ocsp_staples(&cache, storage.as_ref(), &ocsp, &|_, _| {
+                Box::pin(async { Ok(()) })
+            })
+            .await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                cache.resolve(&domain).unwrap().key.ocsp.as_ref(),
+                Some(&response)
+            );
+            let deadline = cache.next_ocsp_deadline().unwrap();
+            assert!(deadline > Utc::now());
+            for _ in 0..5 {
+                update_ocsp_staples(&cache, storage.as_ref(), &ocsp, &|_, _| {
+                    Box::pin(async { Ok(()) })
+                })
+                .await;
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "same or unavailable responder caused a refresh loop"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[tokio::test]
     async fn ocsp_refresh_does_not_resurrect_removed_or_renewed_serving_keys() {
         for successful_refresh in [false, true] {
@@ -1027,10 +1228,7 @@ mod tests {
                         .unwrap();
                 }
                 cache.add(cert).await;
-                assert_eq!(
-                    cache.resolve(&domain).unwrap().key.ocsp,
-                    Some(vec![0, 1, 2])
-                );
+                assert_eq!(cache.resolve(&domain).unwrap().key.ocsp, None);
                 storage.block_next_load.store(true, Ordering::SeqCst);
                 let worker_cache = Arc::clone(&cache);
                 let worker_storage = Arc::clone(&storage);
@@ -1117,7 +1315,7 @@ mod tests {
                     "revoke" => {
                         let actual = cache.get_by_hash(&hash).await.unwrap();
                         assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
-                        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+                        assert!(cache.resolve(&domain).is_none());
                     }
                     "retag" => {
                         let actual = cache.get_by_hash(&hash).await.unwrap();
@@ -1206,7 +1404,7 @@ mod tests {
         assert_eq!(current.tags, vec!["manual"]);
         assert_eq!(current.issuer_key, "manual-issuer");
         assert_eq!(current.ocsp_status, Some(ocsp::OcspStatus::Revoked));
-        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+        assert!(cache.resolve(&domain).is_none());
     }
 
     #[tokio::test]
@@ -1251,7 +1449,7 @@ mod tests {
             let actual = cache.get_by_hash(&hash).await.unwrap();
             assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
             assert!(actual.ocsp_response.is_none());
-            assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+            assert!(cache.resolve(&domain).is_none());
             assert_eq!(attempts.load(Ordering::SeqCst), step + 1);
         }
         let (replacement, _) = signed_certificate();
@@ -1317,19 +1515,6 @@ mod tests {
         let custom = Duration::from_secs(42);
         let result = normalize_interval(custom, DEFAULT_RENEW_CHECK_INTERVAL);
         assert_eq!(result, custom);
-    }
-
-    #[test]
-    fn test_needs_ocsp_refresh_no_response() {
-        let cert = make_managed_cert(&["example.com"], "h1", 60);
-        assert!(needs_ocsp_refresh(&cert));
-    }
-
-    #[test]
-    fn test_needs_ocsp_refresh_with_response() {
-        let mut cert = make_managed_cert(&["example.com"], "h1", 60);
-        cert.ocsp_response = Some(vec![1, 2, 3]); // unparsable -> triggers refresh
-        assert!(needs_ocsp_refresh(&cert));
     }
 
     #[tokio::test]

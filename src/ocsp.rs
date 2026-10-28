@@ -205,7 +205,7 @@ const OCSP_RESPONSE_CONTENT_TYPE: &str = "application/ocsp-response";
 
 /// When `nextUpdate` is absent, consider an OCSP response fresh for this
 /// long after `thisUpdate`.
-const DEFAULT_OCSP_LIFETIME_HOURS: i64 = 24;
+pub(crate) const DEFAULT_OCSP_LIFETIME_HOURS: i64 = 24;
 
 /// Tolerate a small amount of clock skew without accepting future-dated status.
 const OCSP_CLOCK_SKEW_SECONDS: i64 = 300;
@@ -295,6 +295,7 @@ pub async fn staple_ocsp(
     // Parse the leaf to extract its first SAN for storage key generation.
     let first_name = cert.names.first().cloned().unwrap_or_default();
     let ocsp_storage_key = storage::ocsp_key(&first_name, &cert.hash);
+    let mut fresh_fallback = None;
 
     // Try loading a cached OCSP response from storage.
     match storage.load(&ocsp_storage_key).await {
@@ -306,11 +307,16 @@ pub async fn staple_ocsp(
                         status = %parsed.status,
                         "using cached OCSP staple"
                     );
-                    cert.ocsp_status = Some(parsed.status);
-                    if parsed.status == OcspStatus::Good {
-                        cert.ocsp_response = Some(cached_bytes);
+                    if parsed.status != OcspStatus::Good || !ocsp_needs_update(&parsed) {
+                        cert.ocsp_status = Some(parsed.status);
+                        if parsed.status == OcspStatus::Good {
+                            cert.ocsp_response = Some(cached_bytes);
+                        }
+                        return Ok(parsed.status == OcspStatus::Good);
                     }
-                    return Ok(parsed.status == OcspStatus::Good);
+                    // Proactively request a replacement, retaining this response
+                    // only while it is still fresh if the responder is unavailable.
+                    fresh_fallback = Some((cached_bytes, parsed));
                 }
                 Ok(parsed) => {
                     debug!(
@@ -354,6 +360,13 @@ pub async fn staple_ocsp(
                     error = %e,
                     "failed to get OCSP response; stapling skipped"
                 );
+                if let Some((raw, parsed)) = fresh_fallback
+                    && is_ocsp_fresh(&parsed)
+                {
+                    cert.ocsp_status = Some(OcspStatus::Good);
+                    cert.ocsp_response = Some(raw);
+                    return Ok(true);
+                }
                 return Ok(false);
             }
         };
@@ -553,7 +566,7 @@ async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
     }
 }
 
-async fn parse_ocsp_response_for_cert_chain(
+pub(crate) async fn parse_ocsp_response_for_cert_chain(
     data: &[u8],
     chain: &[rustls::pki_types::CertificateDer<'static>],
 ) -> Result<OcspResponse> {
@@ -1733,6 +1746,16 @@ pub(crate) mod tests {
         this_update: DateTime<Utc>,
         next_update: DateTime<Utc>,
     ) -> Vec<u8> {
+        signed_response_with_next_update(chain, key, status, this_update, Some(next_update))
+    }
+
+    pub(crate) fn signed_response_with_next_update(
+        chain: &[rustls::pki_types::CertificateDer<'static>],
+        key: &rcgen::KeyPair,
+        status: u8,
+        this_update: DateTime<Utc>,
+        next_update: Option<DateTime<Utc>>,
+    ) -> Vec<u8> {
         use rcgen::SigningKey;
         let (_, leaf) = X509Certificate::from_der(chain[0].as_ref()).unwrap();
         let (_, issuer) = X509Certificate::from_der(chain[1].as_ref()).unwrap();
@@ -1752,16 +1775,11 @@ pub(crate) mod tests {
             1 => der_wrap(0xa1, &time(this_update)),
             _ => der_wrap(0x82, &[]),
         };
-        let single = der_wrap(
-            0x30,
-            &[
-                id,
-                status,
-                time(this_update),
-                der_wrap(0xa0, &time(next_update)),
-            ]
-            .concat(),
-        );
+        let mut single = [id, status, time(this_update)].concat();
+        if let Some(next_update) = next_update {
+            single.extend(der_wrap(0xa0, &time(next_update)));
+        }
+        let single = der_wrap(0x30, &single);
         let tbs = der_wrap(
             0x30,
             &[

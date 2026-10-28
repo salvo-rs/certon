@@ -778,7 +778,7 @@ impl CertManager {
         domain: &str,
     ) -> Result<Certificate> {
         Self::validate_certificate_time(&cert, domain)?;
-        self.cache.add(cert.clone()).await;
+        self.cache.add_managed(cert.clone(), domain).await?;
         let _ = self.emit(
             EVENT_CACHED_MANAGED_CERT,
             &serde_json::json!({"sans": cert.names}),
@@ -915,7 +915,7 @@ impl CertManager {
                 .all(|name| Self::validate_certificate_name(replacement, name).is_ok())
     }
 
-    async fn publish_certificate(&self, cert: Certificate, domain: &str) {
+    async fn publish_certificate(&self, cert: Certificate, domain: &str) -> Result<()> {
         let incoming_hash = cert.hash.clone();
         let previous = self.cache.all_matching_certificates(domain).await;
         let superseded: Vec<_> = previous
@@ -928,10 +928,11 @@ impl CertManager {
         // A partial replacement must keep the old certificate serving every
         // name that it still covers. This applies to cleanup entries too.
         let old_hash = superseded.first().copied().unwrap_or(&incoming_hash);
-        self.cache.replace(old_hash, cert).await;
+        self.cache.replace_managed(old_hash, cert, domain).await?;
         for hash in superseded.into_iter().skip(1) {
             self.cache.remove(hash).await;
         }
+        Ok(())
     }
 
     /// Load a certificate from storage for the given domain.
@@ -1119,7 +1120,7 @@ impl CertManager {
                         ));
                     }
                     self.certificates.save(&ik, &cert_res).await?;
-                    self.publish_certificate(cert, domain).await;
+                    self.publish_certificate(cert, domain).await?;
 
                     info!(
                         domain = %domain,
@@ -1328,7 +1329,7 @@ impl CertManager {
             let mut fresh = cert;
             fresh.managed = true;
             fresh.issuer_key = cert_res.issuer_key.clone();
-            self.publish_certificate(fresh, domain).await;
+            self.publish_certificate(fresh, domain).await?;
             return Ok(());
         }
 
@@ -1407,7 +1408,7 @@ impl CertManager {
                         ));
                     }
                     self.certificates.save(&ik, &new_cert_res).await?;
-                    self.publish_certificate(cert, domain).await;
+                    self.publish_certificate(cert, domain).await?;
 
                     info!(
                         domain = %domain,

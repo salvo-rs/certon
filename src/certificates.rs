@@ -462,11 +462,11 @@ pub async fn reload_managed_certificate(
     let existing = cache.get_by_name(domain).await;
     match existing {
         Some(old_cert) => {
-            cache.replace(&old_cert.hash, cert).await;
+            cache.replace_managed(&old_cert.hash, cert, domain).await?;
         }
         None => {
             // No existing cert to replace; just add it.
-            cache.add(cert).await;
+            cache.add_managed(cert, domain).await?;
         }
     }
 

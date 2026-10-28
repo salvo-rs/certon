@@ -384,7 +384,28 @@ async fn already_managed_invalid_leaves_do_not_skip_foreground_or_background_rep
 async fn invalid_managed_siblings_remain_tracked_without_hiding_a_valid_cached_leaf() {
     for background in [false, true] {
         for future in [true, false] {
-            let fixture = Fixture::new().await;
+            let mut fixture = Fixture::new().await;
+            // This case tests the no-issuance shortcut. The default fixture is
+            // deliberately due for renewal, which background management must
+            // submit even while that certificate is still valid for TLS.
+            fixture.manager.cache.remove(&fixture.old.hash).await;
+            let year = chrono::Utc::now().year();
+            let fresh = fixture.issuer.resource(year - 1, year + 4);
+            fixture
+                .store
+                .save(&fixture.issuer.issuer_key(), &fresh)
+                .await
+                .unwrap();
+            fixture.old = fixture
+                .manager
+                .cache_certificate("example.com")
+                .await
+                .unwrap();
+            assert!(
+                !fixture
+                    .old
+                    .needs_renewal(fixture.manager.policy.renewal_window_ratio)
+            );
             let invalid = fixture.store_invalid(future).await;
             fixture.manager.cache.add(invalid.clone()).await;
             if background {
