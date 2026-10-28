@@ -24,6 +24,9 @@ struct Server {
     task: tokio::task::JoinHandle<()>,
 }
 
+trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.task.abort();
@@ -32,15 +35,36 @@ impl Drop for Server {
 
 impl Server {
     async fn start(recover: bool) -> Self {
+        Self::start_transport(recover, None, false).await
+    }
+
+    async fn start_transport(
+        recover: bool,
+        tls: Option<rustls::ServerConfig>,
+        pending: bool,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!(
+            "{}://{}",
+            if tls.is_some() { "https" } else { "http" },
+            listener.local_addr().unwrap()
+        );
+        let acceptor = tls.map(|config| tokio_rustls::TlsAcceptor::from(Arc::new(config)));
         let requests = Arc::new(Mutex::new(Vec::<Request>::new()));
         let recorded = Arc::clone(&requests);
         let base = url.clone();
         let task = tokio::spawn(async move {
             let mut orders = 0;
             loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut stream: Box<dyn Stream> = if let Some(acceptor) = &acceptor {
+                    match acceptor.accept(socket).await {
+                        Ok(stream) => Box::new(stream),
+                        Err(_) => continue,
+                    }
+                } else {
+                    Box::new(socket)
+                };
                 let mut input = Vec::new();
                 let mut buffer = [0; 4096];
                 let (head_len, body_len) = loop {
@@ -112,7 +136,9 @@ impl Server {
                             json!({"status":"ready", "authorizations":[format!("{base}/authz")], "finalize":format!("{base}/finalize")}).to_string()
                         }
                     }
-                    "/authz" => json!({"status":"valid", "identifier":{"type":"dns", "value":"review.example.com"}}).to_string(),
+                    "/authz" => if pending {
+                        json!({"status":"pending", "identifier":{"type":"dns", "value":"review.example.com"}, "challenges":[{"type":"http-01", "url":format!("{base}/challenge"), "token":"token"}]}).to_string()
+                    } else { json!({"status":"valid", "identifier":{"type":"dns", "value":"review.example.com"}}).to_string() },
                     "/finalize" => json!({"status":"valid", "certificate":format!("{base}/cert")}).to_string(),
                     "/cert" => "test certificate chain".into(),
                     "/ari/id" => {
@@ -262,4 +288,85 @@ fn eab_debug_redacts_hmac_key() {
     let output = format!("{eab:?}");
     assert!(!output.contains(&format!("{:?}", eab.hmac_key)));
     assert!(output.contains("REDACTED"));
+}
+
+#[tokio::test]
+async fn custom_ca_root_changes_real_https_trust() {
+    certon::install_default_crypto_provider();
+    let generated = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+    let root = generated.cert.der().clone();
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![root.clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(generated.signing_key.serialize_der())
+                .into(),
+        )
+        .unwrap();
+    let server = Server::start_transport(false, Some(config), false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let ca = format!("{}/directory", server.url);
+    let build = || {
+        AcmeIssuer::builder()
+            .ca(&ca)
+            .test_ca(&ca)
+            .agreed(true)
+            .email("review@example.com")
+            .storage(Arc::new(FileStorage::new(directory.path())))
+    };
+    assert!(
+        build()
+            .build()
+            .issue(b"csr", &["review.example.com".into()])
+            .await
+            .is_err()
+    );
+    let result = build()
+        .trusted_roots(root.as_ref().to_vec())
+        .build()
+        .issue(b"csr", &["review.example.com".into()])
+        .await
+        .unwrap();
+    assert_eq!(result.certificate_pem, b"test certificate chain");
+}
+
+struct HangingSolver {
+    cleaned: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl certon::Solver for HangingSolver {
+    async fn present(&self, _: &str, _: &str, _: &str) -> certon::Result<()> {
+        Ok(())
+    }
+    async fn wait(&self, _: &str, _: &str, _: &str) -> certon::Result<()> {
+        std::future::pending().await
+    }
+    async fn cleanup(&self, _: &str, _: &str, _: &str) -> certon::Result<()> {
+        self.cleaned.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn total_timeout_cleans_presented_challenge() {
+    let server = Server::start_transport(false, None, true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let ca = format!("{}/directory", server.url);
+    let cleaned = Arc::new(tokio::sync::Notify::new());
+    let issuer = AcmeIssuer::builder()
+        .ca(&ca)
+        .test_ca(&ca)
+        .agreed(true)
+        .storage(Arc::new(FileStorage::new(directory.path())))
+        .http01_solver(Arc::new(HangingSolver {
+            cleaned: Arc::clone(&cleaned),
+        }))
+        .cert_obtain_timeout(Duration::from_millis(500))
+        .build();
+    let result = issuer.issue(b"csr", &["review.example.com".into()]).await;
+    assert!(matches!(result, Err(certon::Error::Timeout(_))));
+    tokio::time::timeout(Duration::from_secs(2), cleaned.notified())
+        .await
+        .unwrap();
 }

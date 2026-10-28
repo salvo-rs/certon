@@ -1550,6 +1550,21 @@ mod tests {
     use crate::crypto::{KeyType, generate_private_key};
 
     #[test]
+    fn ari_identifier_keeps_der_serial_sign_padding() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::new(params, key);
+        let mut leaf = rcgen::CertificateParams::new(vec!["ari.example.com".into()]).unwrap();
+        leaf.use_authority_key_identifier_extension = true;
+        leaf.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x87, 0x65, 0x43, 0x21]));
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let cert = leaf.signed_by(&leaf_key, &issuer).unwrap();
+        let id = ari_cert_id(cert.der()).unwrap();
+        assert_eq!(id.split_once('.').unwrap().1, "AIdlQyE");
+    }
+
+    #[test]
     fn test_jwk_from_key() {
         let key = generate_private_key(KeyType::EcdsaP256).unwrap();
         let jwk = jwk_from_key(&key).unwrap();

@@ -61,7 +61,10 @@ struct PresentedChallenge {
 
 impl PresentedChallenge {
     async fn cleanup(mut self) -> Result<()> {
-        let result = self.solver.cleanup(&self.domain, &self.token, &self.key_auth).await;
+        let result = self
+            .solver
+            .cleanup(&self.domain, &self.token, &self.key_auth)
+            .await;
         self.armed = false;
         result
     }
@@ -69,7 +72,9 @@ impl PresentedChallenge {
 
 impl Drop for PresentedChallenge {
     fn drop(&mut self) {
-        if self.armed && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let solver = Arc::clone(&self.solver);
             let domain = self.domain.clone();
             let token = self.token.clone();
@@ -540,7 +545,10 @@ impl AcmeIssuerBuilder {
         self
     }
 
-    /// Set a custom DNS resolver address (e.g. "8.8.8.8:53").
+    /// This setting cannot configure an arbitrary custom solver. Set
+    /// `Dns01Solver::resolvers` on the DNS solver instead.
+    /// A nonempty value is rejected before issuance rather than silently ignored.
+    #[deprecated(note = "configure Dns01Solver.resolvers directly")]
     pub fn resolver(mut self, resolver: impl Into<String>) -> Self {
         self.resolver = Some(resolver.into());
         self
@@ -1080,8 +1088,7 @@ impl AcmeIssuer {
             .await;
 
             // Cleanup the challenge regardless of poll result.
-            if let Err(cleanup_err) = presented.cleanup().await
-            {
+            if let Err(cleanup_err) = presented.cleanup().await {
                 warn!(
                     identifier = %authz.identifier.value,
                     error = %cleanup_err,
