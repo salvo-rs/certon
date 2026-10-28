@@ -516,6 +516,8 @@ impl CertCache {
     /// imports cannot downgrade an entry that is already managed.
     /// Signing keys are prepared once, outside the cache lock. Quarantined
     /// leaves are ignored; Result-returning unmanaged helpers report rejection.
+    /// Time-invalid entries remain available as lifecycle metadata, but are
+    /// excluded from TLS selection until their validity period begins.
     pub async fn add(&self, cert: Certificate) {
         let key = cert_to_certified_key(&cert).ok();
         let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
@@ -709,7 +711,7 @@ impl CertCache {
         self.resolve_with_filter(name, |_| true).selected
     }
 
-    /// Filter client-incompatible keys before applying certificate preferences.
+    /// Filter time-invalid and client-incompatible keys before preferences.
     pub(crate) fn resolve_with_filter(
         &self,
         name: &str,
@@ -721,6 +723,7 @@ impl CertCache {
         let matched = !candidates.is_empty();
         let selected = candidates
             .into_iter()
+            .filter(|e| e.certificate.not_before <= now && now < e.certificate.not_after)
             .filter(|e| e.key.as_ref().is_some_and(|key| accepts(key)))
             .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))
             .and_then(|entry| {
@@ -744,8 +747,12 @@ impl CertCache {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let matches = state.matching(name);
         let matched = !matches.is_empty();
+        let now = Utc::now();
         let mut candidates: Vec<_> = matches
             .into_iter()
+            .filter(|entry| {
+                entry.certificate.not_before <= now && now < entry.certificate.not_after
+            })
             .filter(|entry| entry.key.as_ref().is_some_and(|key| accepts(key)))
             .filter_map(|entry| {
                 Some(CachedKeyCandidate {
@@ -760,7 +767,6 @@ impl CertCache {
             })
             .collect();
         drop(state);
-        let now = Utc::now();
         candidates.sort_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now));
         (matched, candidates)
     }
@@ -1070,6 +1076,61 @@ mod tests {
         let found = cache.get_by_hash("hash1").await;
         assert!(found.is_some());
         assert_eq!(found.unwrap().names, vec!["example.com".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn time_invalid_entries_remain_metadata_but_never_become_tls_candidates() {
+        crate::install_default_crypto_provider();
+        for managed in [false, true] {
+            for future in [false, true] {
+                let cache = CertCache::new(CacheOptions::default());
+                let generated =
+                    rcgen::generate_simple_self_signed(vec!["*.example.com".into()]).unwrap();
+                let mut invalid = Certificate::from_pem(
+                    generated.cert.pem().as_bytes(),
+                    generated.signing_key.serialize_pem().as_bytes(),
+                )
+                .unwrap();
+                invalid.managed = managed;
+                let now = Utc::now();
+                if future {
+                    invalid.not_before = now + ChronoDuration::days(1);
+                } else {
+                    invalid.not_after = now - ChronoDuration::days(1);
+                }
+                cache.add(invalid.clone()).await;
+                assert!(cache.get_by_hash(&invalid.hash).await.is_some());
+                assert!(cache.get_by_name("a.example.com").await.is_some());
+                assert_eq!(
+                    cache.get_managed_certificates().await.len(),
+                    usize::from(managed)
+                );
+                let lookup = cache.resolve_with_filter("a.example.com", |_| {
+                    panic!("invalid-time candidate reached key filter")
+                });
+                assert!(lookup.matched);
+                assert!(lookup.selected.is_none());
+                let (matched, candidates) = cache.selection_candidates("a.example.com", |_| {
+                    panic!("invalid-time candidate reached selector filter")
+                });
+                assert!(matched);
+                assert!(candidates.is_empty());
+
+                let generated =
+                    rcgen::generate_simple_self_signed(vec!["*.example.com".into()]).unwrap();
+                let valid = Certificate::from_pem(
+                    generated.cert.pem().as_bytes(),
+                    generated.signing_key.serialize_pem().as_bytes(),
+                )
+                .unwrap();
+                cache.add(valid.clone()).await;
+                assert_eq!(cache.resolve("a.example.com").unwrap().hash, valid.hash);
+                let (_, candidates) = cache.selection_candidates("a.example.com", |_| true);
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].key.hash, valid.hash);
+                assert!(cache.get_by_hash(&invalid.hash).await.is_some());
+            }
+        }
     }
 
     #[tokio::test]

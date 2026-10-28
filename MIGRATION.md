@@ -232,3 +232,22 @@ Use `crypto::generate_private_key_async` in Tokio async applications. The
 existing synchronous `generate_private_key`, `StandardKeyGenerator::generate_key`
 and `account::new_account` remain synchronous and outside that budget. The
 fixed P-256 TLS-ALPN challenge-key generation path is unchanged.
+
+
+## Initial certificate loading and validity
+
+`CertManager::cache_certificate` now returns `CertError::NotYetValid` or
+`CertError::Expired` before adding invalid-time credentials to the serving
+cache. An existing usable certificate remains available when that load fails.
+`load_certificate` is a read-only view of the best stored resource; it may
+return a certificate that needs renewal and does not publish it.
+
+`manage` and `obtain` repair future/expired stored certificates through the
+normal renewal path, publishing only after the replacement is validated.
+A failed CA request returns an error without caching the unusable resource.
+Already-managed fast paths keep invalid-time entries as lifecycle metadata so
+maintenance retains their SAN coverage. TLS selection filters these entries,
+including custom certificate selectors, while metadata lookups still return
+them. Maintenance repairs future certificates as well as expiring ones.
+Valid cached siblings remain available during failed repairs. Background
+management uses the same checks.

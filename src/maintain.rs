@@ -378,7 +378,7 @@ async fn check_renewals_with_policy(
     );
 
     for cert in &managed_certs {
-        if !cert.needs_renewal(policy.ratio) {
+        if cert.not_before <= chrono::Utc::now() && !cert.needs_renewal(policy.ratio) {
             continue;
         }
 
