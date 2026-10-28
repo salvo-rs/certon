@@ -4,9 +4,10 @@
 //!
 //! * **Atomic writes** — data is first written to a temporary file in the same directory, then
 //!   renamed into place so that readers never see a partial write.
-//! * **Distributed locking** — lock files containing a JSON timestamp are created atomically.  A
-//!   background keepalive task periodically updates the timestamp; stale locks whose timestamp
-//!   exceeds twice the freshness interval are automatically removed.
+//! * **Process locking** — OS advisory locks are held by open file handles. Process exit releases
+//!   ownership automatically. Lock files are never removed or replaced, avoiding stale-owner
+//!   unlink/renewal races. Shared filesystems must support cross-host OS locks; this backend does
+//!   not provide fencing tokens or time-based lease takeover.
 //! * **Platform-aware defaults** — the default storage path follows OS conventions
 //!   (`~/.local/share/certon` on Linux, `~/Library/Application Support/certon` on macOS,
 //!   `%APPDATA%/certon` on Windows).
@@ -18,9 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{error, info};
 
 use crate::error::{Error, Result, StorageError};
 use crate::storage::{KeyInfo, Storage, safe_key};
@@ -29,34 +28,15 @@ use crate::storage::{KeyInfo, Storage, safe_key};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// How often the keepalive task refreshes the lock file timestamp.
-const LOCK_FRESHNESS_INTERVAL: Duration = Duration::from_secs(5);
-
 /// How often to poll when waiting for a lock held by another process.
-const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1000);
-
-/// Maximum number of times an empty/truncated lock file is tolerated before
-/// treating it as stale.
-const MAX_EMPTY_LOCK_READS: u32 = 8;
-
-/// Delay between retries when the lock file reads as empty (it may be in the
-/// middle of being written).
-const EMPTY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(250);
-
-// ---------------------------------------------------------------------------
-// Lock metadata
-// ---------------------------------------------------------------------------
-
-/// JSON structure stored inside lock files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LockMeta {
-    created: chrono::DateTime<chrono::Utc>,
-    updated: chrono::DateTime<chrono::Utc>,
-}
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // FileStorage
 // ---------------------------------------------------------------------------
+
+/// Default lock acquisition timeout (5 minutes).
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// A [`Storage`] implementation backed by the local file system.
 ///
@@ -66,19 +46,19 @@ struct LockMeta {
 ///
 /// # Locking
 ///
-/// Locks are implemented as files under `<path>/locks/<safe_name>.lock`.  Each
-/// lock file contains a `LockMeta` JSON object whose `updated` field is
-/// refreshed every `LOCK_FRESHNESS_INTERVAL` (5 seconds) by a background tokio task.  If
-/// another process finds the timestamp older than twice that interval the lock
-/// is considered stale and forcibly removed.
+/// Locks are OS advisory locks on permanent files under
+/// `<path>/locks/<safe_name>.lock`. Ownership belongs to the open handle, so
+/// a crashed process releases it and an old owner cannot unlink a successor's
+/// lock. An active owner is never evicted based on timestamps. Empty or corrupt
+/// legacy lock metadata is harmless. This is not a fencing protocol: a shared
+/// filesystem must implement cross-host advisory locking correctly. Stop old
+/// certon processes before upgrading; timestamp-based and OS locks must not be
+/// mixed on the same storage directory.
 ///
 /// # Atomic writes
 ///
 /// Data is first written to a temporary file in the same directory, then
 /// renamed into place. This ensures readers never see partial writes.
-/// Default lock timeout (5 minutes).
-const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
 pub struct FileStorage {
     /// Root directory for all stored data.
     pub path: PathBuf,
@@ -87,8 +67,8 @@ pub struct FileStorage {
     /// Defaults to 5 minutes.
     pub lock_timeout: Duration,
 
-    /// Handles to keepalive tasks, keyed by lock name.
-    lock_keepalives: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Open handles own OS locks; dropping a handle releases only that lock.
+    held_locks: Mutex<HashMap<String, std::fs::File>>,
 }
 
 impl FileStorage {
@@ -101,7 +81,7 @@ impl FileStorage {
         Self {
             path: path.into(),
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
-            lock_keepalives: Mutex::new(HashMap::new()),
+            held_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -110,7 +90,7 @@ impl FileStorage {
         Self {
             path: path.into(),
             lock_timeout,
-            lock_keepalives: Mutex::new(HashMap::new()),
+            held_locks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -263,6 +243,13 @@ impl FileStorage {
             return Err(e);
         }
 
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_owned();
+            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+                .await
+                .map_err(std::io::Error::other)??;
+        }
         Ok(())
     }
 
@@ -275,206 +262,46 @@ impl FileStorage {
 
     // -- lock helpers -------------------------------------------------------
 
-    /// Atomically create a lock file.  Returns `Ok(true)` if the file was
-    /// created (lock acquired), `Ok(false)` if it already exists, or an error
-    /// on unexpected I/O failure.
-    async fn create_lock_file(filename: &Path) -> std::io::Result<bool> {
-        // Ensure parent directory exists.
-        if let Some(dir) = filename.parent() {
-            tokio::fs::create_dir_all(dir).await?;
-            #[cfg(unix)]
-            {
-                Self::set_dir_permissions(dir, 0o700).await.ok();
-            }
-        }
-
-        // Use std::fs in a blocking task for O_EXCL semantics (tokio::fs does
-        // not expose OpenOptions with create_new + write in a single atomic
-        // step reliably on all platforms).
-        let path = filename.to_path_buf();
-        let result = tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path);
-            match file {
-                Ok(f) => {
-                    // Write initial lock metadata.
-                    let now = chrono::Utc::now();
-                    let meta = LockMeta {
-                        created: now,
-                        updated: now,
-                    };
-                    serde_json::to_writer(&f, &meta)?;
-                    f.sync_all()?;
-                    Ok(true)
-                }
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(false),
-                Err(e) => Err(e),
-            }
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-
-        Ok(result)
-    }
-
-    /// Read and parse the metadata from a lock file.
-    async fn read_lock_meta(filename: &Path) -> std::io::Result<Option<LockMeta>> {
-        match tokio::fs::read(filename).await {
-            Ok(bytes) => {
-                if bytes.is_empty() {
-                    return Ok(None);
-                }
-                let meta: LockMeta = serde_json::from_slice(&bytes)
-                    .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-                Ok(Some(meta))
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Returns `true` if the lock metadata indicates a stale lock.
-    fn lock_is_stale(meta: &LockMeta) -> bool {
-        let ref_time = meta.updated;
-        let elapsed = chrono::Utc::now().signed_duration_since(ref_time);
-        // Grace period: twice the freshness interval.
-        elapsed
-            > chrono::Duration::from_std(LOCK_FRESHNESS_INTERVAL * 2)
-                .unwrap_or(chrono::Duration::MAX)
-    }
-
-    /// Update the `updated` timestamp in the lock file.
-    async fn update_lock_freshness(filename: &Path) -> std::io::Result<bool> {
-        let path = filename.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            // Open for read + write.
-            let file = match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-            {
-                Ok(f) => f,
-                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(true), // lock released
-                Err(e) => return Err(e),
-            };
-
-            // Read current metadata.
-            let reader = std::io::BufReader::new(&file);
-            let mut meta: LockMeta = match serde_json::from_reader(reader) {
-                Ok(m) => m,
-                Err(_) => return Ok(true), // corrupt / empty => stop keepalive
-            };
-
-            // Truncate and rewrite with updated timestamp.
-            file.set_len(0)?;
-            use std::io::Seek;
-            (&file).seek(std::io::SeekFrom::Start(0))?;
-            meta.updated = chrono::Utc::now();
-            serde_json::to_writer(&file, &meta).map_err(std::io::Error::other)?;
-            file.sync_all()?;
-
-            Ok(false) // keep going
-        })
-        .await
-        .map_err(std::io::Error::other)?
-    }
-
-    /// Spawn a background task that periodically refreshes a lock file's
-    /// timestamp.
-    fn spawn_keepalive(filename: PathBuf) -> tokio::task::JoinHandle<()> {
-        tokio::task::spawn(async move {
-            loop {
-                tokio::time::sleep(LOCK_FRESHNESS_INTERVAL).await;
-                match Self::update_lock_freshness(&filename).await {
-                    Ok(true) => return, // lock was released
-                    Ok(false) => {}     // keep refreshing
-                    Err(e) => {
-                        error!(
-                            lockfile = %filename.display(),
-                            error = %e,
-                            "keeping lock file fresh failed; stopping keepalive"
-                        );
-                        return;
-                    }
-                }
-            }
-        })
-    }
-
-    /// Core lock-acquisition loop.
+    /// Open one permanent lock inode. Never unlink it: another process may
+    /// already be waiting on the same inode.
     async fn obtain_lock(&self, name: &str) -> Result<()> {
         let filename = self.lock_filename(name);
-        let mut empty_count: u32 = 0;
-
+        let mut file = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = filename.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(filename)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("opening lock task failed: {e}")))?
+        .map_err(|e| StorageError::LockFailed(format!("opening lock file: {e}")))?;
         loop {
-            // Try to atomically create the lock file.
-            match Self::create_lock_file(&filename).await {
-                Ok(true) => {
-                    // Lock acquired — start keepalive.
-                    let mut keepalives = self.lock_keepalives.lock().await;
-                    let handle = Self::spawn_keepalive(filename);
-                    keepalives.insert(name.to_string(), handle);
-                    return Ok(());
-                }
-                Ok(false) => {
-                    // Lock file already exists — fall through to staleness check.
-                }
-                Err(e) => {
-                    return Err(StorageError::LockFailed(format!("creating lock file: {e}")).into());
-                }
+            // A cancelled blocking attempt drops its returned handle, which
+            // releases any OS lock it acquired before cancellation.
+            let (returned_file, locked) = tokio::task::spawn_blocking(move || {
+                let locked = match file.try_lock() {
+                    Ok(()) => true,
+                    Err(std::fs::TryLockError::WouldBlock) => false,
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                };
+                Ok((file, locked))
+            })
+            .await
+            .map_err(|e| Error::Other(format!("lock attempt task failed: {e}")))?
+            .map_err(|e| StorageError::LockFailed(format!("locking file: {e}")))?;
+            file = returned_file;
+            if locked {
+                self.held_locks.lock().await.insert(name.to_owned(), file);
+                return Ok(());
             }
-
-            // Lock file exists.  Read its metadata to check freshness.
-            match Self::read_lock_meta(&filename).await {
-                Ok(None) => {
-                    // File disappeared or was empty.
-                    empty_count += 1;
-                    if empty_count < MAX_EMPTY_LOCK_READS {
-                        tokio::time::sleep(EMPTY_LOCK_RETRY_DELAY).await;
-                        continue;
-                    }
-                    // Treat as stale after too many empty reads.
-                    info!(
-                        name,
-                        "lock file empty after {MAX_EMPTY_LOCK_READS} reads; treating as stale"
-                    );
-                    let _ = tokio::fs::remove_file(&filename).await;
-                    continue;
-                }
-                Ok(Some(meta)) => {
-                    if Self::lock_is_stale(&meta) {
-                        info!(
-                            name,
-                            created = %meta.created,
-                            updated = %meta.updated,
-                            "lock is stale; removing and retrying"
-                        );
-                        match tokio::fs::remove_file(&filename).await {
-                            Ok(()) => continue,
-                            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                            Err(e) => {
-                                return Err(StorageError::LockFailed(format!(
-                                    "unable to delete stale lockfile; deadlocked: {e}"
-                                ))
-                                .into());
-                            }
-                        }
-                    }
-                    // Lock is still fresh — wait and retry.
-                    tokio::time::sleep(LOCK_POLL_INTERVAL).await;
-                }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
-                    // Lock file was just removed — retry immediately.
-                    continue;
-                }
-                Err(e) => {
-                    return Err(
-                        StorageError::LockFailed(format!("accessing lock file: {e}")).into(),
-                    );
-                }
-            }
+            tokio::time::sleep(LOCK_POLL_INTERVAL).await;
         }
     }
 
@@ -660,22 +487,14 @@ impl Storage for FileStorage {
     }
 
     async fn unlock(&self, name: &str) -> Result<()> {
-        // Cancel the keepalive task if one is running.
-        if let Some(handle) = self.lock_keepalives.lock().await.remove(name) {
-            handle.abort();
+        // Removing our own handle cannot release another instance's lock.
+        // There is no path-based check/remove operation and no renewal task.
+        if let Some(file) = self.held_locks.lock().await.remove(name) {
+            tokio::task::spawn_blocking(move || drop(file))
+                .await
+                .map_err(|e| Error::Other(format!("unlock task failed: {e}")))?;
         }
-
-        // Use spawn_blocking for the file removal so that it completes even
-        // if the calling task is cancelled (e.g. via tokio::select! or
-        // task abort).
-        let filename = self.lock_filename(name);
-        tokio::task::spawn_blocking(move || match std::fs::remove_file(&filename) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::from(StorageError::Io(e))),
-        })
-        .await
-        .map_err(|e| Error::Other(format!("unlock spawn_blocking failed: {e}")))?
+        Ok(())
     }
 }
 
@@ -873,7 +692,15 @@ mod tests {
         assert!(fs.lock_filename("mylock").exists());
 
         fs.unlock("mylock").await.unwrap();
-        // Lock file should be gone.
-        assert!(!fs.lock_filename("mylock").exists());
+        // The inode is permanent; availability follows OS ownership.
+        assert!(fs.lock_filename("mylock").exists());
+        let other = FileStorage::new(tmp.path());
+        assert!(
+            other
+                .try_lock("mylock", Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+        other.unlock("mylock").await.unwrap();
     }
 }

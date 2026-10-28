@@ -2,15 +2,15 @@
 //!
 //! This module handles creating, loading, and saving ACME accounts to storage.
 //!
-//! Accounts are stored at:
-//! - Registration JSON: `acme/<ca_key>/users/<email>/<username>.json`
-//! - Private key PEM:   `acme/<ca_key>/users/<email>/<username>.key`
+//! Accounts are atomically stored as complete snapshots at
+//! `acme/<ca_key>/users/<email>/_certon/account.v1.key`. Legacy registration JSON
+//! and private-key files remain readable for upgrades.
 //!
 //! where `<username>` is the portion of the email address before `@`, or
 //! `"default"` if no email is provided.
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::crypto::{
     KeyType, decode_private_key_pem, encode_private_key_pem, generate_private_key,
@@ -40,9 +40,8 @@ const DEFAULT_KEY_FILENAME: &str = "private";
 /// Represents an ACME account, including its private key material and
 /// registration metadata.
 ///
-/// This struct is serialised to JSON for storage. The private key PEM is
-/// stored in a separate file (not embedded in the JSON), but is carried
-/// in-memory as part of this struct for convenience.
+/// Standalone serialization omits the private key. Persistence wraps this
+/// metadata together with the key in a private, versioned atomic snapshot.
 ///
 /// Accounts are uniquely identified by their CA URL and email address.
 /// A single application may have accounts on multiple CAs simultaneously
@@ -68,8 +67,8 @@ pub struct AcmeAccount {
 
     /// PEM-encoded private key for this account.
     ///
-    /// This field is **not** written into the registration JSON — it is stored
-    /// in a separate `.key` file.
+    /// Standalone registration JSON omits this field. The persistence snapshot
+    /// includes it separately and is stored with private-key permissions.
     #[serde(skip)]
     pub private_key_pem: String,
 
@@ -182,6 +181,28 @@ fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
     )
 }
 
+#[derive(Serialize, Deserialize)]
+struct AccountSnapshot {
+    version: u32,
+    registration: AcmeAccount,
+    private_key_pem: String,
+}
+
+fn storage_key_account_snapshot(issuer: &str, email: &str) -> String {
+    format!(
+        "{}/_certon/account.v1.key",
+        account_key_prefix(issuer, &normalise_email(email))
+    )
+}
+
+fn validate_account(mut account: AcmeAccount, key_pem: String) -> Result<AcmeAccount> {
+    let key = decode_private_key_pem(&key_pem)
+        .map_err(|e| AcmeError::Account(format!("could not decode account's private key: {e}")))?;
+    account.private_key_pem = key_pem;
+    account.key_type = key.key_type();
+    Ok(account)
+}
+
 // ---------------------------------------------------------------------------
 // Account operations
 // ---------------------------------------------------------------------------
@@ -199,35 +220,45 @@ pub async fn get_account(
     let reg_key = storage_key_user_reg(&issuer_key, email);
     let pk_key = storage_key_user_private_key(&issuer_key, email);
 
-    // Load registration JSON.
-    let reg_bytes = match storage.load(&reg_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => return Ok(None),
-        Err(e) => return Err(e),
+    match storage
+        .load(&storage_key_account_snapshot(&issuer_key, email))
+        .await
+    {
+        Ok(bytes) => {
+            let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
+                .map_err(|e| AcmeError::Account(format!("invalid account snapshot: {e}")))?;
+            if snapshot.version != 1 {
+                return Err(
+                    AcmeError::Account("unsupported account snapshot version".into()).into(),
+                );
+            }
+            return Ok(Some(validate_account(
+                snapshot.registration,
+                snapshot.private_key_pem,
+            )?));
+        }
+        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
+        Err(error) => return Err(error),
+    }
+    let mut legacy = Vec::new();
+    for key in [&reg_key, &pk_key] {
+        legacy.push(match storage.load(key).await {
+            Ok(bytes) => Some(bytes),
+            Err(crate::error::Error::Storage(StorageError::NotFound(_))) => None,
+            Err(error) => return Err(error),
+        });
+    }
+    let (reg_bytes, key_bytes) = match (legacy.remove(0), legacy.remove(0)) {
+        (None, None) => return Ok(None),
+        (Some(reg), Some(key)) => (reg, key),
+        _ => return Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
     };
-
-    // Load private key PEM.
-    let key_bytes = match storage.load(&pk_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    // Deserialise registration.
-    let mut account: AcmeAccount = serde_json::from_slice(&reg_bytes).map_err(|e| {
+    let registration = serde_json::from_slice(&reg_bytes).map_err(|e| {
         AcmeError::Account(format!("failed to deserialise account registration: {e}"))
     })?;
-
-    // Decode and attach the private key PEM.
-    let pem_str = String::from_utf8(key_bytes)
+    let key_pem = String::from_utf8(key_bytes)
         .map_err(|e| AcmeError::Account(format!("account private key is not valid UTF-8: {e}")))?;
-
-    // Validate that the PEM can actually be decoded.
-    let private_key = decode_private_key_pem(&pem_str)
-        .map_err(|e| AcmeError::Account(format!("could not decode account's private key: {e}")))?;
-
-    account.private_key_pem = pem_str;
-    account.key_type = private_key.key_type();
+    let account = validate_account(registration, key_pem)?;
 
     debug!(
         email = email,
@@ -240,10 +271,9 @@ pub async fn get_account(
 
 /// Save an ACME account to storage transactionally.
 ///
-/// Persists both the registration JSON and the private key PEM as separate
-/// storage entries. If either write fails, any already-written entry is
-/// rolled back (deleted) on a best-effort basis to keep the storage
-/// consistent.
+/// Publishes registration and private key together in a versioned, private
+/// snapshot. Failed or cancelled publication exposes a complete old or new
+/// account, never metadata paired with another generation's private key.
 pub async fn save_account(
     storage: &dyn Storage,
     ca_url: &str,
@@ -252,26 +282,16 @@ pub async fn save_account(
     let email = get_primary_contact(account);
     let issuer_key = crate::storage::issuer_key(ca_url);
 
-    // Serialise registration (without the private key, which is #[serde(skip)]).
-    let reg_bytes = serde_json::to_vec_pretty(account).map_err(|e| {
-        AcmeError::Account(format!("failed to serialise account registration: {e}"))
-    })?;
-
-    let reg_key = storage_key_user_reg(&issuer_key, &email);
-    let pk_key = storage_key_user_private_key(&issuer_key, &email);
-
-    // Store registration JSON.
-    storage.store(&reg_key, &reg_bytes).await?;
-
-    // Store private key PEM; roll back the registration JSON on failure.
-    if let Err(e) = storage
-        .store(&pk_key, account.private_key_pem.as_bytes())
-        .await
-    {
-        // Best-effort rollback of the registration JSON.
-        let _ = storage.delete(&reg_key).await;
-        return Err(e);
-    }
+    let snapshot = AccountSnapshot {
+        version: 1,
+        registration: account.clone(),
+        private_key_pem: account.private_key_pem.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| AcmeError::Account(format!("failed to serialise account snapshot: {e}")))?;
+    storage
+        .store(&storage_key_account_snapshot(&issuer_key, &email), &bytes)
+        .await?;
 
     debug!(
         email = %email,
@@ -369,8 +389,18 @@ pub async fn delete_account_locally(
     let reg_key = storage_key_user_reg(&issuer_key, &email);
     let pk_key = storage_key_user_private_key(&issuer_key, &email);
 
-    storage.delete(&reg_key).await?;
-    storage.delete(&pk_key).await?;
+    // Remove legacy resources first to prevent resurrection after a partial
+    // deletion. The current snapshot remains usable until the final delete.
+    for key in [
+        reg_key,
+        pk_key,
+        storage_key_account_snapshot(&issuer_key, &email),
+    ] {
+        match storage.delete(&key).await {
+            Ok(()) | Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
+        }
+    }
 
     debug!(
         email = %email,
@@ -383,9 +413,9 @@ pub async fn delete_account_locally(
 
 /// Find the email address of the most recently modified account for a given CA.
 ///
-/// Lists all entries under the accounts prefix for the given CA URL,
-/// stats each entry to find the most recently modified one, and returns
-/// the email address encoded in its storage path.
+/// Enumerates account directories and ranks their authoritative snapshot's
+/// modification time. Legacy accounts use the newer registration/key file
+/// timestamp. Parent directory timestamps do not track snapshot overwrites.
 ///
 /// Returns `Ok(None)` if no accounts exist for the given CA. The
 /// `"default"` placeholder (used for accounts with no email) is filtered
@@ -411,11 +441,6 @@ pub async fn most_recent_account_email(
     let mut best_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     for entry in &entries {
-        let info = match storage.stat(entry).await {
-            Ok(info) => info,
-            Err(_) => continue,
-        };
-
         // Extract the email component from the key path -- it is the last
         // segment of the entry key (which is a directory name under users/).
         let email_part = entry.rsplit('/').next().unwrap_or("").to_string();
@@ -425,14 +450,58 @@ pub async fn most_recent_account_email(
             continue;
         }
 
-        let dominated = best_modified.is_some_and(|bm| info.modified <= bm);
+        let info = match storage.stat(entry).await {
+            Ok(info) => info,
+            Err(crate::error::Error::Storage(StorageError::NotFound(_))) => continue,
+            Err(error) => return Err(error),
+        };
+        if info.is_terminal {
+            continue;
+        }
+
+        let Some(modified) = account_modified(storage, &ik, &email_part).await? else {
+            continue;
+        };
+        let dominated = best_modified.is_some_and(|bm| modified <= bm);
         if !dominated {
-            best_modified = Some(info.modified);
+            best_modified = Some(modified);
             best_email = Some(email_part);
         }
     }
 
     Ok(best_email)
+}
+
+async fn account_asset_modified(
+    storage: &dyn Storage,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    match storage.stat(key).await {
+        Ok(info) if info.is_terminal => Ok(Some(info.modified)),
+        Ok(_) => Err(AcmeError::Account(format!("account resource is not a file: {key}")).into()),
+        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn account_modified(
+    storage: &dyn Storage,
+    issuer: &str,
+    email: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if let Some(modified) =
+        account_asset_modified(storage, &storage_key_account_snapshot(issuer, email)).await?
+    {
+        return Ok(Some(modified));
+    }
+    let registration =
+        account_asset_modified(storage, &storage_key_user_reg(issuer, email)).await?;
+    let key = account_asset_modified(storage, &storage_key_user_private_key(issuer, email)).await?;
+    match (registration, key) {
+        (Some(registration), Some(key)) => Ok(Some(registration.max(key))),
+        (None, None) => Ok(None),
+        _ => Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
+    }
 }
 
 /// Find an ACME account whose private key PEM matches `key_pem`.
@@ -484,11 +553,16 @@ pub async fn get_account_by_key(
 /// Checks [`most_recent_account_email`] and returns the email if found.
 /// This is a convenience wrapper for use in flows that need to discover
 /// the email associated with a previously-registered account.
+/// Storage failures are logged; use [`most_recent_account_email`] when the
+/// caller needs the error returned.
 pub async fn discover_email(storage: &dyn Storage, ca_url: &str) -> Option<String> {
-    most_recent_account_email(storage, ca_url)
-        .await
-        .ok()
-        .flatten()
+    match most_recent_account_email(storage, ca_url).await {
+        Ok(email) => email,
+        Err(error) => {
+            warn!(%error, "failed to discover stored ACME account email");
+            None
+        }
+    }
 }
 
 /// Build a lock key name for ACME account registration.
@@ -581,6 +655,311 @@ fn atty_is_terminal() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_modified(path: &std::path::Path, seconds: u64) {
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES and FILE_FLAG_BACKUP_SEMANTICS also allow
+            // setting directory timestamps without relying on timer precision.
+            std::fs::OpenOptions::new()
+                .access_mode(0x0100)
+                .custom_flags(0x02000000)
+                .open(path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_discovery_uses_latest_snapshot_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let ca = "https://acme.example.com/directory";
+        let issuer = crate::storage::issuer_key(ca);
+        let mut a = new_account("a@example.com", KeyType::EcdsaP256).unwrap();
+        let b = new_account("b@example.com", KeyType::EcdsaP256).unwrap();
+        save_account(&storage, ca, &a).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(account_key_prefix(&issuer, "a@example.com")),
+            1_700_000_000,
+        );
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "a@example.com")),
+            1_700_000_000,
+        );
+        save_account(&storage, ca, &b).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(account_key_prefix(&issuer, "b@example.com")),
+            1_700_001_000,
+        );
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "b@example.com")),
+            1_700_001_000,
+        );
+        a.status = "updated".into();
+        save_account(&storage, ca, &a).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "a@example.com")),
+            1_700_002_000,
+        );
+        // A newer default account must still be excluded.
+        let default = new_account("", KeyType::EcdsaP256).unwrap();
+        save_account(&storage, ca, &default).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "")),
+            1_700_003_000,
+        );
+        assert_eq!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a@example.com")
+        );
+        assert_eq!(
+            discover_email(&storage, ca).await.as_deref(),
+            Some("a@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn account_discovery_mixes_legacy_and_authoritative_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let ca = "https://acme.example.com/directory";
+        let issuer = crate::storage::issuer_key(ca);
+        let a = new_account("a@example.com", KeyType::EcdsaP256).unwrap();
+        let b = new_account("b@example.com", KeyType::EcdsaP256).unwrap();
+        let reg = storage_key_user_reg(&issuer, "a@example.com");
+        let key = storage_key_user_private_key(&issuer, "a@example.com");
+        storage
+            .store(&reg, &serde_json::to_vec(&a).unwrap())
+            .await
+            .unwrap();
+        storage
+            .store(&key, a.private_key_pem.as_bytes())
+            .await
+            .unwrap();
+        set_modified(&directory.path().join(&reg), 1_700_000_000);
+        set_modified(&directory.path().join(&key), 1_700_002_000);
+        set_modified(
+            &directory
+                .path()
+                .join(account_key_prefix(&issuer, "a@example.com")),
+            1_700_000_000,
+        );
+        save_account(&storage, ca, &b).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "b@example.com")),
+            1_700_001_000,
+        );
+        set_modified(
+            &directory
+                .path()
+                .join(account_key_prefix(&issuer, "b@example.com")),
+            1_700_001_000,
+        );
+        assert_eq!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a@example.com")
+        );
+        // Once A has a snapshot, its old legacy files no longer determine age.
+        save_account(&storage, ca, &a).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "a@example.com")),
+            1_699_999_000,
+        );
+        assert_eq!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("b@example.com")
+        );
+        assert_eq!(
+            discover_email(&storage, ca).await.as_deref(),
+            Some("b@example.com")
+        );
+    }
+
+    struct StatFailure<'a> {
+        storage: &'a dyn Storage,
+        key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for StatFailure<'_> {
+        async fn stat(&self, key: &str) -> Result<crate::storage::KeyInfo> {
+            if key == self.key {
+                return Err(crate::Error::Other("stat is unavailable".into()));
+            }
+            self.storage.stat(key).await
+        }
+        async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.storage.store(key, value).await
+        }
+        async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            self.storage.load(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.storage.delete(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.storage.exists(key).await
+        }
+        async fn list(&self, prefix: &str, recursive: bool) -> Result<Vec<String>> {
+            self.storage.list(prefix, recursive).await
+        }
+        async fn lock(&self, name: &str) -> Result<()> {
+            self.storage.lock(name).await
+        }
+        async fn unlock(&self, name: &str) -> Result<()> {
+            self.storage.unlock(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn account_discovery_propagates_snapshot_directory_and_legacy_stat_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let ca = "https://acme.example.com/directory";
+        let issuer = crate::storage::issuer_key(ca);
+        let account = new_account("a@example.com", KeyType::EcdsaP256).unwrap();
+        save_account(&storage, ca, &account).await.unwrap();
+        let snapshot = storage_key_account_snapshot(&issuer, "a@example.com");
+        let registration = storage_key_user_reg(&issuer, "a@example.com");
+        let key = storage_key_user_private_key(&issuer, "a@example.com");
+        storage
+            .store(&registration, &serde_json::to_vec(&account).unwrap())
+            .await
+            .unwrap();
+        storage
+            .store(&key, account.private_key_pem.as_bytes())
+            .await
+            .unwrap();
+        let default = new_account("", KeyType::EcdsaP256).unwrap();
+        save_account(&storage, ca, &default).await.unwrap();
+        let excluded = StatFailure {
+            storage: &storage,
+            key: account_key_prefix(&issuer, ""),
+        };
+        assert_eq!(
+            most_recent_account_email(&excluded, ca)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a@example.com")
+        );
+        for fault in [
+            account_key_prefix(&issuer, "a@example.com"),
+            snapshot.clone(),
+        ] {
+            let failure = StatFailure {
+                storage: &storage,
+                key: fault,
+            };
+            let error = most_recent_account_email(&failure, ca).await.unwrap_err();
+            assert!(error.to_string().contains("stat is unavailable"));
+            assert!(discover_email(&failure, ca).await.is_none());
+        }
+        storage.delete(&snapshot).await.unwrap();
+        for fault in [registration, key] {
+            let failure = StatFailure {
+                storage: &storage,
+                key: fault,
+            };
+            assert!(
+                most_recent_account_email(&failure, ca)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stat is unavailable")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_discovery_skips_unknown_entries_but_rejects_incomplete_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let ca = "https://acme.example.com/directory";
+        let issuer = crate::storage::issuer_key(ca);
+        let users = format!("{}/users", crate::storage::acme_ca_prefix(&issuer));
+        storage
+            .store(&format!("{users}/unrelated.txt"), b"not an account")
+            .await
+            .unwrap();
+        std::fs::create_dir_all(
+            directory
+                .path()
+                .join(account_key_prefix(&issuer, "empty@example.com")),
+        )
+        .unwrap();
+        assert!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let account = new_account("a@example.com", KeyType::EcdsaP256).unwrap();
+        let registration = storage_key_user_reg(&issuer, "a@example.com");
+        storage
+            .store(&registration, &serde_json::to_vec(&account).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete legacy")
+        );
+        // A present but invalid snapshot must not silently fall back to legacy.
+        storage
+            .store(
+                &storage_key_user_private_key(&issuer, "a@example.com"),
+                account.private_key_pem.as_bytes(),
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(
+            directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "a@example.com")),
+        )
+        .unwrap();
+        assert!(
+            most_recent_account_email(&storage, ca)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not a file")
+        );
+    }
 
     // -- normalise_email ---------------------------------------------------
 

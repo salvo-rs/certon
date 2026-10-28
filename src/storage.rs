@@ -18,7 +18,8 @@
 //! # Key path layout
 //!
 //! ```text
-//! certificates/<issuer>/<domain>/<domain>.crt   -- certificate PEM
+//! certificates/<issuer>/<domain>/_certon/resource.v1.key -- complete private snapshot
+//! certificates/<issuer>/<domain>/<domain>.crt   -- legacy certificate PEM
 //! certificates/<issuer>/<domain>/<domain>.key   -- private key PEM
 //! certificates/<issuer>/<domain>/<domain>.json  -- metadata sidecar
 //! ocsp/<domain>-<hash>                          -- OCSP staple
@@ -45,7 +46,9 @@ use crate::error::{Error, Result, StorageError};
 /// Implementations **must** be safe for concurrent use and should block until
 /// the requested operation is complete. For example, [`Storage::load`] should
 /// always return the value from the most recent [`Storage::store`] call for a
-/// given key, and concurrent calls to [`Storage::store`] must not corrupt data.
+/// given key. A single-value store must publish atomically: concurrent readers,
+/// cancellation and a crash may observe the old or new value, never a partial
+/// value. Certificate and account snapshots rely on this guarantee.
 ///
 /// This is not a streaming API and is not suitable for very large values.
 #[async_trait]
@@ -124,10 +127,9 @@ pub trait Storage: Send + Sync {
 /// the two by hand means every early return, every `?`, every panic and every
 /// cancellation is a place the lock can be left held.
 ///
-/// Cancellation is the one that bites. A lock backed by [`FileStorage`] is
-/// kept alive by a background task that refreshes its timestamp, so a lock
-/// nobody released is not stale — it is refreshed for as long as the process
-/// runs, and no instance anywhere in the cluster can take it again.
+/// Cancellation can otherwise strand a lock for the lifetime of the process.
+/// [`FileStorage`] owns an OS lock through an open handle, and other backends
+/// may maintain distributed leases until explicitly released.
 ///
 /// Dropping this releases the lock. Because releasing is asynchronous and
 /// `Drop` is not, the release is spawned; call [`release`](Self::release) to
@@ -496,9 +498,9 @@ impl StorageKeys {
 /// key, the list of Subject Alternative Names, issuer-specific metadata, and
 /// the issuer key that determines the storage path.
 ///
-/// Note that `certificate_pem` and `private_key_pem` are marked
-/// `#[serde(skip)]` because they are stored as separate files in storage
-/// rather than inline in the JSON metadata sidecar.
+/// Standalone serialization omits `certificate_pem` and `private_key_pem` to
+/// preserve the legacy metadata format. Persistence stores these fields beside
+/// the metadata inside one complete private snapshot.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CertificateResource {
     /// The Subject Alternative Names on the certificate.
@@ -559,74 +561,53 @@ impl CertificateResource {
 // Transactional store / load helpers
 // ---------------------------------------------------------------------------
 
-/// A key-value pair for use in [`store_tx`].
-struct KeyValue {
-    key: String,
-    value: Vec<u8>,
+/// The complete resource is published as one value. The `.key` suffix tells
+/// file backends that this JSON contains a secret and needs private permissions.
+pub(crate) fn site_snapshot_key(issuer: &str, domain: &str) -> String {
+    format!(
+        "{}/_certon/resource.v1.key",
+        certs_site_prefix(issuer, domain)
+    )
 }
 
-/// Store all key-value pairs transactionally: if any single store fails, the
-/// previously-stored entries in this batch are rolled back (deleted).
-async fn store_tx(storage: &dyn Storage, items: &[KeyValue]) -> Result<()> {
-    for (i, kv) in items.iter().enumerate() {
-        if let Err(e) = storage.store(&kv.key, &kv.value).await {
-            // Roll back everything stored so far (best effort).
-            for prev in items[..i].iter().rev() {
-                let _ = storage.delete(&prev.key).await;
-            }
-            return Err(e);
-        }
-    }
-    Ok(())
+#[derive(Serialize, Deserialize)]
+struct CertificateSnapshot {
+    version: u32,
+    metadata: CertificateResource,
+    certificate_pem: Vec<u8>,
+    private_key_pem: Vec<u8>,
 }
 
-/// Store a [`CertificateResource`] transactionally.
-///
-/// The private key, certificate PEM, and JSON metadata are all written
-/// atomically — if any write fails, those that succeeded are rolled back
-/// (best effort). The storage keys are derived from `issuer_key` and the
-/// certificate's [`CertificateResource::names_key`].
-///
-/// # Errors
-///
-/// Returns a [`StorageError`] if any of the three writes fail. On partial
-/// failure the already-written keys are deleted in reverse order.
+/// Publish a complete, versioned certificate snapshot in one atomic store.
+/// Failure or cancellation cannot mix a new key with an old certificate.
+/// Legacy files remain readable but are not rewritten during renewal.
 pub async fn store_certificate(
     storage: &dyn Storage,
     issuer_key: &str,
     cert: &CertificateResource,
 ) -> Result<()> {
-    let cert_key_name = cert.names_key();
-
-    let meta_bytes = serde_json::to_vec_pretty(cert).map_err(|e| {
+    let snapshot = CertificateSnapshot {
+        version: 1,
+        metadata: cert.clone(),
+        certificate_pem: cert.certificate_pem.clone(),
+        private_key_pem: cert.private_key_pem.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| {
         Error::Storage(StorageError::Serialize(format!(
             "encoding certificate metadata: {e}"
         )))
     })?;
 
-    let items = [
-        KeyValue {
-            key: site_private_key(issuer_key, &cert_key_name),
-            value: cert.private_key_pem.clone(),
-        },
-        KeyValue {
-            key: site_cert_key(issuer_key, &cert_key_name),
-            value: cert.certificate_pem.clone(),
-        },
-        KeyValue {
-            key: site_meta_key(issuer_key, &cert_key_name),
-            value: meta_bytes,
-        },
-    ];
-
-    store_tx(storage, &items).await
+    storage
+        .store(&site_snapshot_key(issuer_key, &cert.names_key()), &bytes)
+        .await
 }
 
 /// Load a [`CertificateResource`] from storage.
 ///
-/// Reads the private key, certificate PEM, and metadata JSON from the
-/// appropriate storage keys and assembles them into a single
-/// [`CertificateResource`].
+/// Prefers the complete atomic snapshot. If no snapshot exists, reads the
+/// legacy private key, certificate PEM and metadata sidecar. A malformed
+/// snapshot is an error, never a reason to resurrect an older legacy value.
 ///
 /// # Errors
 ///
@@ -637,6 +618,26 @@ pub async fn load_certificate(
     issuer_key: &str,
     domain: &str,
 ) -> Result<CertificateResource> {
+    match storage.load(&site_snapshot_key(issuer_key, domain)).await {
+        Ok(bytes) => {
+            let mut snapshot: CertificateSnapshot =
+                serde_json::from_slice(&bytes).map_err(|e| {
+                    StorageError::Deserialize(format!("decoding certificate snapshot: {e}"))
+                })?;
+            if snapshot.version != 1 {
+                return Err(StorageError::Deserialize(
+                    "unsupported certificate snapshot version".into(),
+                )
+                .into());
+            }
+            snapshot.metadata.certificate_pem = snapshot.certificate_pem;
+            snapshot.metadata.private_key_pem = snapshot.private_key_pem;
+            snapshot.metadata.issuer_key = issuer_key.to_owned();
+            return Ok(snapshot.metadata);
+        }
+        Err(Error::Storage(StorageError::NotFound(_))) => {}
+        Err(error) => return Err(error),
+    }
     let key_bytes = storage.load(&site_private_key(issuer_key, domain)).await?;
     let cert_bytes = storage.load(&site_cert_key(issuer_key, domain)).await?;
     let meta_bytes = storage.load(&site_meta_key(issuer_key, domain)).await?;
