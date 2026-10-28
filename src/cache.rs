@@ -352,6 +352,33 @@ impl CacheState {
         }
         let hash = cert.hash.clone();
         if let Some(existing) = self.certificates.get_mut(&hash) {
+            if cert.managed && !existing.certificate.managed {
+                let old_names = existing.certificate.names.clone();
+                let current = Arc::make_mut(&mut existing.certificate);
+                current.managed = true;
+                current.issuer_key = cert.issuer_key.clone();
+                // A manager puts its canonical store alias first. Preserve
+                // that order for maintenance while retaining the existing
+                // signing key, tags and OCSP state (including sticky Revoked).
+                current.names = cert.names.clone();
+                existing.managed_index = Some(self.managed_hashes.len());
+                self.managed_hashes.push(hash.clone());
+                for name in old_names {
+                    let name = name.to_lowercase();
+                    if let Some(hashes) = self.index.get_mut(&name) {
+                        hashes.retain(|candidate| candidate != &hash);
+                        if hashes.is_empty() {
+                            self.index.remove(&name);
+                        }
+                    }
+                }
+                for name in &current.names {
+                    let hashes = self.index.entry(name.to_lowercase()).or_default();
+                    if !hashes.contains(&hash) {
+                        hashes.push(hash.clone());
+                    }
+                }
+            }
             for tag in &cert.tags {
                 if !existing.certificate.tags.contains(tag) {
                     Arc::make_mut(&mut existing.certificate)
@@ -360,7 +387,7 @@ impl CacheState {
                 }
             }
             events.push(CacheEvent::Updated {
-                names: cert.names,
+                names: existing.certificate.names.clone(),
                 hash,
             });
             return;
@@ -479,6 +506,9 @@ impl CertCache {
     }
 
     /// Add a certificate, merging tags if the hash is already present.
+    /// A managed input takes over an unmanaged entry's management metadata and
+    /// name order atomically, retaining its signing key and OCSP state. Repeated
+    /// imports cannot downgrade an entry that is already managed.
     /// Signing keys are prepared once, outside the cache lock. Quarantined
     /// leaves are ignored; Result-returning unmanaged helpers report rejection.
     pub async fn add(&self, cert: Certificate) {
@@ -1531,6 +1561,124 @@ mod tests {
         assert_eq!(cache.count().await, 1);
         assert!(cache.get_by_hash("unmanaged").await.is_some());
         assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn same_hash_management_promotion_updates_indices_without_downgrading() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = CertCache::new(CacheOptions::default());
+        cache
+            .add(make_cert(&["other.example.com"], "other", true))
+            .await;
+        let mut original = make_cert(&["old-alias.example.com", "example.com"], "promoted", false);
+        original.tags = vec!["operator".into()];
+        cache.add(original).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&cache);
+        let observed = calls.clone();
+        cache
+            .set_options(CacheOptions {
+                on_event: Some(Arc::new(move |event| {
+                    if let CacheEvent::Updated { hash, names } = event {
+                        let cache = weak.upgrade().unwrap();
+                        // A callback must be able to re-enter both reads and writes,
+                        // and observe metadata and the pool already in agreement.
+                        let state = cache
+                            .state
+                            .try_write()
+                            .expect("promotion callback ran under cache lock");
+                        let entry = &state.certificates[&hash];
+                        assert!(entry.certificate.managed);
+                        assert_eq!(entry.certificate.issuer_key, "managed-ca");
+                        assert_eq!(entry.certificate.names, names);
+                        assert_eq!(state.managed_hashes.len(), 2);
+                        assert_eq!(state.managed_hashes[entry.managed_index.unwrap()], hash);
+                        assert!(!state.index.contains_key("old-alias.example.com"));
+                        drop(state);
+                        let _ = cache.resolve("example.com");
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    }
+                })),
+                ..Default::default()
+            })
+            .await;
+        let mut managed = make_cert(&["example.com", "www.example.com"], "promoted", true);
+        managed.issuer_key = "managed-ca".into();
+        managed.tags = vec!["managed".into()];
+        cache.add(managed.clone()).await;
+        cache.add(managed).await;
+        let mut stale = make_cert(&["wrong.example.com"], "promoted", false);
+        stale.issuer_key = "unmanaged-import".into();
+        stale.tags = vec!["reimport".into()];
+        cache.add(stale).await;
+        let cert = cache.get_by_hash("promoted").await.unwrap();
+        assert!(cert.managed);
+        assert_eq!(cert.issuer_key, "managed-ca");
+        assert_eq!(cert.names, vec!["example.com", "www.example.com"]);
+        assert_eq!(cert.tags, vec!["operator", "managed", "reimport"]);
+        assert!(cache.get_by_name("old-alias.example.com").await.is_none());
+        assert!(cache.get_by_name("wrong.example.com").await.is_none());
+        assert_eq!(
+            cache.get_by_name("www.example.com").await.unwrap().hash,
+            "promoted"
+        );
+        assert_eq!(
+            cache.state.read().unwrap().index["example.com"],
+            vec!["promoted"]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_cache_indices(&cache);
+        cache.remove("other").await; // Exercise the promoted entry's moved back-reference.
+        assert_cache_indices(&cache);
+        cache.remove("promoted").await;
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn same_hash_management_promotion_preserves_ocsp_and_quarantine() {
+        use crate::ocsp::OcspStatus;
+        for status in [OcspStatus::Good, OcspStatus::Revoked] {
+            let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+            let cert = Certificate::from_pem(
+                generated.cert.pem().as_bytes(),
+                generated.signing_key.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+            let leaf_hash = crate::storage::certificate_leaf_hash(&cert).unwrap();
+            let hash = cert.hash.clone();
+            let cache = CertCache::new(CacheOptions::default());
+            cache.add(cert.clone()).await;
+            let response = (status == OcspStatus::Good).then(|| vec![1, 2, 3]);
+            cache
+                .update_ocsp_if_present(&hash, Some(status), response.clone())
+                .await
+                .unwrap();
+            let before = cache.resolve("example.com").unwrap().key;
+            let mut incoming = cert;
+            incoming.managed = true;
+            incoming.issuer_key = "managed-ca".into();
+            incoming.ocsp_status = Some(OcspStatus::Good);
+            incoming.ocsp_response = Some(vec![9, 9, 9]);
+            cache.add(incoming.clone()).await;
+            let current = cache.get_by_hash(&hash).await.unwrap();
+            assert!(current.managed);
+            assert_eq!(current.ocsp_status, Some(status));
+            assert_eq!(current.ocsp_response, response);
+            let after = cache.resolve("example.com").unwrap().key;
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "metadata promotion replaced the existing serving key/staple"
+            );
+            assert_eq!(after.ocsp, response);
+            assert_eq!(cache.maintenance_snapshot(true).len(), 1);
+            assert_cache_indices(&cache);
+            cache.deny_revoked_certificate(&leaf_hash).await;
+            cache.add(incoming).await;
+            assert!(cache.get_by_hash(&hash).await.is_none());
+            assert!(cache.resolve("example.com").is_none());
+            assert!(cache.maintenance_snapshot(true).is_empty());
+            assert_cache_indices(&cache);
+        }
     }
 
     #[tokio::test]
