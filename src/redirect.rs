@@ -280,24 +280,75 @@ fn parse_redirect_request(request: &[u8], handler: &HttpsRedirectHandler) -> Res
         .windows(4)
         .position(|bytes| bytes == b"\r\n\r\n")
         .ok_or_else(bad_request)?;
-    let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| bad_request())?;
-    let mut lines = headers.split("\r\n");
-    let mut first = lines.next().ok_or_else(bad_request)?.split_whitespace();
-    let _method = first.next().ok_or_else(bad_request)?;
-    let path = first.next().ok_or_else(bad_request)?;
-    let version = first.next().ok_or_else(bad_request)?;
-    if first.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+    let headers = &request[..header_end];
+    // Require CRLF framing; splitting a bare LF must not create another field.
+    if headers.iter().enumerate().any(|(index, byte)| match byte {
+        b'\r' => headers.get(index + 1) != Some(&b'\n'),
+        b'\n' => index == 0 || headers[index - 1] != b'\r',
+        _ => false,
+    }) {
         return Err(bad_request());
     }
+    let is_token = |value: &[u8]| {
+        !value.is_empty()
+            && value
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(byte))
+    };
+    let mut lines = headers
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line));
+    let mut first = lines
+        .next()
+        .ok_or_else(bad_request)?
+        .split(|byte| *byte == b' ');
+    let method = first.next().ok_or_else(bad_request)?;
+    let target = first.next().ok_or_else(bad_request)?;
+    let version = first.next().ok_or_else(bad_request)?;
+    if !is_token(method)
+        || target.is_empty()
+        || target.iter().any(u8::is_ascii_control)
+        || first.next().is_some()
+        || (version != b"HTTP/1.0" && version != b"HTTP/1.1")
+    {
+        return Err(bad_request());
+    }
+    let path = std::str::from_utf8(target).map_err(|_| bad_request())?;
     let mut host = None;
     for line in lines {
-        let (name, value) = line.split_once(':').ok_or_else(bad_request)?;
-        if name.eq_ignore_ascii_case("host") {
+        let separator = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(bad_request)?;
+        let (name, value) = line.split_at(separator);
+        let value = &value[1..];
+        // HTTP field values allow obs-text and horizontal tabs, but not other
+        // controls, DEL or folded lines. Unused fields need no UTF-8 decoding.
+        if !is_token(name)
+            || value
+                .iter()
+                .any(|byte| matches!(byte, 0..=8 | 10..=31 | 127))
+        {
+            return Err(bad_request());
+        }
+        if name.eq_ignore_ascii_case(b"host") {
             if host.is_some() {
                 return Err(bad_request());
             }
-            host = Some(value.trim());
+            let value = value.trim_ascii();
+            if !value.is_ascii() {
+                return Err(bad_request());
+            }
+            let value = std::str::from_utf8(value).map_err(|_| bad_request())?;
+            // Validate the required field even with a canonical redirect host.
+            // URL parsing also rejects invalid bracketed IPs and port overflow.
+            normalize_host(value)?;
+            url::Url::parse(&format!("http://{value}/")).map_err(|_| bad_request())?;
+            host = Some(value);
         }
+    }
+    if version == b"HTTP/1.1" && host.is_none() {
+        return Err(bad_request());
     }
     handler.try_redirect_url(host.unwrap_or(""), path)
 }
@@ -716,6 +767,53 @@ mod tests {
             parse_redirect_request(request, &handler).unwrap(),
             "https://example.com/upload"
         );
+    }
+
+    #[tokio::test]
+    async fn unrelated_obs_text_headers_are_independent_of_fragmentation() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Label: \xff\t\x80\r\n\r\n";
+        let obs_text = request.iter().position(|byte| *byte == 0xff).unwrap();
+        for split in [
+            None,
+            Some(obs_text),
+            Some(obs_text + 1),
+            Some(request.len() - 2),
+        ] {
+            let response = fragmented_response(request, split, 8192).await;
+            assert!(
+                response.starts_with("HTTP/1.1 301"),
+                "split={split:?}: {response}"
+            );
+            assert!(response.contains("Location: https://example.com/\r\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_required_fields_and_control_bytes_are_still_rejected() {
+        let requests: &[&[u8]] = &[
+            b"G\xffT / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET /\xff HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: examp\xffle.com\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com bad\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [not-an-ip]\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com:65536\r\n\r\n",
+            b"GET / HTTP/1.1\r\nX-Label: present\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: evil.com\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX Label: value\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Label: value\0bad\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nX-Label: value\rbad\r\n\r\n",
+            b"GET / HTTP/1.1\nHost: example.com\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n X-Fold: value\r\n\r\n",
+        ];
+        for request in requests {
+            for split in [None, Some(request.len() / 2)] {
+                let response = fragmented_response(request, split, 8192).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 400"),
+                    "request={request:?} split={split:?}: {response}"
+                );
+            }
+        }
     }
 
     #[test]
