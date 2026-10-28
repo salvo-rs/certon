@@ -34,6 +34,13 @@ its metadata remains available for maintenance. A usable sibling can still
 serve the name. `replace_revoked` controls automatic replacement, not permission
 to serve a known revoked leaf.
 
+`Certificate::with_ocsp` responses are verified when entering the cache. Their
+verified status and serving deadline come from the same parse; a signed Revoked
+response quarantines the cached entry even during duplicate publication or a
+concurrent Good refresh. Invalid or unsigned bytes cannot assert revocation.
+Already-verified status supplied by `staple_ocsp` remains authoritative after
+that function clears the non-Good response bytes.
+
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
 Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`
