@@ -813,6 +813,30 @@ impl CertManager {
         domain: &str,
     ) -> Result<Certificate> {
         let cert = Self::parse_managed_certificate(resource, domain)?;
+        self.validate_certificate_status(cert, domain).await
+    }
+
+    /// Response contents are attributable to the issuer. Keep these checks
+    /// separate from fallible revocation/storage reads so only bad responses
+    /// cause issuer fallback.
+    fn parse_issued_certificate(
+        resource: &CertificateResource,
+        domain: &str,
+        requested_names: &[String],
+    ) -> Result<Certificate> {
+        let cert = Self::parse_managed_certificate(resource, domain)?;
+        for name in requested_names {
+            Self::validate_certificate_name(&cert, name)?;
+        }
+        Self::validate_certificate_time(&cert, domain)?;
+        Ok(cert)
+    }
+
+    async fn validate_certificate_status(
+        &self,
+        cert: Certificate,
+        domain: &str,
+    ) -> Result<Certificate> {
         if let Some(leaf_hash) = crate::storage::certificate_leaf_hash(&cert)
             && crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash)
                 .await?
@@ -1089,6 +1113,7 @@ impl CertManager {
         // Try each issuer in order.
         let mut last_err: Option<Error> = None;
         let mut issuer_keys = Vec::new();
+        let mut issuer_errors = Vec::new();
 
         for (i, issuer) in issuers.iter().enumerate() {
             let ik = issuer.issuer_key();
@@ -1113,12 +1138,20 @@ impl CertManager {
                         issuer_key: ik.clone(),
                     };
 
-                    let cert = self.validated_certificate(&cert_res, domain).await?;
-                    if cert.expired() || cert.not_before > chrono::Utc::now() {
-                        return Err(Error::Config(
-                            "issuer returned a certificate outside its validity period".into(),
-                        ));
-                    }
+                    let cert = match Self::parse_issued_certificate(&cert_res, domain, &domains) {
+                        Ok(cert) => cert,
+                        Err(error) => {
+                            error!(domain, issuer = %ik, %error, "issuer returned an unusable certificate");
+                            issuer_errors.push(
+                                serde_json::json!({"issuer": ik, "error": error.to_string()}),
+                            );
+                            last_err = Some(error);
+                            continue;
+                        }
+                    };
+                    // Backend failures must abort the transaction, even when
+                    // another issuer could return a different certificate.
+                    let cert = self.validate_certificate_status(cert, domain).await?;
                     self.certificates.save(&ik, &cert_res).await?;
                     self.publish_certificate(cert, domain).await?;
 
@@ -1146,6 +1179,7 @@ impl CertManager {
                         error = %e,
                         "could not get certificate from issuer"
                     );
+                    issuer_errors.push(serde_json::json!({"issuer": ik, "error": e.to_string()}));
                     last_err = Some(e);
                 }
             }
@@ -1158,6 +1192,7 @@ impl CertManager {
                 "identifier": domain,
                 "renewal": false,
                 "issuers": issuer_keys,
+                "issuer_errors": issuer_errors,
             }),
         );
 
@@ -1381,6 +1416,7 @@ impl CertManager {
         // Try each issuer.
         let mut last_err: Option<Error> = None;
         let mut issuer_keys = Vec::new();
+        let mut issuer_errors = Vec::new();
 
         for issuer in &issuers {
             let ik = issuer.issuer_key();
@@ -1398,15 +1434,19 @@ impl CertManager {
                         issuer_key: ik.clone(),
                     };
 
-                    let cert = self.validated_certificate(&new_cert_res, domain).await?;
-                    for name in &domains {
-                        Self::validate_certificate_name(&cert, name)?;
-                    }
-                    if cert.expired() || cert.not_before > chrono::Utc::now() {
-                        return Err(Error::Config(
-                            "issuer returned a certificate outside its validity period".into(),
-                        ));
-                    }
+                    let cert = match Self::parse_issued_certificate(&new_cert_res, domain, &domains)
+                    {
+                        Ok(cert) => cert,
+                        Err(error) => {
+                            error!(domain, issuer = %ik, %error, "issuer returned an unusable renewal certificate");
+                            issuer_errors.push(
+                                serde_json::json!({"issuer": ik, "error": error.to_string()}),
+                            );
+                            last_err = Some(error);
+                            continue;
+                        }
+                    };
+                    let cert = self.validate_certificate_status(cert, domain).await?;
                     self.certificates.save(&ik, &new_cert_res).await?;
                     self.publish_certificate(cert, domain).await?;
 
@@ -1433,6 +1473,7 @@ impl CertManager {
                         error = %e,
                         "could not renew certificate from issuer"
                     );
+                    issuer_errors.push(serde_json::json!({"issuer": ik, "error": e.to_string()}));
                     last_err = Some(e);
                 }
             }
@@ -1445,6 +1486,7 @@ impl CertManager {
                 "identifier": domain,
                 "renewal": true,
                 "issuers": issuer_keys,
+                "issuer_errors": issuer_errors,
             }),
         );
 

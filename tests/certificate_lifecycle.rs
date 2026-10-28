@@ -65,6 +65,13 @@ impl CertIssuer for TestIssuer {
             self.entered.notify_one();
             std::future::pending::<()>().await;
         }
+        if mode == 8 {
+            return Ok(IssuedCertificate {
+                certificate_pem: b"not a certificate".to_vec(),
+                private_key_pem: Vec::new(),
+                metadata: serde_json::Value::Null,
+            });
+        }
         let (_, csr) =
             x509_parser::certification_request::X509CertificationRequest::from_der(csr).unwrap();
         let public = CsrPublicKey(
@@ -86,6 +93,11 @@ impl CertIssuer for TestIssuer {
         params.serial_number = Some((serial as u64).into());
         params.not_before = rcgen::date_time_ymd(self.not_before_year, 1, 1);
         params.not_after = rcgen::date_time_ymd(self.not_after_year, 1, 1);
+        if mode == 6 {
+            params.not_before = rcgen::date_time_ymd(chrono::Utc::now().year() + 1, 1, 1);
+        } else if mode == 7 {
+            params.not_after = rcgen::date_time_ymd(chrono::Utc::now().year() - 1, 1, 1);
+        }
         let cert = if mode == 1 {
             params
                 .signed_by(&KeyPair::generate().unwrap(), &self.ca)
@@ -321,6 +333,332 @@ fn multiple_issuer_manager(
             ..Default::default()
         })
         .build()
+}
+
+#[tokio::test]
+async fn invalid_issuer_results_fall_back_for_obtain_and_renew() {
+    for renewal in [false, true] {
+        // Transport errors remain a control for the existing fallback path.
+        for mode in [1, 2, 6, 7, 8, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+            let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+            let primary = Arc::new(TestIssuer::new());
+            let mut fallback = TestIssuer::new();
+            fallback.name = "fallback-ca";
+            fallback.not_before_year = chrono::Utc::now().year() - 1;
+            let fallback = Arc::new(fallback);
+            let manager = multiple_issuer_manager(
+                storage.clone(),
+                certificates.clone(),
+                vec![primary.clone(), fallback.clone()],
+            );
+            let old = if renewal {
+                let resource = certificate_resource(&primary).await;
+                certificates
+                    .save(&primary.issuer_key(), &resource)
+                    .await
+                    .unwrap();
+                manager.cache_certificate("example.com").await.unwrap();
+                Some(resource.certificate_pem)
+            } else {
+                None
+            };
+            primary.calls.store(0, Ordering::SeqCst);
+            primary.mode.store(mode, Ordering::SeqCst);
+            let result = if renewal {
+                manager.renew("example.com", true).await
+            } else {
+                manager.obtain("example.com").await
+            };
+            result.unwrap_or_else(|error| {
+                panic!("renewal={renewal}, mode={mode}: fallback not attempted: {error}")
+            });
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+            let served = handshake(&manager, &fallback).await;
+            let primary_stored = certificates
+                .load(&primary.issuer_key(), "example.com")
+                .await
+                .unwrap()
+                .map(|resource| resource.certificate_pem);
+            assert_eq!(
+                primary_stored, old,
+                "unusable primary response was persisted"
+            );
+            let restarted =
+                multiple_issuer_manager(storage, certificates, vec![primary, fallback.clone()]);
+            restarted.cache_certificate("example.com").await.unwrap();
+            assert_eq!(handshake(&restarted, &fallback).await, served);
+        }
+    }
+}
+
+#[tokio::test]
+async fn incomplete_renewal_coverage_tries_the_next_issuer() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+    let primary = Arc::new(TestIssuer::new());
+    let mut fallback = TestIssuer::new();
+    fallback.name = "fallback-ca";
+    fallback.not_before_year = chrono::Utc::now().year() - 1;
+    let fallback = Arc::new(fallback);
+    let resource = resource_with_names(
+        &primary,
+        &["a.example.com", "b.example.com"],
+        "a.example.com",
+    )
+    .await;
+    certificates
+        .save(&primary.issuer_key(), &resource)
+        .await
+        .unwrap();
+    let manager = multiple_issuer_manager(
+        storage.clone(),
+        certificates.clone(),
+        vec![primary.clone(), fallback.clone()],
+    );
+    manager.cache_certificate("a.example.com").await.unwrap();
+    primary.mode.store(5, Ordering::SeqCst);
+    manager.renew("a.example.com", true).await.unwrap();
+    assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        handshake_for_domain(&manager, &fallback, "a.example.com").await,
+        handshake_for_domain(&manager, &fallback, "b.example.com").await
+    );
+    assert_eq!(
+        certificates
+            .load(&primary.issuer_key(), "a.example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .certificate_pem,
+        resource.certificate_pem
+    );
+    let restarted = multiple_issuer_manager(storage, certificates, vec![primary, fallback.clone()]);
+    restarted.cache_certificate("a.example.com").await.unwrap();
+    handshake_for_domain(&restarted, &fallback, "b.example.com").await;
+}
+
+#[tokio::test]
+async fn all_invalid_issuer_responses_report_each_failure_without_replacing_credentials() {
+    for renewal in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+        let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+        let primary = Arc::new(TestIssuer::new());
+        let mut secondary = TestIssuer::new();
+        secondary.name = "secondary-ca";
+        let secondary = Arc::new(secondary);
+        let mut manager = multiple_issuer_manager(
+            storage,
+            certificates.clone(),
+            vec![primary.clone(), secondary.clone()],
+        );
+        let old = if renewal {
+            certificates
+                .save(&primary.issuer_key(), &certificate_resource(&primary).await)
+                .await
+                .unwrap();
+            Some(manager.cache_certificate("example.com").await.unwrap())
+        } else {
+            None
+        };
+        primary.calls.store(0, Ordering::SeqCst);
+        primary.mode.store(1, Ordering::SeqCst);
+        secondary.mode.store(2, Ordering::SeqCst);
+        let failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = failures.clone();
+        manager.on_event = Some(Arc::new(move |event, data| {
+            if event == certon::manager::EVENT_CERT_FAILED {
+                recorded.lock().unwrap().push(data.clone());
+            }
+            Ok(())
+        }));
+        let error = if renewal {
+            manager.renew("example.com", true).await
+        } else {
+            manager.obtain("example.com").await
+        }
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not cover example.com"),
+            "{error}"
+        );
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.calls.load(Ordering::SeqCst), 1);
+        let failures = failures.lock().unwrap().clone();
+        assert_eq!(failures.len(), 1);
+        let errors = failures[0]["issuer_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0]["issuer"], primary.issuer_key());
+        assert!(errors[0]["error"].as_str().unwrap().contains("mismatch"));
+        assert_eq!(errors[1]["issuer"], secondary.issuer_key());
+        assert!(
+            errors[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("does not cover")
+        );
+        assert!(
+            certificates
+                .load(&secondary.issuer_key(), "example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if let Some(old) = old {
+            assert_eq!(
+                handshake(&manager, &primary).await,
+                old.cert_chain[0].as_ref()
+            );
+        } else {
+            assert!(manager.cache.get_all().await.is_empty());
+        }
+    }
+}
+
+struct IssuanceFaultStorage {
+    inner: FileStorage,
+    mode: AtomicU8,
+    allowed_marker: std::sync::Mutex<Option<String>>,
+}
+#[async_trait::async_trait]
+impl Storage for IssuanceFaultStorage {
+    async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+        if self.mode.load(Ordering::SeqCst) == 3 && key.ends_with("/_certon/resource.v1.key") {
+            return Err(certon::Error::Config(
+                "custom certificate store write failed".into(),
+            ));
+        }
+        self.inner.store(key, value).await
+    }
+    async fn load(&self, key: &str) -> Result<Vec<u8>> {
+        let mode = self.mode.load(Ordering::SeqCst);
+        if key.starts_with("revocations/")
+            && self.allowed_marker.lock().unwrap().as_deref() != Some(key)
+        {
+            match mode {
+                1 => {
+                    return Err(certon::Error::Config(
+                        "custom revocation backend failed".into(),
+                    ));
+                }
+                2 => return Ok(b"malformed marker".to_vec()),
+                4 => {
+                    return Err(certon::error::StorageError::Io(std::io::Error::other(
+                        "revocation backend offline",
+                    ))
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        self.inner.load(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn list(&self, path: &str, recursive: bool) -> Result<Vec<String>> {
+        self.inner.list(path, recursive).await
+    }
+    async fn stat(&self, key: &str) -> Result<certon::storage::KeyInfo> {
+        self.inner.stat(key).await
+    }
+    async fn lock(&self, name: &str) -> Result<()> {
+        self.inner.lock(name).await
+    }
+    async fn unlock(&self, name: &str) -> Result<()> {
+        self.inner.unlock(name).await
+    }
+}
+
+#[tokio::test]
+async fn issuance_backend_failures_abort_fallback_even_for_custom_validation_error_types() {
+    use std::fmt::Write;
+
+    use sha2::Digest;
+    for renewal in [false, true] {
+        for fault in [1, 2, 3, 4] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = Arc::new(IssuanceFaultStorage {
+                inner: FileStorage::new(directory.path()),
+                mode: AtomicU8::new(0),
+                allowed_marker: std::sync::Mutex::new(None),
+            });
+            let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+            let primary = Arc::new(TestIssuer::new());
+            let mut secondary = TestIssuer::new();
+            secondary.name = "secondary-ca";
+            let secondary = Arc::new(secondary);
+            let mut third = TestIssuer::new();
+            third.name = "third-ca";
+            let third = Arc::new(third);
+            let manager = multiple_issuer_manager(
+                storage.clone(),
+                certificates.clone(),
+                vec![primary.clone(), secondary.clone(), third.clone()],
+            );
+            let old = if renewal {
+                certificates
+                    .save(&primary.issuer_key(), &certificate_resource(&primary).await)
+                    .await
+                    .unwrap();
+                let old = manager.cache_certificate("example.com").await.unwrap();
+                let mut hash = String::new();
+                for byte in sha2::Sha256::digest(old.cert_chain[0].as_ref()) {
+                    write!(&mut hash, "{byte:02x}").unwrap();
+                }
+                *storage.allowed_marker.lock().unwrap() = Some(format!("revocations/{hash}.json"));
+                Some(old)
+            } else {
+                None
+            };
+            primary.calls.store(0, Ordering::SeqCst);
+            primary.mode.store(2, Ordering::SeqCst);
+            storage.mode.store(fault, Ordering::SeqCst);
+            let error = if renewal {
+                manager.renew("example.com", true).await
+            } else {
+                manager.obtain("example.com").await
+            }
+            .unwrap_err();
+            let expected = match fault {
+                1 => "custom revocation backend failed",
+                2 => "invalid revocation marker",
+                3 => "custom certificate store write failed",
+                4 => "revocation backend offline",
+                _ => unreachable!(),
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(secondary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                third.calls.load(Ordering::SeqCst),
+                0,
+                "backend failure was treated as a bad CA response"
+            );
+            assert!(
+                certificates
+                    .load(&secondary.issuer_key(), "example.com")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            if let Some(old) = old {
+                assert_eq!(
+                    handshake(&manager, &primary).await,
+                    old.cert_chain[0].as_ref()
+                );
+            } else {
+                assert!(manager.cache.get_all().await.is_empty());
+            }
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
