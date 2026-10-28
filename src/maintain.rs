@@ -443,8 +443,8 @@ async fn check_renewals_with_policy(
 }
 
 /// Check storage for a certificate that may have been renewed by another
-/// instance. If the stored certificate does NOT need renewal, reload it
-/// into the cache and return `true` (meaning: skip local renewal).
+/// instance. Only reload a currently valid certificate that does not need
+/// renewal, returning `true` to skip local issuance.
 async fn try_reload_from_storage(
     cache: &CertCache,
     certificates: &dyn CertStore,
@@ -479,6 +479,8 @@ async fn try_reload_from_storage(
     // If the stored cert has a different hash AND does not need renewal,
     // it was renewed by another instance — reload it into the cache.
     if stored_cert.hash != cached_cert.hash
+        && stored_cert.not_before <= chrono::Utc::now()
+        && !stored_cert.expired()
         && !stored_cert.needs_renewal(renewal_ratio)
         && crate::manager::CertManager::covers_certificate(&stored_cert, cached_cert)
     {

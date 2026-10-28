@@ -1114,6 +1114,7 @@ impl CertManager {
     /// held during the operation. With `force = true`, a quarantined stored
     /// resource may supply the SANs for a replacement with a new leaf; its old
     /// leaf remains blocked and cannot be republished.
+    /// A stored certificate outside its validity period always needs renewal.
     pub async fn renew(&self, domain: &str, force: bool) -> Result<()> {
         self.renew_cert(domain, force, true).await
     }
@@ -1188,7 +1189,12 @@ impl CertManager {
         } else {
             self.validated_certificate(&cert_res, domain).await?
         };
-        let needs_renewal = cert.needs_renewal(self.policy.renewal_window_ratio);
+        // Maintenance may have rejected an unusable storage replacement. Do
+        // not let its normal renewal callback republish a future certificate
+        // through the "already renewed" shortcut below.
+        let needs_renewal = cert.not_before > chrono::Utc::now()
+            || cert.expired()
+            || cert.needs_renewal(self.policy.renewal_window_ratio);
 
         // Renew all actual DNS/IP SANs, including managed overlaps that would
         // otherwise lose coverage. CNs, URIs and email SANs are not TLS names.
