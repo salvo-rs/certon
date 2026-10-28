@@ -71,6 +71,7 @@ pub mod rate_limiter;
 pub mod redirect;
 pub mod solvers;
 pub mod storage;
+mod tls_listener;
 #[cfg(feature = "zerossl")]
 pub mod zerossl_issuer;
 
@@ -107,6 +108,7 @@ pub use solvers::{Dns01Solver, DnsProvider};
 pub use storage::{
     CertificateResource, KeyInfo, LockGuard, Storage, StorageKeys, acquire, try_acquire,
 };
+pub use tls_listener::{BoundTlsListener, TlsListenerLimits};
 #[cfg(feature = "zerossl")]
 pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 
@@ -190,33 +192,10 @@ pub async fn listen_with_agreement(
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Other(format!("failed to bind listener on {addr}: {e}")))?;
-    Ok(BoundTlsListener {
+    Ok(BoundTlsListener::new(
         listener,
-        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)),
-    })
-}
-
-/// A bound socket and its TLS configuration, kept alive together.
-pub struct BoundTlsListener {
-    pub listener: tokio::net::TcpListener,
-    pub acceptor: tokio_rustls::TlsAcceptor,
-}
-
-impl BoundTlsListener {
-    /// Accept a TCP connection and complete its TLS handshake.
-    pub async fn accept(
-        &self,
-    ) -> std::io::Result<(
-        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
-        std::net::SocketAddr,
-    )> {
-        let (stream, address) = self.listener.accept().await?;
-        Ok((self.acceptor.accept(stream).await?, address))
-    }
-
-    pub fn into_parts(self) -> (tokio::net::TcpListener, tokio_rustls::TlsAcceptor) {
-        (self.listener, self.acceptor)
-    }
+        tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)),
+    ))
 }
 
 /// Obtain or load certificates for `domains`, and wait for it.
