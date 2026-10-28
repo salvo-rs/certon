@@ -413,6 +413,13 @@ impl std::fmt::Debug for CertCache {
 }
 
 impl CacheState {
+    fn has_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
+        self.matching(name).into_iter().any(|entry| {
+            entry.leaf_hash.as_deref() == Some(leaf_hash)
+                && entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+        })
+    }
+
     /// A verified response authenticates the leaf even when duplicate admission
     /// will retain this entry's existing signing key and management metadata.
     fn record_verified_revocation(&mut self, hash: &str) -> Option<CacheEvent> {
@@ -902,6 +909,18 @@ impl CertCache {
                 .into());
             }
             // Reject invalid managed input before removing the old working leaf.
+            // A different chain can authenticate the same revoked leaf. Check
+            // managed admission at its write-lock linearization point, including
+            // revocation received while preparation awaited AIA. This uses only
+            // existing matching metadata, without a global deny-list policy.
+            if let (Some(domain), Some(leaf_hash)) = (domain, leaf_hash.as_deref())
+                && state.has_ocsp_revoked_leaf(domain, leaf_hash)
+            {
+                cert.ocsp_status = Some(crate::ocsp::OcspStatus::Revoked);
+                cert.ocsp_response = None;
+                key.key = key.unstapled.clone();
+                key.validity = None;
+            }
             // `staple_ocsp` already clears raw bytes after verifying Revoked;
             // preserve that trusted status as well as evidence parsed here.
             if cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked) {
@@ -1112,6 +1131,29 @@ impl CertCache {
     /// they do not parse DER, verify signatures, or copy the signing key.
     pub(crate) fn resolve(&self, name: &str) -> Option<CachedKey> {
         self.resolve_with_filter(name, |_| true).selected
+    }
+
+    /// Read local OCSP evidence for this managed identity across alternate
+    /// chains. A different replacement leaf remains independent.
+    pub(crate) fn has_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .has_ocsp_revoked_leaf(name, leaf_hash)
+    }
+
+    /// Lifecycle shortcuts must not treat an unusable Must-Staple or revoked
+    /// entry as already managed successfully. Keep the same serving boundary
+    /// without parsing DER or cloning private keys.
+    pub(crate) fn has_usable_managed_certificate(&self, name: &str) -> bool {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        state.matching(name).into_iter().any(|entry| {
+            entry.certificate.managed
+                && entry.certificate.not_before <= now
+                && now < entry.certificate.not_after
+                && entry.serving_key(now).is_some()
+        })
     }
 
     /// An unusable Must-Staple key can request recovery without being offered
@@ -1785,8 +1827,9 @@ pub(crate) mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // 0..3: existing OCSP/leaf quarantine races; 4..5: incoming verified
         // Revoked versus a concurrent Good update (replace/add); 6..9:
-        // Must-Staple readiness versus Unknown/Revoked or duplicate admission.
-        for scenario in 0..10 {
+        // Must-Staple readiness versus Unknown/Revoked or duplicate admission;
+        // 10: a different chain for the same leaf becomes revoked during AIA.
+        for scenario in 0..11 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/issuer", listener.local_addr().unwrap());
             let issuer_key = rcgen::KeyPair::generate().unwrap();
@@ -1832,6 +1875,13 @@ pub(crate) mod tests {
             let incoming_leaf = crate::storage::certificate_leaf_hash(&cert).unwrap();
             let old = if matches!(scenario, 0 | 3 | 4 | 5 | 6 | 7 | 8) {
                 cert.clone()
+            } else if scenario == 10 {
+                // Omitting the trusted root is a valid alternate TLS chain.
+                let mut full_chain = cert.clone();
+                full_chain.cert_chain.push(ca_cert.der().clone());
+                full_chain.hash =
+                    crate::certificates::hash_certificate_chain(&full_chain.cert_chain);
+                full_chain
             } else {
                 signed_certificate().0
             };
@@ -1909,6 +1959,12 @@ pub(crate) mod tests {
                 }
                 1 => cache.deny_revoked_certificate(&incoming_leaf).await,
                 2 => cache.deny_revoked_certificate(&old_leaf).await,
+                10 => {
+                    cache
+                        .update_ocsp_if_present(&old_hash, Some(expected_status), None)
+                        .await
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
             let current_key = cache
@@ -1921,6 +1977,19 @@ pub(crate) mod tests {
             release.notify_one();
             let result = worker.await.unwrap();
             server.await.unwrap();
+            if scenario == 10 {
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::Cert(crate::error::CertError::OcspFailed(_)))
+                ));
+                assert!(cache.get_by_hash(&hash).await.is_none());
+                assert_eq!(
+                    cache.get_by_hash(&old_hash).await.unwrap().ocsp_status,
+                    Some(crate::ocsp::OcspStatus::Revoked)
+                );
+                assert!(cache.resolve("ocsp.example.com").is_none());
+                continue;
+            }
             if matches!(scenario, 4 | 5) {
                 result.unwrap();
                 let current = cache.get_by_hash(&hash).await.unwrap();

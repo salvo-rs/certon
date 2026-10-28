@@ -604,7 +604,7 @@ impl CertManager {
     /// This is the primary entry point for certificate management. For each
     /// domain:
     ///
-    /// 1. Skip currently valid managed entries, removing stale managed entries.
+    /// 1. Skip currently usable managed entries.
     /// 2. Load storage resources and cache only certificates currently valid.
     /// 3. If not found in storage -- obtain a new certificate from the configured issuers.
     /// 4. If loaded from storage, check if renewal is needed and renew if so.
@@ -706,19 +706,9 @@ impl CertManager {
         Ok(())
     }
 
-    /// Time-invalid managed entries still track their SANs for maintenance and
-    /// renewal. TLS selection excludes them without discarding that metadata.
-    async fn has_current_managed_certificate(&self, domain: &str) -> bool {
-        self.cache
-            .all_matching_certificates(domain)
-            .await
-            .iter()
-            .any(|cert| cert.managed && Self::validate_certificate_time(cert, domain).is_ok())
-    }
-
     /// Manage a single domain name.
     async fn manage_one(&self, domain: &str, r#async: bool) -> Result<()> {
-        if self.has_current_managed_certificate(domain).await {
+        if self.cache.has_usable_managed_certificate(domain) {
             return Ok(());
         }
 
@@ -732,13 +722,53 @@ impl CertManager {
         // Planning may read an expired/future resource for its SANs and issuer,
         // but those credentials must not be published before renewal succeeds.
         match self.load_stored_certificate(domain).await {
-            Ok(cert) => {
+            Ok(mut cert) => {
                 let current = Self::validate_certificate_time(&cert, domain).is_ok();
-                let revoked = matches!(cert.ocsp_status, Some(OcspStatus::Revoked));
-                let needs_action =
+                let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
+                let cached_revoked = leaf_hash
+                    .as_deref()
+                    .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
+                let mut revoked =
+                    matches!(cert.ocsp_status, Some(OcspStatus::Revoked)) || cached_revoked;
+                if cached_revoked {
+                    cert.ocsp_status = Some(OcspStatus::Revoked);
+                    cert.ocsp_response = None;
+                }
+                let mut needs_action =
                     !current || cert.needs_renewal(self.policy.renewal_window_ratio) || revoked;
                 if current {
-                    self.cache_loaded_certificate(cert, domain).await?;
+                    // Readiness for serving is distinct from eligibility for
+                    // renewal. Apply admission first so a known revocation
+                    // still quarantines the existing same-hash entry, then let
+                    // a due/OCSP-revoked Must-Staple leaf supply renewal metadata
+                    // even when its required Good response is unavailable.
+                    let must_staple = crate::ocsp::requires_ocsp_staple(&cert)?;
+                    let hash = cert.hash.clone();
+                    let admission = self.cache_loaded_certificate(cert, domain).await;
+                    // Admission reconciles sticky state atomically. A stored
+                    // Good response may be older than a confirmed cache
+                    // revocation, including one received during preparation.
+                    let cached_revoked = leaf_hash
+                        .as_deref()
+                        .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
+                    if cached_revoked {
+                        revoked = true;
+                        // Close a revocation arriving after admission before
+                        // awaiting the CA; do not leave an admitted alternate
+                        // chain serving while a replacement is obtained.
+                        if admission.is_ok() {
+                            self.cache
+                                .update_ocsp_if_present(&hash, Some(OcspStatus::Revoked), None)
+                                .await;
+                        }
+                    }
+                    needs_action |= revoked;
+                    match admission {
+                        Ok(_) => {}
+                        Err(Error::Cert(CertError::OcspFailed(_)))
+                            if needs_action && must_staple => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 if needs_action {
                     if r#async {
@@ -1811,12 +1841,14 @@ mod tests {
 
     struct MemoryStorage {
         data: RwLock<HashMap<String, Vec<u8>>>,
+        fail_reads: std::sync::atomic::AtomicBool,
     }
 
     impl MemoryStorage {
         fn new() -> Self {
             Self {
                 data: RwLock::new(HashMap::new()),
+                fail_reads: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
@@ -1830,6 +1862,9 @@ mod tests {
         }
 
         async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            if self.fail_reads.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("injected storage read failure").into());
+            }
             let data = self.data.read().await;
             data.get(key)
                 .cloned()
@@ -1882,6 +1917,525 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    mod must_staple_recovery {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use x509_parser::prelude::FromDer;
+
+        use super::*;
+
+        const DOMAIN: &str = "ocsp.example.com";
+
+        struct CsrKey(Vec<u8>);
+        impl rcgen::PublicKeyData for CsrKey {
+            fn der_bytes(&self) -> &[u8] {
+                &self.0
+            }
+            fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+                &rcgen::PKCS_ECDSA_P256_SHA256
+            }
+        }
+
+        struct Issuer {
+            ca: rcgen::Issuer<'static, rcgen::KeyPair>,
+            root: rustls::pki_types::CertificateDer<'static>,
+            storage: Arc<MemoryStorage>,
+            calls: AtomicUsize,
+            unavailable: AtomicBool,
+        }
+
+        fn params(before: i64, after: i64, must_staple: bool) -> rcgen::CertificateParams {
+            let mut params = rcgen::CertificateParams::new(vec![DOMAIN.into()]).unwrap();
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            let date = |offset: i64| {
+                rcgen::date_time_ymd(1970, 1, 1)
+                    + Duration::from_secs((Utc::now().timestamp() + offset).try_into().unwrap())
+            };
+            params.not_before = date(before);
+            params.not_after = date(after);
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            if must_staple {
+                params
+                    .custom_extensions
+                    .push(rcgen::CustomExtension::from_oid_content(
+                        &[1, 3, 6, 1, 5, 5, 7, 1, 24],
+                        vec![0x30, 0x03, 0x02, 0x01, 0x05],
+                    ));
+            }
+            params
+        }
+
+        #[async_trait::async_trait]
+        impl CertIssuer for Issuer {
+            async fn issue(
+                &self,
+                csr: &[u8],
+                names: &[String],
+            ) -> Result<crate::IssuedCertificate> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.unavailable.load(Ordering::SeqCst) {
+                    return Err(Error::Config("recovery CA unavailable".into()));
+                }
+                let (_, csr) =
+                    x509_parser::certification_request::X509CertificationRequest::from_der(csr)
+                        .unwrap();
+                let public = CsrKey(
+                    csr.certification_request_info
+                        .subject_pki
+                        .subject_public_key
+                        .data
+                        .to_vec(),
+                );
+                let mut params = params(-60, 90 * 86400, true);
+                params.subject_alt_names = names
+                    .iter()
+                    .map(|name| rcgen::SanType::DnsName(name.clone().try_into().unwrap()))
+                    .collect();
+                let leaf = params.signed_by(&public, &self.ca).unwrap();
+                let chain = vec![leaf.der().clone(), self.root.clone()];
+                let response = crate::ocsp::tests::signed_response(
+                    &chain,
+                    self.ca.key(),
+                    0,
+                    Utc::now(),
+                    Utc::now() + chrono::Duration::hours(4),
+                );
+                self.storage
+                    .store(
+                        &crate::storage::ocsp_key(
+                            &names[0],
+                            &crate::certificates::hash_certificate_chain(&chain),
+                        ),
+                        &response,
+                    )
+                    .await?;
+                Ok(crate::IssuedCertificate {
+                    certificate_pem: format!(
+                        "{}{}",
+                        leaf.pem(),
+                        ::pem::encode(&::pem::Pem::new("CERTIFICATE", self.root.as_ref()))
+                    )
+                    .into_bytes(),
+                    private_key_pem: Vec::new(),
+                    metadata: serde_json::Value::Null,
+                })
+            }
+            fn issuer_key(&self) -> String {
+                "must-staple-recovery".into()
+            }
+        }
+
+        struct Fixture {
+            storage: Arc<MemoryStorage>,
+            store: Arc<crate::cert_store::tests::InMemory>,
+            issuer: Arc<Issuer>,
+            manager: Arc<CertManager>,
+            old: Certificate,
+            resource: CertificateResource,
+        }
+
+        impl Fixture {
+            async fn new(due: bool, status: Option<u8>, must_staple: bool) -> Self {
+                let storage = Arc::new(MemoryStorage::new());
+                let store = Arc::new(crate::cert_store::tests::InMemory::default());
+                let key = rcgen::KeyPair::generate().unwrap();
+                let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+                let root = ca.self_signed(&key).unwrap().der().clone();
+                let issuer = Arc::new(Issuer {
+                    ca: rcgen::Issuer::new(ca, key),
+                    root,
+                    storage: storage.clone(),
+                    calls: AtomicUsize::new(0),
+                    unavailable: AtomicBool::new(false),
+                });
+                let key = rcgen::KeyPair::generate().unwrap();
+                let leaf = params(
+                    if due { -80 * 86400 } else { -86400 },
+                    if due { 10 * 86400 } else { 89 * 86400 },
+                    must_staple,
+                )
+                .signed_by(&key, &issuer.ca)
+                .unwrap();
+                let resource = CertificateResource {
+                    sans: vec![DOMAIN.into()],
+                    certificate_pem: format!(
+                        "{}{}",
+                        leaf.pem(),
+                        ::pem::encode(&::pem::Pem::new("CERTIFICATE", issuer.root.as_ref()))
+                    )
+                    .into_bytes(),
+                    private_key_pem: key.serialize_pem().into_bytes(),
+                    issuer_key: issuer.issuer_key(),
+                    issuer_data: None,
+                };
+                store.save(&issuer.issuer_key(), &resource).await.unwrap();
+                let mut old =
+                    Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+                        .unwrap();
+                old.managed = true;
+                old.issuer_key = issuer.issuer_key();
+                assert_eq!(old.needs_renewal(1.0 / 3.0), due);
+                if let Some(status) = status {
+                    let response = crate::ocsp::tests::signed_response(
+                        &old.cert_chain,
+                        issuer.ca.key(),
+                        status,
+                        Utc::now(),
+                        Utc::now() + chrono::Duration::hours(4),
+                    );
+                    storage
+                        .store(&crate::storage::ocsp_key(DOMAIN, &old.hash), &response)
+                        .await
+                        .unwrap();
+                    old.ocsp_response = Some(response);
+                }
+                let manager = Arc::new(
+                    CertManager::builder()
+                        .storage(storage.clone())
+                        .certificates(store.clone())
+                        .issuers(vec![issuer.clone()])
+                        .background_retry_config(RetryConfig {
+                            max_retries: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                );
+                Self {
+                    storage,
+                    store,
+                    issuer,
+                    manager,
+                    old,
+                    resource,
+                }
+            }
+
+            async fn manage(&self, queued: bool) -> Result<()> {
+                if queued {
+                    self.manager.manage_in_background(&[DOMAIN.into()]).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.manager.job_queue.wait(&format!("manage_{DOMAIN}")),
+                    )
+                    .await
+                    .unwrap();
+                    Ok(())
+                } else {
+                    self.manager.manage(&[DOMAIN.into()]).await
+                }
+            }
+
+            async fn handshake(&self) -> Option<Vec<u8>> {
+                crate::install_default_crypto_provider();
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(self.issuer.root.clone()).unwrap();
+                let client = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                let (server_io, client_io) = tokio::io::duplex(16384);
+                let acceptor =
+                    tokio_rustls::TlsAcceptor::from(Arc::new(self.manager.server_config()));
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+                let (server, client) = tokio::join!(
+                    acceptor.accept(server_io),
+                    connector.connect(DOMAIN.try_into().unwrap(), client_io)
+                );
+                server.ok()?;
+                Some(client.ok()?.get_ref().1.peer_certificates()?[0].to_vec())
+            }
+        }
+
+        #[tokio::test]
+        async fn due_or_revoked_must_staple_recovers_from_cold_or_unusable_cached_state() {
+            for queued in [false, true] {
+                for (due, status, warm) in [
+                    (true, None, false),
+                    (false, Some(1), false),
+                    (true, None, true),
+                    (false, Some(1), true),
+                ] {
+                    let fixture = Fixture::new(due, status, true).await;
+                    if warm {
+                        fixture.manager.cache.add(fixture.old.clone()).await;
+                    }
+                    fixture.manage(queued).await.unwrap();
+                    assert_eq!(
+                        fixture.issuer.calls.load(Ordering::SeqCst),
+                        1,
+                        "queued={queued} due={due} status={status:?} warm={warm}"
+                    );
+                    let current = fixture.manager.cache.resolve(DOMAIN).unwrap();
+                    assert_ne!(current.hash, fixture.old.hash);
+                    assert!(current.key.ocsp.is_some());
+                    assert_eq!(
+                        fixture.handshake().await.unwrap(),
+                        current.key.cert[0].as_ref()
+                    );
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn cached_revocation_still_forces_recovery_when_storage_replays_fresh_good() {
+            for queued in [false, true] {
+                let fixture = Fixture::new(false, Some(0), true).await;
+                fixture.manager.cache.add(fixture.old.clone()).await;
+                fixture
+                    .manager
+                    .cache
+                    .update_ocsp_if_present(&fixture.old.hash, Some(OcspStatus::Revoked), None)
+                    .await
+                    .unwrap();
+                fixture.manage(queued).await.unwrap();
+                assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 1);
+                let current = fixture.manager.cache.resolve(DOMAIN).unwrap();
+                assert_ne!(current.hash, fixture.old.hash);
+                assert_eq!(
+                    fixture.handshake().await.unwrap(),
+                    current.key.cert[0].as_ref()
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn same_leaf_alternate_chain_does_not_republish_a_cached_revocation() {
+            let fixture = Fixture::new(false, Some(0), true).await;
+            fixture.manager.cache.add(fixture.old.clone()).await;
+            fixture
+                .manager
+                .cache
+                .update_ocsp_if_present(&fixture.old.hash, Some(OcspStatus::Revoked), None)
+                .await
+                .unwrap();
+            // Cross-sign the original issuer key under another root. Both
+            // chains authenticate exactly the same leaf and OCSP CertID.
+            let other_key = rcgen::KeyPair::generate().unwrap();
+            let mut other_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            other_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let other_root = other_params.self_signed(&other_key).unwrap();
+            let other_issuer = rcgen::Issuer::new(other_params, other_key);
+            let mut cross_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            cross_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            cross_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            let cross_signed = cross_params
+                .signed_by(fixture.issuer.ca.key(), &other_issuer)
+                .unwrap();
+            let resource = CertificateResource {
+                certificate_pem: format!(
+                    "{}{}{}",
+                    ::pem::encode(&::pem::Pem::new(
+                        "CERTIFICATE",
+                        fixture.old.cert_chain[0].as_ref()
+                    )),
+                    cross_signed.pem(),
+                    other_root.pem()
+                )
+                .into_bytes(),
+                ..fixture.resource.clone()
+            };
+            let alternate =
+                Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+                    .unwrap();
+            assert_ne!(alternate.hash, fixture.old.hash);
+            assert_eq!(
+                crate::storage::certificate_leaf_hash(&alternate),
+                crate::storage::certificate_leaf_hash(&fixture.old)
+            );
+            let response = crate::ocsp::tests::signed_response(
+                &alternate.cert_chain,
+                fixture.issuer.ca.key(),
+                0,
+                Utc::now(),
+                Utc::now() + chrono::Duration::hours(4),
+            );
+            assert_eq!(
+                crate::ocsp::parse_ocsp_response_for_cert_chain(&response, &alternate.cert_chain)
+                    .await
+                    .unwrap()
+                    .status,
+                OcspStatus::Good
+            );
+            fixture
+                .storage
+                .store(
+                    &crate::storage::ocsp_key(DOMAIN, &alternate.hash),
+                    &response,
+                )
+                .await
+                .unwrap();
+            fixture
+                .store
+                .save(&fixture.issuer.issuer_key(), &resource)
+                .await
+                .unwrap();
+            fixture.manage(false).await.unwrap();
+            assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 1);
+            let current = fixture.manager.cache.resolve(DOMAIN).unwrap();
+            assert_ne!(current.key.cert[0], fixture.old.cert_chain[0]);
+            assert_eq!(
+                fixture.handshake().await.unwrap(),
+                current.key.cert[0].as_ref()
+            );
+        }
+
+        #[tokio::test]
+        async fn cached_revocation_does_not_force_issue_for_a_different_healthy_stored_leaf() {
+            let fixture = Fixture::new(false, Some(0), true).await;
+            fixture.manager.cache.add(fixture.old.clone()).await;
+            fixture
+                .manager
+                .cache
+                .update_ocsp_if_present(&fixture.old.hash, Some(OcspStatus::Revoked), None)
+                .await
+                .unwrap();
+            let key = rcgen::KeyPair::generate().unwrap();
+            let leaf = params(-60, 90 * 86400, true)
+                .signed_by(&key, &fixture.issuer.ca)
+                .unwrap();
+            let resource = CertificateResource {
+                certificate_pem: format!(
+                    "{}{}",
+                    leaf.pem(),
+                    ::pem::encode(&::pem::Pem::new(
+                        "CERTIFICATE",
+                        fixture.issuer.root.as_ref()
+                    ))
+                )
+                .into_bytes(),
+                private_key_pem: key.serialize_pem().into_bytes(),
+                ..fixture.resource.clone()
+            };
+            let replacement =
+                Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+                    .unwrap();
+            let response = crate::ocsp::tests::signed_response(
+                &replacement.cert_chain,
+                fixture.issuer.ca.key(),
+                0,
+                Utc::now(),
+                Utc::now() + chrono::Duration::hours(4),
+            );
+            fixture
+                .storage
+                .store(
+                    &crate::storage::ocsp_key(DOMAIN, &replacement.hash),
+                    &response,
+                )
+                .await
+                .unwrap();
+            fixture
+                .store
+                .save(&fixture.issuer.issuer_key(), &resource)
+                .await
+                .unwrap();
+            fixture.manage(false).await.unwrap();
+            assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                fixture.handshake().await.unwrap(),
+                replacement.cert_chain[0].as_ref()
+            );
+            assert_eq!(
+                fixture
+                    .manager
+                    .cache
+                    .get_by_hash(&fixture.old.hash)
+                    .await
+                    .unwrap()
+                    .ocsp_status,
+                Some(OcspStatus::Revoked)
+            );
+        }
+
+        #[tokio::test]
+        async fn fresh_must_staple_without_good_response_does_not_issue() {
+            for (queued, warm) in [(false, false), (true, false), (false, true), (true, true)] {
+                let fixture = Fixture::new(false, None, true).await;
+                if warm {
+                    fixture.manager.cache.add(fixture.old.clone()).await;
+                }
+                let result = fixture.manage(queued).await;
+                if !queued {
+                    assert!(matches!(result, Err(Error::Cert(CertError::OcspFailed(_)))));
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 0);
+                assert!(fixture.handshake().await.is_none());
+                assert_eq!(
+                    fixture
+                        .store
+                        .load(&fixture.issuer.issuer_key(), DOMAIN)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .certificate_pem,
+                    fixture.resource.certificate_pem
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn due_must_staple_recovery_preserves_backend_marker_and_ca_errors() {
+            for fault in ["backend", "marker", "ca"] {
+                let fixture = Fixture::new(true, None, true).await;
+                match fault {
+                    "backend" => fixture.storage.fail_reads.store(true, Ordering::SeqCst),
+                    "marker" => crate::storage::store_revocation(
+                        fixture.storage.as_ref(),
+                        &crate::storage::certificate_leaf_hash(&fixture.old).unwrap(),
+                        true,
+                    )
+                    .await
+                    .unwrap(),
+                    "ca" => fixture.issuer.unavailable.store(true, Ordering::SeqCst),
+                    _ => unreachable!(),
+                }
+                let error = fixture.manage(false).await.unwrap_err();
+                assert!(
+                    match (&error, fault) {
+                        (Error::Storage(StorageError::Io(_)), "backend")
+                        | (Error::Cert(CertError::Revoked(_)), "marker") => true,
+                        (Error::Config(message), "ca") => message == "recovery CA unavailable",
+                        _ => false,
+                    },
+                    "fault={fault}: {error}"
+                );
+                assert_eq!(
+                    fixture.issuer.calls.load(Ordering::SeqCst),
+                    usize::from(fault == "ca")
+                );
+                assert!(fixture.handshake().await.is_none());
+                assert_eq!(
+                    fixture
+                        .store
+                        .load(&fixture.issuer.issuer_key(), DOMAIN)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .certificate_pem,
+                    fixture.resource.certificate_pem
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn serving_due_leaves_keep_the_foreground_managed_shortcut() {
+            for must_staple in [false, true] {
+                let fixture = Fixture::new(true, must_staple.then_some(0), must_staple).await;
+                fixture.manager.cache_certificate(DOMAIN).await.unwrap();
+                fixture.manage(false).await.unwrap();
+                assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    fixture.handshake().await.unwrap(),
+                    fixture.old.cert_chain[0].as_ref()
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn actual_must_staple_requires_good_ocsp_before_saving_or_publishing() {
