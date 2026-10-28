@@ -172,6 +172,17 @@ pub trait Revoker: Send + Sync {
     /// `cert_pem` is the PEM-encoded certificate (chain) to revoke.
     /// `reason` is the optional RFC 5280 revocation reason code (0–10).
     async fn revoke(&self, cert_pem: &[u8], reason: Option<u8>) -> Result<()>;
+
+    /// Revoke using the complete stored resource. Existing revokers continue
+    /// receiving PEM through the default implementation; REST issuers may use
+    /// `issuer_data` without changing the PEM contract of [`Self::revoke`].
+    async fn revoke_resource(
+        &self,
+        resource: &crate::CertificateResource,
+        reason: Option<u8>,
+    ) -> Result<()> {
+        self.revoke(&resource.certificate_pem, reason).await
+    }
 }
 
 // ---------------------------------------------------------------------------

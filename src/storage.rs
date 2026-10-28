@@ -22,6 +22,7 @@
 //! certificates/<issuer>/<domain>/<domain>.crt   -- legacy certificate PEM
 //! certificates/<issuer>/<domain>/<domain>.key   -- private key PEM
 //! certificates/<issuer>/<domain>/<domain>.json  -- metadata sidecar
+//! revocations/<leaf-hash>.json                 -- persistent revocation intent
 //! ocsp/<domain>-<hash>                          -- OCSP staple
 //! acme/<issuer>/users/<email>/...               -- ACME account data
 //! locks/<name>                                  -- distributed locks
@@ -653,6 +654,76 @@ pub async fn load_certificate(
     cert_res.issuer_key = issuer_key.to_owned();
 
     Ok(cert_res)
+}
+
+// Revocation intent is independent of the certificate store, so a failed
+// certificate deletion cannot make the same leaf usable on a later load.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RevocationMarker {
+    version: u32,
+    pub confirmed: bool,
+}
+
+pub(crate) fn certificate_leaf_hash(cert: &crate::Certificate) -> Option<String> {
+    cert.cert_chain
+        .first()
+        .map(|leaf| crate::certificates::hash_certificate_chain(std::slice::from_ref(leaf)))
+}
+
+pub(crate) fn resource_leaf_hash(resource: &CertificateResource) -> Result<String> {
+    let pem = std::str::from_utf8(&resource.certificate_pem)
+        .map_err(|error| Error::Config(format!("invalid certificate PEM: {error}")))?;
+    let chain: Vec<rustls::pki_types::CertificateDer<'static>> = pem::parse_many(pem)
+        .map_err(|error| Error::Config(format!("invalid certificate PEM: {error}")))?
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(|block| rustls::pki_types::CertificateDer::from(block.into_contents()))
+        .collect();
+    let leaf = chain
+        .first()
+        .ok_or_else(|| Error::Config("no certificate found for revocation".into()))?;
+    x509_parser::parse_x509_certificate(leaf.as_ref())
+        .map_err(|error| Error::Config(format!("invalid certificate for revocation: {error}")))?;
+    Ok(crate::certificates::hash_certificate_chain(
+        std::slice::from_ref(leaf),
+    ))
+}
+
+fn revocation_key(leaf_hash: &str) -> String {
+    format!("revocations/{leaf_hash}.json")
+}
+
+pub(crate) async fn load_revocation(
+    storage: &dyn Storage,
+    leaf_hash: &str,
+) -> Result<Option<RevocationMarker>> {
+    let bytes = match storage.load(&revocation_key(leaf_hash)).await {
+        Ok(bytes) => bytes,
+        Err(Error::Storage(StorageError::NotFound(_))) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let marker: RevocationMarker = serde_json::from_slice(&bytes).map_err(|error| {
+        StorageError::Deserialize(format!("invalid revocation marker: {error}"))
+    })?;
+    if marker.version != 1 {
+        return Err(
+            StorageError::Deserialize("unsupported revocation marker version".into()).into(),
+        );
+    }
+    Ok(Some(marker))
+}
+
+pub(crate) async fn store_revocation(
+    storage: &dyn Storage,
+    leaf_hash: &str,
+    confirmed: bool,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(&RevocationMarker {
+        version: 1,
+        confirmed,
+    })
+    .map_err(|error| StorageError::Serialize(format!("encoding revocation marker: {error}")))?;
+    storage.store(&revocation_key(leaf_hash), &bytes).await
 }
 
 // ---------------------------------------------------------------------------

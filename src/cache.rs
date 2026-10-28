@@ -221,9 +221,11 @@ pub struct CertCache {
 struct CacheState {
     certificates: HashMap<String, CachedCertificate>,
     index: HashMap<String, Vec<String>>,
+    revoked_leaf_hashes: HashSet<String>,
 }
 
 struct CachedCertificate {
+    leaf_hash: Option<String>,
     certificate: Certificate,
     key: Option<Arc<CertifiedKey>>,
 }
@@ -320,9 +322,16 @@ impl CacheState {
         &mut self,
         cert: Certificate,
         key: Option<Arc<CertifiedKey>>,
+        leaf_hash: Option<String>,
         options: &CacheOptions,
         events: &mut Vec<CacheEvent>,
     ) {
+        if leaf_hash
+            .as_ref()
+            .is_some_and(|hash| self.revoked_leaf_hashes.contains(hash))
+        {
+            return;
+        }
         let hash = cert.hash.clone();
         if let Some(existing) = self.certificates.get_mut(&hash) {
             for tag in &cert.tags {
@@ -363,6 +372,7 @@ impl CacheState {
         self.certificates.insert(
             hash,
             CachedCertificate {
+                leaf_hash,
                 certificate: cert,
                 key,
             },
@@ -450,16 +460,20 @@ impl CertCache {
     /// Signing keys are prepared once, outside the cache lock.
     pub async fn add(&self, cert: Certificate) {
         let key = cert_to_certified_key(&cert).ok();
+        let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
         let options = self
             .options
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut events = Vec::new();
-        self.state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .add(cert, key, &options, &mut events);
+        self.state.write().unwrap_or_else(|e| e.into_inner()).add(
+            cert,
+            key,
+            leaf_hash,
+            &options,
+            &mut events,
+        );
         dispatch_events(&options, events);
     }
 
@@ -521,6 +535,7 @@ impl CertCache {
     /// Replace metadata and the prebuilt serving key in one critical section.
     pub async fn replace(&self, old_hash: &str, new_cert: Certificate) {
         let key = cert_to_certified_key(&new_cert).ok();
+        let leaf_hash = crate::storage::certificate_leaf_hash(&new_cert);
         let options = self
             .options
             .read()
@@ -529,11 +544,45 @@ impl CertCache {
         let mut events = Vec::new();
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if leaf_hash
+                .as_ref()
+                .is_some_and(|hash| state.revoked_leaf_hashes.contains(hash))
+            {
+                return;
+            }
             if let Some(event) = state.remove(old_hash) {
                 events.push(event);
             }
-            state.add(new_cert, key, &options, &mut events);
+            state.add(new_cert, key, leaf_hash, &options, &mut events);
         }
+        dispatch_events(&options, events);
+    }
+
+    /// Irreversibly quarantine this leaf for the lifetime of this cache. A
+    /// stale loader or alternate chain cannot put it back after revocation.
+    pub(crate) async fn deny_revoked_certificate(&self, leaf_hash: &str) {
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let events = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            state.revoked_leaf_hashes.insert(leaf_hash.to_owned());
+            let hashes: Vec<_> = state
+                .certificates
+                .iter()
+                .filter(|(_, entry)| entry.leaf_hash.as_deref() == Some(leaf_hash))
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            hashes
+                .iter()
+                .filter_map(|hash| state.remove(hash))
+                .collect()
+        };
         dispatch_events(&options, events);
     }
 

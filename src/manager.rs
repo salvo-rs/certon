@@ -438,7 +438,7 @@ impl CertManager {
 impl CertManager {
     /// Build a lock key for a certificate operation on the given domain.
     fn lock_key(op: &str, domain: &str) -> String {
-        format!("{op}_{domain}")
+        format!("{op}_{}", domain.to_lowercase())
     }
 
     /// Check the certificate store, propagating backend failures.
@@ -454,8 +454,17 @@ impl CertManager {
     /// Select the newest valid resource across configured issuers. An older
     /// preferred CA must not shadow a certificate renewed through a fallback.
     async fn load_cert_resource_any_issuer(&self, domain: &str) -> Result<CertificateResource> {
+        self.load_cert_resource_for_operation(domain, false).await
+    }
+
+    async fn load_cert_resource_for_operation(
+        &self,
+        domain: &str,
+        allow_revoked: bool,
+    ) -> Result<CertificateResource> {
         let mut selected = None;
         let mut validation_errors = Vec::new();
+        let mut revoked = Vec::new();
         let now = chrono::Utc::now();
         for issuer in &self.issuers {
             let issuer_key = issuer.issuer_key();
@@ -469,7 +478,21 @@ impl CertManager {
                         continue;
                     }
                 };
+                let mut has_intent = false;
+                if let Some(leaf_hash) = crate::storage::certificate_leaf_hash(&cert) {
+                    has_intent = crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash)
+                        .await?
+                        .is_some();
+                    if has_intent {
+                        self.cache.deny_revoked_certificate(&leaf_hash).await;
+                        revoked.push(issuer_key);
+                        if !allow_revoked {
+                            continue;
+                        }
+                    }
+                }
                 let rank = (
+                    !has_intent,
                     cert.not_before <= now && !cert.expired(),
                     cert.not_before,
                     cert.not_after,
@@ -481,6 +504,12 @@ impl CertManager {
         }
         if let Some((_, resource)) = selected {
             Ok(resource)
+        } else if !revoked.is_empty() {
+            Err(crate::error::CertError::Revoked(format!(
+                "{domain}: persisted revocation intent for {}",
+                revoked.join(", ")
+            ))
+            .into())
         } else if !validation_errors.is_empty() {
             Err(Error::Config(format!(
                 "no valid certificate resource for '{domain}': {}",
@@ -711,6 +740,17 @@ impl CertManager {
         domain: &str,
     ) -> Result<Certificate> {
         let cert = Self::parse_managed_certificate(resource, domain)?;
+        if let Some(leaf_hash) = crate::storage::certificate_leaf_hash(&cert)
+            && crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash)
+                .await?
+                .is_some()
+        {
+            self.cache.deny_revoked_certificate(&leaf_hash).await;
+            return Err(crate::error::CertError::Revoked(format!(
+                "{domain}: persisted revocation intent"
+            ))
+            .into());
+        }
         Ok(self.staple_certificate(cert).await)
     }
 
@@ -1071,7 +1111,9 @@ impl CertManager {
     /// Loads the existing certificate from storage, checks if renewal is
     /// needed (unless `force` is `true`), generates a new key and CSR,
     /// and tries each configured issuer in order. A distributed lock is
-    /// held during the operation.
+    /// held during the operation. With `force = true`, a quarantined stored
+    /// resource may supply the SANs for a replacement with a new leaf; its old
+    /// leaf remains blocked and cannot be republished.
     pub async fn renew(&self, domain: &str, force: bool) -> Result<()> {
         self.renew_cert(domain, force, true).await
     }
@@ -1106,22 +1148,46 @@ impl CertManager {
         let lock_key = Self::lock_key(CERT_ISSUE_LOCK_OP, domain);
         let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
-        if interactive {
-            self.do_renew(domain, force).await
-        } else {
-            do_with_retry(&RetryConfig::default(), |_| self.do_renew(domain, force)).await
+        loop {
+            let resource = self.load_cert_resource_for_operation(domain, force).await?;
+            let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
+            // A custom CertStore may resolve multiple aliases to the same leaf.
+            // Hold only one leaf lock, after the domain lock, and re-read when
+            // a preceding operation replaced the resource while we waited.
+            let leaf_lock = acquire(
+                self.storage.clone(),
+                &format!("certificate_leaf_{leaf_hash}"),
+            )
+            .await?;
+            let current = self.load_cert_resource_for_operation(domain, force).await?;
+            if crate::storage::resource_leaf_hash(&current)? != leaf_hash {
+                drop(leaf_lock);
+                continue;
+            }
+            return if interactive {
+                self.do_renew(domain, force).await
+            } else {
+                do_with_retry(&RetryConfig::default(), |_| self.do_renew(domain, force)).await
+            };
         }
     }
 
     /// The inner renewal logic, called once per attempt.
     async fn do_renew(&self, domain: &str, force: bool) -> Result<()> {
         // Load the existing certificate resource from storage.
-        let cert_res = self.load_cert_resource_any_issuer(domain).await?;
+        let cert_res = self.load_cert_resource_for_operation(domain, force).await?;
 
         // Double-check: re-load the cert and verify it still needs renewal
         // (Task 6). Another instance may have renewed it while we were
         // waiting for the lock.
-        let cert = self.validated_certificate(&cert_res, domain).await?;
+        // Explicit forced renewal may use a quarantined resource only as the
+        // source of its SANs/key policy. It is never republished, and validation
+        // of the replacement still rejects the old leaf or another banned leaf.
+        let cert = if force {
+            Self::parse_managed_certificate(&cert_res, domain)?
+        } else {
+            self.validated_certificate(&cert_res, domain).await?
+        };
         let needs_renewal = cert.needs_renewal(self.policy.renewal_window_ratio);
 
         // Renew all actual DNS/IP SANs, including managed overlaps that would
@@ -1286,82 +1352,108 @@ impl CertManager {
 impl CertManager {
     /// Revoke the certificate for `domain`.
     ///
-    /// Iterates over configured issuers, attempting revocation for each.
-    /// After successful revocation, the certificate assets are deleted from
-    /// storage to prevent reuse. The optional `reason` is an RFC 5280
-    /// revocation reason code (0-10).
+    /// Revoke the first stored resource found in issuer order. Before calling
+    /// the provider, persist revocation intent in the shared [`Storage`] and
+    /// quarantine this leaf in the local cache. Provider errors do not undo
+    /// that intent. After confirmation, delete the matching stored resource;
+    /// cleanup retries skip a provider call already recorded as confirmed.
+    /// `reason` is an optional RFC 5280 revocation reason code (0-10).
+    ///
+    /// The operation runs in an owned task: dropping the caller's future does
+    /// not cancel it. Await the result to observe provider, cleanup and task
+    /// errors. Runtime/process shutdown can still interrupt it; a persistent
+    /// pending marker blocks reuse until provider reconciliation and cleanup.
+    ///
+    /// Other instances must share the storage/lock backend and refresh their
+    /// existing caches with [`Self::refresh_revocations`] or maintenance. This
+    /// does not close existing TLS sessions or invalidate separately cloned
+    /// signing keys. A provider without [`crate::Revoker`] support is an error.
     pub async fn revoke(&self, domain: &str, reason: Option<u8>) -> Result<()> {
-        for (i, issuer) in self.issuers.iter().enumerate() {
-            let ik = issuer.issuer_key();
+        let worker = self.detached("revocation");
+        let domain = domain.to_lowercase();
+        // Dropping the caller's future must not interrupt an irreversible CA
+        // operation between acknowledgement and local invalidation/cleanup.
+        tokio::spawn(async move { worker.revoke_locked(&domain, reason).await })
+            .await
+            .map_err(|error| Error::Other(format!("revocation task failed: {error}")))?
+    }
 
-            // Try to load the certificate resource for this issuer.
-            // A store that cannot be read is reported rather than skipped:
-            // this used to be `Err(_) => continue`, so revoking against a
-            // broken backend quietly revoked nothing and said it was fine.
-            let Some(cert_res) = self.certificates.load(&ik, domain).await? else {
+    async fn revoke_locked(&self, domain: &str, reason: Option<u8>) -> Result<()> {
+        let _lock = acquire(
+            self.storage.clone(),
+            &Self::lock_key(CERT_ISSUE_LOCK_OP, domain),
+        )
+        .await?;
+        loop {
+            let mut selected = None;
+            for issuer in &self.issuers {
+                if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await?
+                {
+                    selected = Some((issuer, resource));
+                    break;
+                }
+            }
+            let Some((issuer, resource)) = selected else {
+                return Err(Error::Config(format!(
+                    "no certificate found in storage for '{domain}' from any configured issuer"
+                )));
+            };
+            let issuer_key = issuer.issuer_key();
+            let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
+            let leaf_lock = acquire(
+                self.storage.clone(),
+                &format!("certificate_leaf_{leaf_hash}"),
+            )
+            .await?;
+            let current = self.certificates.load(&issuer_key, domain).await?;
+            let Some(resource) = current else {
+                drop(leaf_lock);
                 continue;
             };
-
-            if cert_res.private_key_pem.is_empty() {
-                return Err(Error::Config(format!(
-                    "private key not found for '{domain}' (issuer {i}: {ik})"
-                )));
+            if crate::storage::resource_leaf_hash(&resource)? != leaf_hash {
+                drop(leaf_lock);
+                continue;
             }
-
-            info!(
-                domain = %domain,
-                issuer = %ik,
-                "revoking certificate"
-            );
-
-            // Call the ACME revocation endpoint if the issuer supports it.
-            if let Some(revoker) = issuer.as_revoker() {
-                revoker.revoke(&cert_res.certificate_pem, reason).await?;
-                info!(
-                    domain = %domain,
-                    issuer = %ik,
-                    "certificate revoked via ACME"
-                );
-            } else {
-                warn!(
-                    domain = %domain,
-                    issuer = %ik,
-                    "issuer does not support revocation; skipping ACME revoke call"
-                );
+            let revoker = issuer.as_revoker().ok_or_else(|| {
+                Error::Config(format!(
+                    "issuer {issuer_key} does not support certificate revocation"
+                ))
+            })?;
+            let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
+            let marker = crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash).await?;
+            if marker.is_none() {
+                crate::storage::store_revocation(self.storage.as_ref(), &leaf_hash, false).await?;
             }
-
-            // Delete certificate assets from storage after revocation.
-            self.delete_site_assets(&ik, domain).await?;
-
-            info!(
-                domain = %domain,
-                issuer = %ik,
-                "certificate assets deleted after revocation"
-            );
-
+            // Persistent intent is fail closed even if the provider subsequently
+            // fails, panics, or the process exits before recording confirmation.
+            self.cache.deny_revoked_certificate(&leaf_hash).await;
+            if !marker.is_some_and(|marker| marker.confirmed) {
+                revoker.revoke_resource(&resource, reason).await?;
+                crate::storage::store_revocation(self.storage.as_ref(), &leaf_hash, true).await?;
+            }
+            // All certon writers use the lifecycle lock. Check the leaf again as
+            // protection against an independently updated custom CertStore; this
+            // is not an atomic CAS against writers that ignore the shared lock.
+            if let Some(current) = self.certificates.load(&issuer_key, domain).await?
+                && crate::storage::resource_leaf_hash(&current)? == leaf_hash
+            {
+                self.delete_site_assets(&issuer_key, domain).await?;
+            }
             let _ = self.emit(
                 EVENT_CERT_REVOKED,
                 &serde_json::json!({
-                    "identifier": domain,
-                    "issuer": ik,
+                    "identifier": domain, "issuer": issuer_key, "leaf_hash": leaf_hash,
                 }),
             );
-
-            // Also remove from cache.
-            let cached_certs = self.cache.all_matching_certificates(domain).await;
-            for cert in &cached_certs {
-                if cert.issuer_key == ik {
-                    self.cache.remove(&cert.hash).await;
-                }
-            }
-
-            // Only need to revoke from one issuer (the one that issued it).
             return Ok(());
         }
+    }
 
-        Err(Error::Config(format!(
-            "no certificate found in storage for '{domain}' from any configured issuer"
-        )))
+    /// Poll shared revocation intent and quarantine matching cached leaves.
+    /// Other processes' existing caches are not synchronously invalidated;
+    /// applications may call this after receiving their own invalidation event.
+    pub async fn refresh_revocations(&self) -> Result<usize> {
+        crate::maintain::refresh_revocations(&self.cache, self.storage.as_ref()).await
     }
 }
 

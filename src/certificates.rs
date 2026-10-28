@@ -437,6 +437,17 @@ pub async fn reload_managed_certificate(
 ) -> Result<()> {
     let resource = crate::storage::load_certificate(storage, issuer_key, domain).await?;
     let mut cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
+    if let Some(leaf_hash) = crate::storage::certificate_leaf_hash(&cert)
+        && crate::storage::load_revocation(storage, &leaf_hash)
+            .await?
+            .is_some()
+    {
+        cache.deny_revoked_certificate(&leaf_hash).await;
+        return Err(crate::error::CertError::Revoked(format!(
+            "{domain}: persisted revocation intent"
+        ))
+        .into());
+    }
     cert.managed = true;
     cert.issuer_key = issuer_key.to_owned();
 

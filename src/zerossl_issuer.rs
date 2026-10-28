@@ -635,6 +635,141 @@ mod tests {
         assert!(pem.contains("BEGIN CERTIFICATE REQUEST"));
         assert!(pem.contains("END CERTIFICATE REQUEST"));
     }
+
+    #[tokio::test]
+    async fn rest_manager_revocation_uses_resource_id_and_checks_success_envelope() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::{
+            CertManager, CertStore, CertificateResource, FileStorage, KeyValueCertStore, OcspConfig,
+        };
+        for (body, succeeds) in [
+            (r#"{"success":1}"#, true),
+            (r#"{"success":true}"#, true),
+            (
+                r#"{"success":false,"error":{"code":2906,"type":"revocation_failed"}}"#,
+                false,
+            ),
+            (r#"{}"#, false),
+            ("invalid JSON", false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+            let store = Arc::new(KeyValueCertStore::new(storage.clone()));
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["example.com".into()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            let resource = CertificateResource {
+                sans: vec!["example.com".into()],
+                certificate_pem: cert.pem().into_bytes(),
+                private_key_pem: key.serialize_pem().into_bytes(),
+                issuer_key: ZEROSSL_API_ISSUER_KEY.into(),
+                issuer_data: Some(serde_json::json!({"certificate_id":"cert-123"})),
+            };
+            store.save(ZEROSSL_API_ISSUER_KEY, &resource).await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut issuer = ZeroSslApiIssuer::new("test-access-key", storage.clone());
+            issuer.revocation_origin =
+                Some(Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0; 2048];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let header = std::str::from_utf8(&request[..end]).unwrap();
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(
+                    request.starts_with(
+                        "POST /certificates/cert-123/revoke?access_key=test-access-key HTTP/1.1\r\n"
+                    ),
+                    "{request}"
+                );
+                assert!(request.ends_with("reason=1"), "{request}");
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+            });
+            let manager = CertManager::builder()
+                .storage(storage)
+                .certificates(store.clone())
+                .issuers(vec![Arc::new(issuer)])
+                .ocsp(OcspConfig {
+                    disable_stapling: true,
+                    ..Default::default()
+                })
+                .build();
+            manager.manage(&["example.com".into()]).await.unwrap();
+            assert_eq!(
+                manager.revoke("example.com", Some(1)).await.is_ok(),
+                succeeds,
+                "body={body}"
+            );
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(manager.cache.get_all().await.is_empty());
+            assert_eq!(
+                store
+                    .load(ZEROSSL_API_ISSUER_KEY, "example.com")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                succeeds
+            );
+            if !succeeds {
+                assert!(manager.load_certificate("example.com").await.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_revoker_keeps_pem_contract_and_requires_resource_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let issuer = ZeroSslApiIssuer::new(
+            "secret",
+            Arc::new(crate::FileStorage::new(directory.path())),
+        );
+        for bytes in [
+            b"-----BEGIN CERTIFICATE-----".as_slice(),
+            br#"{"certificate_id":"not-pem"}"#.as_slice(),
+        ] {
+            let error = issuer.revoke(bytes, None).await.unwrap_err().to_string();
+            assert!(error.contains("revoke_resource"));
+        }
+        let resource = crate::CertificateResource {
+            sans: vec!["example.com".into()],
+            certificate_pem: vec![],
+            private_key_pem: vec![],
+            issuer_key: ZEROSSL_API_ISSUER_KEY.into(),
+            issuer_data: None,
+        };
+        assert!(
+            issuer
+                .revoke_resource(&resource, None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no certificate_id")
+        );
+    }
 }
 
 // ===========================================================================
@@ -726,6 +861,8 @@ pub struct ZeroSslApiIssuer {
     key_type: KeyType,
     /// Interval between status polls.
     poll_interval: Duration,
+    #[cfg(test)]
+    revocation_origin: Option<Url>,
 }
 
 impl std::fmt::Debug for ZeroSslApiIssuer {
@@ -748,6 +885,8 @@ impl ZeroSslApiIssuer {
             storage,
             key_type: KeyType::EcdsaP256,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            #[cfg(test)]
+            revocation_origin: None,
         }
     }
 
@@ -1041,42 +1180,43 @@ impl CertIssuer for ZeroSslApiIssuer {
 
 #[async_trait]
 impl Revoker for ZeroSslApiIssuer {
-    /// Revoke a certificate using ZeroSSL's REST API.
-    ///
-    /// The `cert_pem` parameter is currently unused. Revocation requires the
-    /// certificate ID, which must be stored in the certificate resource's
-    /// metadata (set during issuance). This implementation attempts to extract
-    /// the certificate ID from the metadata stored alongside the PEM.
-    ///
-    /// **Note**: For this to work, the caller must pass the certificate
-    /// resource metadata (containing the `certificate_id` field) as
-    /// JSON-encoded bytes in `cert_pem`. If the metadata cannot be parsed,
-    /// an error is returned describing the limitation.
-    async fn revoke(&self, cert_pem: &[u8], reason: Option<u8>) -> Result<()> {
-        // Try to extract the certificate ID from the provided data.
-        // The caller may pass the metadata JSON instead of raw PEM.
-        let cert_id = if let Ok(text) = std::str::from_utf8(cert_pem) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(text) {
-                meta.get("certificate_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+    /// REST revocation needs the ID saved during issuance. PEM bytes alone
+    /// cannot identify a ZeroSSL REST resource; use `revoke_resource` instead.
+    async fn revoke(&self, _cert_pem: &[u8], _reason: Option<u8>) -> Result<()> {
+        Err(Error::Config(
+            "ZeroSSL REST revocation requires CertificateResource.issuer_data.certificate_id; use revoke_resource".into(),
+        ))
+    }
 
-        let cert_id = cert_id.ok_or_else(|| {
-            Error::Other(
-                "cannot revoke ZeroSSL REST API certificate: no certificate_id found. \
-                 Pass the metadata JSON (containing \"certificate_id\") as the cert_pem argument."
-                    .to_owned(),
-            )
-        })?;
+    async fn revoke_resource(
+        &self,
+        resource: &crate::CertificateResource,
+        reason: Option<u8>,
+    ) -> Result<()> {
+        let cert_id = resource
+            .issuer_data
+            .as_ref()
+            .and_then(|metadata| metadata.get("certificate_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                Error::Config(
+                    "ZeroSSL REST certificate has no certificate_id in issuer_data".into(),
+                )
+            })?;
 
         let reason_str = reason.unwrap_or(0).to_string();
-        let url = zerossl_api_url(["certificates", &cert_id, "revoke"], &self.api_key)?;
+        let url = zerossl_api_url(["certificates", cert_id, "revoke"], &self.api_key)?;
+        #[cfg(test)]
+        let url = if let Some(origin) = &self.revocation_origin {
+            let mut url = url;
+            url.set_scheme(origin.scheme()).unwrap();
+            url.set_host(origin.host_str()).unwrap();
+            url.set_port(origin.port()).unwrap();
+            url
+        } else {
+            url
+        };
 
         debug!(cert_id = %cert_id, reason = %reason_str, "revoking ZeroSSL certificate via REST API");
 
@@ -1096,6 +1236,17 @@ impl Revoker for ZeroSslApiIssuer {
             )));
         }
 
+        let body: serde_json::Value = zerossl_json(resp, "ZeroSSL revoke").await?;
+        // The revoke endpoint documents success: 1. Also accept true, while
+        // never treating an HTTP 200 error envelope as confirmation.
+        let success = body
+            .get("success")
+            .is_some_and(|value| value.as_u64() == Some(1) || value.as_bool() == Some(true));
+        if !success || body.get("error").is_some_and(|error| !error.is_null()) {
+            return Err(Error::Other(format!(
+                "ZeroSSL revocation was not confirmed: {body}"
+            )));
+        }
         info!(cert_id = %cert_id, "revoked ZeroSSL certificate via REST API");
         Ok(())
     }

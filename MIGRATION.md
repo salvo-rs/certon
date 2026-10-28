@@ -45,3 +45,46 @@ Certificate lifecycle corrections:
   `ReasonedRenewFn` / `RenewalReason` to distinguish expiration from revocation.
   The legacy low-level callback remains supported; callbacks using that API
   must implement their own revocation handling.
+
+
+Revocation now records durable, fail-closed intent before contacting the CA.
+Once intent is written, that leaf is removed from the local cache and cannot
+be loaded by manager or managed reload APIs, even after a provider error or
+caller cancellation. Pending and confirmed markers live at
+`revocations/<leaf-sha256>.json` in `Storage`, including when using a custom
+`CertStore`. Keep them when migrating storage; deleting a marker can re-enable
+a revoked certificate. Alternate chains with the same leaf are also blocked.
+
+`revoke()` runs an owned task and shares the issuance/renewal domain lock.
+Renewal and revocation also share a leaf lock when custom stores expose
+multiple domain aliases for the same certificate. Dropping
+its future does not cancel the task; await it to observe errors. A confirmed
+revocation with failed certificate cleanup can be retried without a second CA
+request. Process/runtime shutdown, or failure to record confirmation, may
+leave pending intent and an uncertain provider outcome: reconcile with the CA
+and retry cleanup. Provider retries must tolerate an already revoked leaf.
+Use `renew(domain, true)` to replace a pending/confirmed resource with a new
+leaf when cleanup has not completed; normal loads and non-forced renewal
+continue to reject the old leaf. After cleanup, use `obtain()` to issue afresh.
+Never restore the old leaf.
+Issuers without revocation support now return an error instead of silently
+removing local files and reporting success.
+
+Instances must share both `Storage` (markers and locks) and their compatible
+`CertStore`. An already active cache in another process is invalidated on its
+next renewal/OCSP maintenance tick, or after an explicit
+`manager.refresh_revocations().await`. Applications requiring prompt cluster
+invalidation should broadcast their own event and call that method. Existing
+TLS sessions and independently cloned signing keys are not withdrawn. Marker
+read errors prevent storage reload. A custom store writer that bypasses the
+shared lock must provide its own atomic compare-and-delete coordination;
+certon's leaf recheck protects replacements already visible before cleanup,
+but its current `CertStore` trait cannot implement CAS against external writers.
+
+`Revoker` has a default `revoke_resource(&CertificateResource, reason)` method
+which delegates to the existing PEM `revoke` method. Existing implementations
+need no changes. ZeroSSL REST overrides it to use
+`resource.issuer_data["certificate_id"]`; call the resource method when using
+that issuer directly. Passing JSON metadata in the PEM argument is no longer
+supported. A successful HTTP status alone is not provider confirmation:
+ZeroSSL's response must contain a positive success field and no error.
