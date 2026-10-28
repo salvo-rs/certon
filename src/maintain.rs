@@ -775,26 +775,33 @@ pub async fn clean_storage(
             continue;
         }
 
-        // Delete legacy assets before the snapshot. Otherwise a cancelled or
-        // partially failed cleanup can resurrect the legacy certificate through
-        // the backwards-compatible loader.
-        let legacy = [
-            crate::storage::site_cert_key(issuer, domain),
+        // Keep the certificate as retryable expiry evidence until both legacy
+        // sidecars are gone. The snapshot remains authoritative until all legacy
+        // assets are removed, preventing resurrection through the legacy loader.
+        let sidecars = [
             crate::storage::site_private_key(issuer, domain),
             crate::storage::site_meta_key(issuer, domain),
         ];
-        let mut legacy_deleted = true;
-        for path in legacy {
+        let mut sidecars_deleted = true;
+        for path in sidecars {
             match storage.delete(&path).await {
                 Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
                 Err(error) => {
-                    legacy_deleted = false;
+                    sidecars_deleted = false;
                     warn!(path, error = %error, "clean_storage: failed to delete expired certificate asset");
                 }
             }
         }
-        if !legacy_deleted {
+        if !sidecars_deleted {
             continue;
+        }
+        let cert_path = crate::storage::site_cert_key(issuer, domain);
+        match storage.delete(&cert_path).await {
+            Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+            Err(error) => {
+                warn!(path = cert_path, error = %error, "clean_storage: failed to delete expired certificate");
+                continue;
+            }
         }
         match storage.delete(&snapshot).await {
             Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {
@@ -1243,7 +1250,8 @@ mod tests {
 
     struct CleanupFaultStorage {
         files: crate::FileStorage,
-        fail_crt_delete: std::sync::atomic::AtomicBool,
+        fail_delete_suffix: Option<&'static str>,
+        fail_delete_once: std::sync::atomic::AtomicBool,
         deny_snapshot_load: bool,
     }
 
@@ -1263,7 +1271,11 @@ mod tests {
             self.files.load(key).await
         }
         async fn delete(&self, key: &str) -> Result<()> {
-            if key.ends_with(".crt") && self.fail_crt_delete.swap(false, Ordering::SeqCst) {
+            if self
+                .fail_delete_suffix
+                .is_some_and(|suffix| key.ends_with(suffix))
+                && self.fail_delete_once.swap(false, Ordering::SeqCst)
+            {
                 return Err(crate::Error::Other(
                     "transient certificate deletion failure".into(),
                 ));
@@ -1288,29 +1300,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_retries_an_expired_legacy_certificate_after_sidecars_were_removed() {
-        let directory = tempfile::tempdir().unwrap();
-        let storage = CleanupFaultStorage {
-            files: crate::FileStorage::new(directory.path()),
-            fail_crt_delete: std::sync::atomic::AtomicBool::new(true),
-            deny_snapshot_load: false,
-        };
-        write_legacy_resource(&storage, &cleanup_resource(true)).await;
-        let cert = crate::storage::site_cert_key("ca", "example.com");
-        let key = crate::storage::site_private_key("ca", "example.com");
-        let meta = crate::storage::site_meta_key("ca", "example.com");
-        let first = clean_storage(&storage, &CleanStorageOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(first.deleted_certs, 0);
-        assert!(storage.exists(&cert).await.unwrap());
-        assert!(!storage.exists(&key).await.unwrap());
-        assert!(!storage.exists(&meta).await.unwrap());
-        let second = clean_storage(&storage, &CleanStorageOptions::default())
-            .await
-            .unwrap();
-        assert_eq!(second.deleted_certs, 1);
-        assert!(!storage.exists(&cert).await.unwrap());
+    async fn cleanup_retries_each_partial_legacy_asset_deletion() {
+        for suffix in [".key", ".json", ".crt"] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = CleanupFaultStorage {
+                files: crate::FileStorage::new(directory.path()),
+                fail_delete_suffix: Some(suffix),
+                fail_delete_once: std::sync::atomic::AtomicBool::new(true),
+                deny_snapshot_load: false,
+            };
+            write_legacy_resource(&storage, &cleanup_resource(true)).await;
+            let cert = crate::storage::site_cert_key("ca", "example.com");
+            let key = crate::storage::site_private_key("ca", "example.com");
+            let meta = crate::storage::site_meta_key("ca", "example.com");
+            let first = clean_storage(&storage, &CleanStorageOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(first.deleted_certs, 0, "failure: {suffix}");
+            assert!(
+                storage.exists(&cert).await.unwrap(),
+                "lost expiry evidence after {suffix} deletion failed"
+            );
+            assert_eq!(
+                storage.exists(&key).await.unwrap(),
+                suffix == ".key",
+                "failure: {suffix}"
+            );
+            assert_eq!(
+                storage.exists(&meta).await.unwrap(),
+                suffix == ".json",
+                "failure: {suffix}"
+            );
+            let second = clean_storage(&storage, &CleanStorageOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(second.deleted_certs, 1, "failure: {suffix}");
+            for path in [&cert, &key, &meta] {
+                assert!(
+                    !storage.exists(path).await.unwrap(),
+                    "asset left after retry: {path}; failure: {suffix}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1320,7 +1351,8 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let storage = CleanupFaultStorage {
                 files: crate::FileStorage::new(directory.path()),
-                fail_crt_delete: std::sync::atomic::AtomicBool::new(false),
+                fail_delete_suffix: None,
+                fail_delete_once: std::sync::atomic::AtomicBool::new(false),
                 deny_snapshot_load: authority == "unavailable",
             };
             write_legacy_resource(&storage, &cleanup_resource(true)).await;
