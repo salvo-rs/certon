@@ -1,0 +1,9 @@
+# Advisory policy ONLY for the compatibility graph that enables rsa-keys.
+# All other checks use deny.toml. Never use this for the minimal ECDSA audit.
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+yanked = "deny"
+unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Unpatched rsa timing advisory; rsa-keys remains enabled for API compatibility. certon uses rsa for local key generation/decoding, while rustls providers perform TLS signing. check-rsa-exception.py constrains the dependency graph; see SECURITY.md and re-review on every release or RSA call-site change." },
+]

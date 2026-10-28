@@ -1,0 +1,74 @@
+# Security checks and dependency policy
+
+CI checks RustSec advisories for two feature graphs. The minimal ECDSA build
+(`--no-default-features --features ring`) has no advisory exceptions. The full
+compatibility graph uses the single exception in `deny-rsa.toml`; licenses,
+sources and duplicate-dependency checks always use `deny.toml`. The dependency
+workflow also runs weekly so newly published advisories are checked without
+requiring a source change. Security fixes should be applied to the latest release.
+
+## RSA compatibility exception
+
+`rsa-keys` remains enabled by default for compatibility. It includes `rsa`,
+which is affected by [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)
+(Marvin timing side channels). No patched version is currently available.
+This exception acknowledges an unresolved dependency finding; it does not
+assert that RSA operations are universally safe.
+
+Certon's `rsa` call sites generate keys and decode/encode local private-key
+formats in `src/crypto.rs`. TLS private-key operations use the selected rustls
+crypto provider. The exception is permitted only while that separation holds:
+do not expose `rsa` private-key operations to attacker-controlled timing
+measurements. New signing/decryption call sites require a fresh review.
+Deployments that do not need RSA key generation or import can disable default
+features and select `ring` or `aws-lc-rs`, adding other optional features as needed.
+
+Only the full-feature advisory command uses the exception. Its preceding
+metadata check restricts `rsa` to the 0.9 series, directly used only by
+`certon@0.3.0` through the unchanged `rsa-keys` feature. Another dependent crate,
+a version change, an unused exception, or a different vulnerability fails the
+checks and requires review. Remove the exception when a
+patched compatible dependency is available, and re-review it on every release
+and whenever RSA call sites change. The minimal graph must continue to pass
+without this exception. `cargo audit` alone examines all packages in a lockfile,
+including disabled optional dependencies, so the minimal check uses cargo-deny's
+feature-aware graph instead.
+
+## Resolution and license checks
+
+This library does not track `Cargo.lock`. Each build job generates it once if
+absent, then uses `--locked` for checks, tests, docs and publication. This holds
+resolution steady within a job while continuing to exercise new compatible
+dependency releases; separate jobs may resolve at different times. If a lockfile
+is tracked in the future, CI preserves and checks it. Manifest and lockfile
+changes both trigger build and dependency checks.
+
+The direct rustls requirement starts at 0.23.46 to exclude known affected
+versions. Applications should update and audit their own lockfiles as well:
+compatible transitive dependencies can otherwise remain pinned to older
+vulnerable versions even after upgrading this library.
+
+The license allowlist covers the current permissive code licenses. The
+`webpki-root-certs` exception applies its data license only to that package.
+Unlisted licenses, unlicensed packages, unknown registries and Git sources fail
+the policy check. Duplicate versions are reported as warnings because current
+RustCrypto versions and TLS providers have incompatible transitive APIs; they
+remain visible for review. Wildcard dependency requirements fail the check.
+
+To reproduce the checks after generating a lockfile:
+
+```sh
+cargo deny --locked --no-default-features --features ring check advisories
+cargo metadata --locked --all-features --format-version 1 | python .github/scripts/check-rsa-exception.py
+cargo deny --locked --all-features --config deny-rsa.toml check advisories
+cargo deny --locked --all-features check licenses bans sources
+```
+
+Use the pinned `cargo-deny` 0.20.2 version from the workflow.
+
+Windows CI places Cargo artifacts, Cargo data and temporary files under
+`D:/BuildCache/certon-ci`; its setup checks the target directory with Cargo
+metadata. Linux/macOS hosted runners use their native runner filesystems and
+do not have a Windows D drive. Local checks on the maintainer's Windows machine
+must set `CARGO_TARGET_DIR`, `CARGO_HOME`, `TEMP` and `TMP` to D-drive paths
+before running Cargo or the audit tools.

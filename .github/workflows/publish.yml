@@ -19,7 +19,11 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Resolve dependencies once
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+
       - name: Publish
-        run: cargo publish --token ${CRATES_TOKEN}
+        run: cargo publish --locked --token "${CRATES_TOKEN}"
         env:
           CRATES_TOKEN: ${{ secrets.CRATES_TOKEN }}

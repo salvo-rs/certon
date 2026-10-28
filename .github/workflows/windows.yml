@@ -9,6 +9,7 @@ on:
     paths:
       - '**.rs'
       - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/**'
   push:
     branches:
@@ -16,7 +17,15 @@ on:
     paths:
       - '**.rs'
       - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/**'
+
+env:
+  CARGO_TARGET_DIR: D:/BuildCache/certon-ci/target
+  CARGO_HOME: D:/BuildCache/certon-ci/cargo-home
+  RUSTUP_HOME: D:/BuildCache/certon-ci/rustup
+  TEMP: D:/BuildCache/certon-ci/tmp
+  TMP: D:/BuildCache/certon-ci/tmp
 
 jobs:
   test:
@@ -35,18 +44,36 @@ jobs:
     runs-on: windows-latest
 
     steps:
+      - name: Prepare D-drive build storage
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath D:/)) { throw 'D drive is required for build storage' }
+          New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR,$env:CARGO_HOME,$env:RUSTUP_HOME,$env:TEMP | Out-Null
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: ${{ matrix.version }}
           components: rustfmt, clippy
 
+      - name: Resolve dependencies and verify build storage
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath Cargo.lock)) {
+            cargo generate-lockfile
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $actual = [IO.Path]::GetFullPath($metadata.target_directory)
+          $expected = [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+          if ($actual -ne $expected) { throw "Unexpected Cargo target directory: $actual" }
+
       - name: check build
-        run: cargo check --all --bins --examples --tests
+        run: cargo check --locked --all --bins --examples --tests
 
       - name: check release build
-        run: cargo check --all --bins --examples --tests --release
+        run: cargo check --locked --all --bins --examples --tests --release
 
       - name: Cargo test
         timeout-minutes: 40
-        run: cargo test --all --all-features --no-fail-fast -- --nocapture
+        run: cargo test --locked --all --all-features --no-fail-fast -- --nocapture

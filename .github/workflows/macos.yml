@@ -9,6 +9,7 @@ on:
     paths:
       - '**.rs'
       - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/**'
   push:
     branches:
@@ -16,6 +17,7 @@ on:
     paths:
       - '**.rs'
       - '**/Cargo.toml'
+      - '**/Cargo.lock'
       - '.github/workflows/**'
 
 jobs:
@@ -37,12 +39,16 @@ jobs:
           toolchain: ${{ matrix.version }}
           components: rustfmt, clippy
 
+      - name: Resolve dependencies once
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+
       - name: check build
-        run: cargo check --all --bins --examples --tests
+        run: cargo check --locked --all --bins --examples --tests
 
       - name: check release build
-        run: cargo check --all --bins --examples --tests --release
+        run: cargo check --locked --all --bins --examples --tests --release
 
       - name: Cargo test
         timeout-minutes: 40
-        run: cargo test --all --all-features --no-fail-fast -- --nocapture
+        run: cargo test --locked --all --all-features --no-fail-fast -- --nocapture
