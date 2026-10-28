@@ -654,10 +654,15 @@ pub struct CleanStorageResult {
 /// prevent unbounded growth of the storage backend.
 ///
 /// For certificates:
-/// - Lists all certificate PEM files (`.crt`) under `certificates/`.
-/// - Parses each to check its `notAfter` date.
-/// - Deletes certificates (plus their `.key` and `.json` sidecars) whose `notAfter` plus
+/// - Lists legacy PEM files and private resource snapshots under `certificates/`.
+/// - Loads each site's current resource and checks its `notAfter` date.
+/// - Deletes snapshots and legacy `.crt` / `.key` / `.json` assets whose `notAfter` plus
 ///   `expired_cert_grace_period` is in the past.
+///
+/// Callers must externally coordinate this operation with certificate issuance
+/// and renewal against the same storage. Reading expiry and deleting assets
+/// are separate operations, so cleanup must not race a writer publishing a
+/// replacement resource.
 ///
 /// For OCSP staples:
 /// - Lists all entries under `ocsp/`.
@@ -687,18 +692,35 @@ pub async fn clean_storage(
     let grace_period = chrono::Duration::from_std(options.expired_cert_grace_period)
         .unwrap_or_else(|_| chrono::Duration::hours(24));
 
+    // Group old three-file layouts and new private snapshots by site. Always
+    // inspect the canonical resource: a stale legacy .crt must not cause a
+    // newly renewed snapshot for the same site to be deleted.
+    let mut sites = std::collections::BTreeSet::new();
     for entry in &certs_entries {
-        // Only inspect .crt files to avoid double-processing.
-        if !entry.ends_with(".crt") {
+        if let Some(site) = entry.strip_suffix("/_certon/resource.v1.key") {
+            sites.insert(site.to_owned());
+        } else if entry.ends_with(".crt")
+            && let Some((site, _)) = entry.rsplit_once('/')
+        {
+            sites.insert(site.to_owned());
+        }
+    }
+
+    for site in sites {
+        let Some((issuer, domain)) = site
+            .strip_prefix("certificates/")
+            .and_then(|path| path.split_once('/'))
+        else {
+            continue;
+        };
+        if domain.contains('/') {
             continue;
         }
-
-        // Try to load and parse the certificate to check expiry.
-        let cert_pem = match storage.load(entry).await {
-            Ok(data) => data,
+        let resource = match crate::storage::load_certificate(storage, issuer, domain).await {
+            Ok(resource) => resource,
             Err(_) => continue,
         };
-
+        let cert_pem = resource.certificate_pem;
         let cert_pem_str = match std::str::from_utf8(&cert_pem) {
             Ok(s) => s,
             Err(_) => continue,
@@ -726,29 +748,40 @@ pub async fn clean_storage(
             Err(_) => continue,
         };
 
-        // Check if the certificate is past the grace period.
-        if now > not_after + grace_period {
-            // Derive sibling keys (.key, .json) from the .crt path.
-            let base = entry.trim_end_matches(".crt");
-            let key_path = format!("{base}.key");
-            let meta_path = format!("{base}.json");
+        if now <= not_after + grace_period {
+            continue;
+        }
 
-            for path in [entry.as_str(), key_path.as_str(), meta_path.as_str()] {
-                if let Err(e) = storage.delete(path).await {
-                    warn!(
-                        path = path,
-                        error = %e,
-                        "clean_storage: failed to delete expired certificate asset"
-                    );
+        // Delete legacy assets before the snapshot. Otherwise a cancelled or
+        // partially failed cleanup can resurrect the legacy certificate through
+        // the backwards-compatible loader.
+        let legacy = [
+            crate::storage::site_cert_key(issuer, domain),
+            crate::storage::site_private_key(issuer, domain),
+            crate::storage::site_meta_key(issuer, domain),
+        ];
+        let mut legacy_deleted = true;
+        for path in legacy {
+            match storage.delete(&path).await {
+                Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                Err(error) => {
+                    legacy_deleted = false;
+                    warn!(path, error = %error, "clean_storage: failed to delete expired certificate asset");
                 }
             }
-
-            info!(
-                cert_path = entry.as_str(),
-                not_after = %not_after,
-                "clean_storage: deleted expired certificate",
-            );
-            result.deleted_certs += 1;
+        }
+        if !legacy_deleted {
+            continue;
+        }
+        let snapshot = format!("{site}/_certon/resource.v1.key");
+        match storage.delete(&snapshot).await {
+            Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {
+                info!(site, not_after = %not_after, "clean_storage: deleted expired certificate");
+                result.deleted_certs += 1;
+            }
+            Err(error) => {
+                warn!(path = snapshot, error = %error, "clean_storage: failed to delete expired certificate snapshot")
+            }
         }
     }
 
@@ -1089,6 +1122,98 @@ mod tests {
         assert_eq!(current.len(), 1);
         assert_ne!(current[0].hash, old.hash);
         assert_eq!(current[0].issuer_key, "ca");
+    }
+
+    fn cleanup_resource(expired: bool) -> crate::CertificateResource {
+        use chrono::Datelike;
+        let mut params = rcgen::CertificateParams::new(vec!["example.com".into()]).unwrap();
+        let year = Utc::now().year();
+        params.not_before = rcgen::date_time_ymd(year - 4, 1, 1);
+        params.not_after = rcgen::date_time_ymd(if expired { year - 2 } else { year + 4 }, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        crate::CertificateResource {
+            sans: vec!["example.com".into()],
+            certificate_pem: certificate.pem().into_bytes(),
+            private_key_pem: key.serialize_pem().into_bytes(),
+            issuer_key: "ca".into(),
+            issuer_data: None,
+        }
+    }
+
+    async fn write_legacy_resource(storage: &dyn Storage, resource: &crate::CertificateResource) {
+        storage
+            .store(
+                &crate::storage::site_cert_key("ca", "example.com"),
+                &resource.certificate_pem,
+            )
+            .await
+            .unwrap();
+        storage
+            .store(
+                &crate::storage::site_private_key("ca", "example.com"),
+                &resource.private_key_pem,
+            )
+            .await
+            .unwrap();
+        storage
+            .store(
+                &crate::storage::site_meta_key("ca", "example.com"),
+                &serde_json::to_vec(resource).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_published_resources_and_legacy_assets_without_resurrection() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        write_legacy_resource(&storage, &cleanup_resource(false)).await;
+        crate::storage::store_certificate(&storage, "ca", &cleanup_resource(true))
+            .await
+            .unwrap();
+        let result = clean_storage(&storage, &CleanStorageOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.deleted_certs, 1);
+        assert!(matches!(
+            crate::storage::load_certificate(&storage, "ca", "example.com").await,
+            Err(crate::Error::Storage(crate::error::StorageError::NotFound(
+                _
+            )))
+        ));
+        for path in [
+            crate::storage::site_cert_key("ca", "example.com"),
+            crate::storage::site_private_key("ca", "example.com"),
+            crate::storage::site_meta_key("ca", "example.com"),
+            "certificates/ca/example.com/_certon/resource.v1.key".into(),
+        ] {
+            assert!(
+                !storage.exists(&path).await.unwrap(),
+                "resource was left behind: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_let_an_expired_legacy_certificate_delete_a_fresh_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        write_legacy_resource(&storage, &cleanup_resource(true)).await;
+        let fresh = cleanup_resource(false);
+        crate::storage::store_certificate(&storage, "ca", &fresh)
+            .await
+            .unwrap();
+        let result = clean_storage(&storage, &CleanStorageOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(result.deleted_certs, 0);
+        let loaded = crate::storage::load_certificate(&storage, "ca", "example.com")
+            .await
+            .unwrap();
+        assert_eq!(loaded.certificate_pem, fresh.certificate_pem);
+        assert_eq!(loaded.private_key_pem, fresh.private_key_pem);
     }
 
     /// Minimal dummy storage for testing.
