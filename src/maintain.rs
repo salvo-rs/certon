@@ -74,7 +74,7 @@ pub struct MaintenanceConfig {
     /// OCSP configuration (controls stapling behavior).
     pub ocsp: OcspConfig,
 
-    /// Storage backend used for caching OCSP responses.
+    /// Shared storage for OCSP responses and persistent revocation intent.
     pub storage: Arc<dyn Storage>,
 }
 
@@ -112,6 +112,7 @@ pub type ReasonedRenewFn =
 struct RenewalPolicy {
     renew: Arc<ReasonedRenewFn>,
     certificates: Arc<dyn CertStore>,
+    revocations: Arc<dyn Storage>,
     ratio: f64,
 }
 
@@ -163,6 +164,7 @@ pub fn start_maintenance_with_policy(
     let policy = RenewalPolicy {
         renew,
         certificates,
+        revocations: config.storage.clone(),
         ratio,
     };
     let renew_interval =
@@ -276,10 +278,16 @@ async fn maintenance_loop(
         tokio::select! {
             _ = renew_ticker.tick() => {
                 debug!("maintenance: running renewal check");
+                if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+                    warn!(%error, "maintenance: failed to refresh revocation intent");
+                }
                 check_renewals_with_policy(&cache, &policy, &job_queue).await;
             }
             _ = ocsp_ticker.tick() => {
                 debug!("maintenance: running OCSP staple check");
+                if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+                    warn!(%error, "maintenance: failed to refresh revocation intent");
+                }
                 update_ocsp_staples(
                     &cache,
                     config.storage.as_ref(),
@@ -303,6 +311,32 @@ async fn maintenance_loop(
                 }
             }
         }
+    }
+}
+
+pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
+    let mut invalidated = 0;
+    let mut first_error = None;
+    for cert in cache.get_managed_certificates().await {
+        let Some(hash) = crate::storage::certificate_leaf_hash(&cert) else {
+            continue;
+        };
+        match crate::storage::load_revocation(storage, &hash).await {
+            Ok(Some(_)) => {
+                cache.deny_revoked_certificate(&hash).await;
+                invalidated += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // One damaged or unavailable marker must not permanently
+                // shield every later revoked leaf from quarantine.
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(invalidated),
     }
 }
 
@@ -362,6 +396,7 @@ async fn check_renewals_with_policy(
         if try_reload_from_storage(
             cache,
             policy.certificates.as_ref(),
+            policy.revocations.as_ref(),
             cert,
             &domain,
             policy.ratio,
@@ -413,6 +448,7 @@ async fn check_renewals_with_policy(
 async fn try_reload_from_storage(
     cache: &CertCache,
     certificates: &dyn CertStore,
+    revocations: &dyn Storage,
     cached_cert: &Certificate,
     domain: &str,
     renewal_ratio: f64,
@@ -427,6 +463,19 @@ async fn try_reload_from_storage(
             Err(_) => return false,
         };
 
+    if let Some(hash) = crate::storage::certificate_leaf_hash(&stored_cert) {
+        match crate::storage::load_revocation(revocations, &hash).await {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                cache.deny_revoked_certificate(&hash).await;
+                return false;
+            }
+            Err(error) => {
+                warn!(%error, "maintenance: cannot verify revocation status for reload");
+                return false;
+            }
+        }
+    }
     // If the stored cert has a different hash AND does not need renewal,
     // it was renewed by another instance — reload it into the cache.
     if stored_cert.hash != cached_cert.hash
@@ -1294,6 +1343,7 @@ mod tests {
             &cache,
             &RenewalPolicy {
                 renew: renew_func,
+                revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             },
@@ -1329,6 +1379,7 @@ mod tests {
             &cache,
             &RenewalPolicy {
                 renew: renew_func,
+                revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             },
@@ -1364,6 +1415,7 @@ mod tests {
             &cache,
             &RenewalPolicy {
                 renew: renew_func,
+                revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             },
@@ -1398,6 +1450,7 @@ mod tests {
             &cache,
             &RenewalPolicy {
                 renew: renew_func,
+                revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             },
@@ -1459,6 +1512,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let policy = RenewalPolicy {
+            revocations: Arc::new(DummyStorage),
             ratio: 0.5,
             certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
             renew: Arc::new(move |_domain, reason| {
@@ -1493,6 +1547,7 @@ mod tests {
         let store = Arc::new(InMemory::default());
         store.save("ca", &resource).await.unwrap();
         let policy = RenewalPolicy {
+            revocations: Arc::new(DummyStorage),
             ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             certificates: store,
             renew: Arc::new(|_, _| panic!("fresh certificate must be reloaded rather than issued")),

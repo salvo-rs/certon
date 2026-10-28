@@ -882,6 +882,21 @@ impl AcmeClient {
         url: &str,
         payload: Option<&str>,
     ) -> Result<reqwest::Response> {
+        self.acme_post_accepting_problem(account_key, kid, url, payload, None)
+            .await?
+            .ok_or_else(|| AcmeError::Order("unexpected accepted ACME problem".into()).into())
+    }
+
+    /// Only the caller that explicitly names a problem may treat its HTTP 400
+    /// response as an already-completed operation. Other POSTs retain errors.
+    async fn acme_post_accepting_problem(
+        &self,
+        account_key: &PrivateKey,
+        kid: Option<&str>,
+        url: &str,
+        payload: Option<&str>,
+        accepted_problem: Option<&str>,
+    ) -> Result<Option<reqwest::Response>> {
         // We try once; on a badNonce error we retry with a fresh nonce.
         for attempt in 0..2 {
             let nonce = self.get_nonce().await?;
@@ -900,7 +915,7 @@ impl AcmeClient {
             self.cache_nonce(&resp).await;
 
             // Check for badNonce and retry once.
-            if resp.status().as_u16() == 400 && attempt == 0 {
+            if resp.status().as_u16() == 400 && (attempt == 0 || accepted_problem.is_some()) {
                 // Peek at the body to see if it's a badNonce error.
                 let resp_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
                     .await
@@ -908,6 +923,7 @@ impl AcmeClient {
 
                 if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&resp_bytes)
                     && problem.problem_type.contains("badNonce")
+                    && attempt == 0
                 {
                     warn!("bad nonce, retrying with fresh nonce");
                     continue;
@@ -917,6 +933,7 @@ impl AcmeClient {
                 let problem: std::result::Result<AcmeProblem, _> =
                     serde_json::from_slice(&resp_bytes);
                 let detail = match problem {
+                    Ok(p) if accepted_problem == Some(p.problem_type.as_str()) => return Ok(None),
                     Ok(p) => format!("{p}"),
                     Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
                 };
@@ -926,7 +943,7 @@ impl AcmeClient {
                 .into());
             }
 
-            return Ok(resp);
+            return Ok(Some(resp));
         }
 
         Err(AcmeError::Nonce("failed after badNonce retry".into()).into())
@@ -1588,14 +1605,21 @@ impl AcmeClient {
             AcmeError::Certificate(format!("failed to serialize revoke request: {e}"))
         })?;
 
-        let resp = self
-            .acme_post(
+        let Some(resp) = self
+            .acme_post_accepting_problem(
                 account_key,
                 Some(account_url),
                 &self.directory.revoke_cert,
                 Some(&payload),
+                Some("urn:ietf:params:acme:error:alreadyRevoked"),
             )
-            .await?;
+            .await?
+        else {
+            // RFC 8555 section 7.6: this exact problem confirms that the
+            // requested certificate has already been revoked.
+            debug!("certificate was already revoked");
+            return Ok(());
+        };
 
         let status = resp.status();
         if !status.is_success() {
