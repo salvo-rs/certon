@@ -2,6 +2,17 @@
 
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
+Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`
+instead of a struct literal. It now owns bounded handshake state. Its public
+`listener` and `acceptor` fields and `into_parts()` remain available for custom
+accept loops. `accept()` runs up to 256 handshakes with a ten-second deadline
+by default, skips invalid/timed-out handshakes, and returns the next completed
+connection. Use `BoundTlsListener::with_limits(listener, acceptor, limits)` for
+custom nonzero limits. Cancelling `accept()` preserves admitted workers and
+their original deadlines. Dropping the wrapper or taking its parts aborts
+pending convenience handshakes. Custom loops using the raw parts must supply
+their own concurrency and handshake deadlines.
+
 `CertManager::client_config(domain, roots)` now requires the server trust roots
 as its second argument (`rustls::RootCertStore` or `Arc<RootCertStore>`). Populate
 them with the CAs trusted by your application. Previously this convenience
