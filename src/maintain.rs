@@ -502,16 +502,17 @@ async fn update_ocsp_staples(
         );
 
         let mut updated_cert = cert.clone();
-        match ocsp::staple_ocsp(storage, &mut updated_cert, config).await {
+        let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
+        // Publish removal of an unusable staple as well as successful refreshes.
+        // Otherwise a failed refresh keeps serving the expired response forever.
+        cache.replace(&old_hash, updated_cert.clone()).await;
+        match outcome {
             Ok(not_revoked) => {
                 if not_revoked {
                     debug!(
                         name = %first_name,
                         "maintenance: OCSP staple refreshed successfully",
                     );
-                    // Replace the certificate in the cache with the updated one
-                    // that has the fresh OCSP staple.
-                    cache.replace(&old_hash, updated_cert).await;
                 } else {
                     // A missing staple also returns false. Only an explicit
                     // Revoked status authorizes forced replacement.
@@ -880,6 +881,26 @@ mod tests {
     use super::*;
     use crate::cache::CacheOptions;
     use crate::certificates::{Certificate, PrivateKeyKind};
+
+    #[tokio::test]
+    async fn unavailable_ocsp_clears_cached_staple_without_requesting_renewal() {
+        let cache = CertCache::new(CacheOptions::default());
+        let mut cert = make_managed_cert(&["unavailable.example.com"], "stale-staple", 60);
+        cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(vec![0, 1, 2]);
+        cache.add(cert).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let renew: Arc<ReasonedRenewFn> = Arc::new(|_, _| {
+            Box::pin(async {
+                panic!("an unavailable OCSP responder must not be interpreted as revocation")
+            })
+        });
+        update_ocsp_staples(&cache, &storage, &OcspConfig::default(), renew.as_ref()).await;
+        let cached = cache.get_by_name("unavailable.example.com").await.unwrap();
+        assert!(cached.ocsp_response.is_none());
+        assert!(cached.ocsp_status.is_none());
+    }
 
     /// Helper: build a minimal managed test certificate.
     fn make_managed_cert(names: &[&str], hash: &str, days_remaining: i64) -> Certificate {
