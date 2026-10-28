@@ -1650,6 +1650,10 @@ impl CertManager {
     /// Poll shared revocation intent and quarantine matching cached leaves.
     /// Other processes' existing caches are not synchronously invalidated;
     /// applications may call this after receiving their own invalidation event.
+    /// Reads at most eight unique leaf markers concurrently and returns the
+    /// number of quarantined leaves. Alternate chains share one marker read.
+    /// A failed read does not prevent other leaves from being quarantined; the
+    /// first snapshot-order error is returned after all reads finish.
     pub async fn refresh_revocations(&self) -> Result<usize> {
         crate::maintain::refresh_revocations(&self.cache, self.storage.as_ref()).await
     }
