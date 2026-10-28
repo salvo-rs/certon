@@ -767,8 +767,8 @@ impl CertManager {
 
     /// Load a certificate from storage for the given domain.
     ///
-    /// Tries all configured issuers and returns the newest valid certificate. Returns `Some(Certificate)` if
-    /// found, `None` if not in storage for any issuer.
+    /// Tries all configured issuers and returns the newest valid certificate. Returns
+    /// `Some(Certificate)` if found, `None` if not in storage for any issuer.
     pub async fn load_certificate(&self, domain: &str) -> Result<Option<Certificate>> {
         match self.load_managed_certificate(domain).await {
             Ok(cert) => Ok(Some(cert)),

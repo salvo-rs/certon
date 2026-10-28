@@ -1097,7 +1097,8 @@ mod tests {
 
     #[tokio::test]
     async fn maintenance_reloads_from_the_custom_certificate_store() {
-        use crate::cert_store::{CertStore, tests::InMemory};
+        use crate::cert_store::CertStore;
+        use crate::cert_store::tests::InMemory;
         let cache = CertCache::new(CacheOptions::default());
         let mut old = make_managed_cert(&["example.com"], "old", 1);
         old.issuer_key = "ca".into();

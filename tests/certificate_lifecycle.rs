@@ -1,12 +1,11 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
 use certon::{
     CertIssuer, CertManager, FileStorage, IssuedCertificate, OcspConfig, Result, Storage,
 };
 use chrono::Datelike;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PublicKeyData};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU8, AtomicUsize, Ordering},
-};
 use tokio::sync::Notify;
 use x509_parser::prelude::FromDer;
 
