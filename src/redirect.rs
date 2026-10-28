@@ -243,9 +243,11 @@ async fn redirect_exchange<S: AsyncRead + AsyncWrite + Unpin>(
 ) {
     let mut request = Vec::with_capacity(handler.limits.max_header_bytes.min(4096));
     let mut chunk = [0; 1024];
-    loop {
-        if request.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+    let header_end = loop {
+        // A read may also contain body bytes. Find the header terminator before
+        // checking the cap, and never parse or count that body as header text.
+        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
         }
         let remaining = handler.limits.max_header_bytes - request.len();
         if remaining == 0 {
@@ -257,8 +259,8 @@ async fn redirect_exchange<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(0) | Err(_) => return,
             Ok(n) => request.extend_from_slice(&chunk[..n]),
         }
-    }
-    let location = parse_redirect_request(&request, handler);
+    };
+    let location = parse_redirect_request(&request[..header_end], handler);
     let response = match location {
         Ok(location) => format!(
             "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -274,9 +276,12 @@ async fn redirect_exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
 fn parse_redirect_request(request: &[u8], handler: &HttpsRedirectHandler) -> Result<String> {
     let bad_request = || Error::Config("invalid HTTP redirect request".into());
-    let request = std::str::from_utf8(request).map_err(|_| bad_request())?;
-    let header_end = request.find("\r\n\r\n").ok_or_else(bad_request)?;
-    let mut lines = request[..header_end].split("\r\n");
+    let header_end = request
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .ok_or_else(bad_request)?;
+    let headers = std::str::from_utf8(&request[..header_end]).map_err(|_| bad_request())?;
+    let mut lines = headers.split("\r\n");
     let mut first = lines.next().ok_or_else(bad_request)?.split_whitespace();
     let _method = first.next().ok_or_else(bad_request)?;
     let path = first.next().ok_or_else(bad_request)?;
@@ -574,6 +579,143 @@ mod tests {
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 431"));
         task.await.unwrap();
+    }
+
+    /// Deterministic read boundaries model coalesced and fragmented TCP data.
+    struct FragmentedIo {
+        input: std::collections::VecDeque<Vec<u8>>,
+        offset: usize,
+        output: Vec<u8>,
+    }
+
+    impl AsyncRead for FragmentedIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if let Some(fragment) = this.input.front() {
+                let count = buffer.remaining().min(fragment.len() - this.offset);
+                buffer.put_slice(&fragment[this.offset..this.offset + count]);
+                this.offset += count;
+                if this.offset == fragment.len() {
+                    this.input.pop_front();
+                    this.offset = 0;
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FragmentedIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.get_mut().output.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn fragmented_response(
+        request: &[u8],
+        split: Option<usize>,
+        header_cap: usize,
+    ) -> String {
+        let input = match split {
+            Some(split) => [request[..split].to_vec(), request[split..].to_vec()]
+                .into_iter()
+                .collect(),
+            None => [request.to_vec()].into_iter().collect(),
+        };
+        let handler = limited_handler(Duration::from_secs(1), 1)
+            .with_limits(RedirectLimits {
+                max_header_bytes: header_cap,
+                ..RedirectLimits::default()
+            })
+            .unwrap();
+        let mut stream = FragmentedIo {
+            input,
+            offset: 0,
+            output: Vec::new(),
+        };
+        redirect_exchange(&mut stream, &handler).await;
+        String::from_utf8(stream.output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn binary_body_is_independent_of_read_fragmentation() {
+        let header = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\n\r\n";
+        let mut request = header.to_vec();
+        request.push(0xff);
+        let coalesced = fragmented_response(&request, None, 8192).await;
+        let fragmented = fragmented_response(&request, Some(header.len()), 8192).await;
+        assert!(
+            coalesced.starts_with("HTTP/1.1 301"),
+            "coalesced: {coalesced}"
+        );
+        assert_eq!(coalesced, fragmented);
+        assert!(coalesced.contains("Location: https://example.com/upload\r\n"));
+    }
+
+    #[tokio::test]
+    async fn header_limit_counts_only_headers_at_every_fragment_boundary() {
+        for cap in [128, 1024, 1025] {
+            for header_length in [cap - 1, cap, cap + 1] {
+                let prefix = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4096\r\nX-Pad: ";
+                let mut request = prefix.to_vec();
+                request.extend(std::iter::repeat_n(b'a', header_length - prefix.len() - 4));
+                request.extend_from_slice(b"\r\n\r\n");
+                assert_eq!(request.len(), header_length);
+                request.extend_from_slice(&[0xff; 4096]);
+                let expected = if header_length <= cap {
+                    "HTTP/1.1 301"
+                } else {
+                    "HTTP/1.1 431"
+                };
+                for split in [
+                    None,
+                    Some(header_length - 3),
+                    Some(header_length - 1),
+                    Some(header_length),
+                    Some(header_length + 1),
+                    Some(1024),
+                ] {
+                    let response = fragmented_response(&request, split, cap).await;
+                    assert!(
+                        response.starts_with(expected),
+                        "cap={cap} header={header_length} split={split:?}: {response}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parsing_headers_ignores_non_utf8_body_bytes() {
+        let handler = limited_handler(Duration::from_secs(1), 1);
+        let request =
+            b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\n\r\n\xff";
+        assert_eq!(
+            parse_redirect_request(request, &handler).unwrap(),
+            "https://example.com/upload"
+        );
     }
 
     #[test]
