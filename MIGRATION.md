@@ -16,6 +16,14 @@ failures or unchanged responses. Both serving containers share the signing-key
 by an in-flight handshake remains an immutable snapshot, as across certificate
 replacement or removal.
 
+Managed publication now rechecks certificate validity under the cache's write
+lock after asynchronous OCSP/AIA preparation. Failure returns a typed validity
+error and preserves existing working entries. Low-level `CertCache::add` and
+`replace` still allow historical certificate imports. The OCSP deadline index
+stores at most one record per scheduled certificate; unrelated imports do not
+wake maintenance. Deadline wakes inspect only due entries, while periodic
+polls retain the original cadence for certificates without OCSP support.
+
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
 Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`

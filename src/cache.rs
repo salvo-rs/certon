@@ -34,7 +34,7 @@
 //! // let cert = cache.get_by_name("example.com").await;
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -215,7 +215,7 @@ pub struct CertCache {
     stop_tx: watch::Sender<bool>,
     done_tx: watch::Sender<bool>,
     maintenance_count: Mutex<usize>,
-    ocsp_changed: watch::Sender<()>,
+    ocsp_changed: watch::Sender<Option<DateTime<Utc>>>,
 }
 
 #[derive(Default)]
@@ -225,6 +225,8 @@ struct CacheState {
     revoked_leaf_hashes: HashSet<String>,
     /// Dense managed-only sampling pool; each entry stores its back-reference.
     managed_hashes: Vec<String>,
+    /// One indexed effective deadline per scheduled certificate.
+    ocsp_deadlines: BTreeMap<DateTime<Utc>, HashSet<String>>,
 }
 
 struct CachedCertificate {
@@ -384,8 +386,40 @@ impl std::fmt::Debug for CertCache {
 }
 
 impl CacheState {
+    fn next_ocsp_deadline(&self) -> Option<DateTime<Utc>> {
+        self.ocsp_deadlines
+            .first_key_value()
+            .map(|(deadline, _)| *deadline)
+    }
+
+    fn change_ocsp_deadline(
+        &mut self,
+        hash: &str,
+        old: Option<DateTime<Utc>>,
+        new: Option<DateTime<Utc>>,
+    ) {
+        if old == new {
+            return;
+        }
+        if let Some(old) = old
+            && let Some(hashes) = self.ocsp_deadlines.get_mut(&old)
+        {
+            hashes.remove(hash);
+            if hashes.is_empty() {
+                self.ocsp_deadlines.remove(&old);
+            }
+        }
+        if let Some(new) = new {
+            self.ocsp_deadlines
+                .entry(new)
+                .or_default()
+                .insert(hash.to_owned());
+        }
+    }
+
     fn remove(&mut self, hash: &str) -> Option<CacheEvent> {
         let entry = self.certificates.remove(hash)?;
+        self.change_ocsp_deadline(hash, entry.ocsp_deadline(), None);
         if let Some(index) = entry.managed_index {
             self.managed_hashes.swap_remove(index);
             if let Some(moved_hash) = self.managed_hashes.get(index) {
@@ -511,6 +545,11 @@ impl CacheState {
             self.managed_hashes.push(hash.clone());
             index
         });
+        self.change_ocsp_deadline(
+            &hash,
+            None,
+            key.validity.map(|validity| validity.refresh_at),
+        );
         self.certificates.insert(
             hash,
             CachedCertificate {
@@ -548,7 +587,7 @@ impl CertCache {
             stop_tx,
             done_tx,
             maintenance_count: Mutex::new(0),
-            ocsp_changed: watch::channel(()).0,
+            ocsp_changed: watch::channel(None).0,
         })
     }
 
@@ -567,18 +606,30 @@ impl CertCache {
         self.stop_tx.subscribe()
     }
 
-    pub(crate) fn subscribe_ocsp(&self) -> watch::Receiver<()> {
+    pub(crate) fn subscribe_ocsp(&self) -> watch::Receiver<Option<DateTime<Utc>>> {
         self.ocsp_changed.subscribe()
+    }
+
+    fn notify_ocsp_schedule(&self) {
+        // Keep the snapshot and notification ordered with mutations. The watch
+        // wakes tasks without polling their futures under this read lock.
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let deadline = state.next_ocsp_deadline();
+        self.ocsp_changed.send_if_modified(|current| {
+            if *current == deadline {
+                false
+            } else {
+                *current = deadline;
+                true
+            }
+        });
     }
 
     pub(crate) fn next_ocsp_deadline(&self) -> Option<DateTime<Utc>> {
         self.state
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .certificates
-            .values()
-            .filter_map(CachedCertificate::ocsp_deadline)
-            .min()
+            .next_ocsp_deadline()
     }
 
     pub(crate) fn ocsp_refresh_due(&self, hash: &str) -> bool {
@@ -588,6 +639,25 @@ impl CertCache {
                 .ocsp_deadline()
                 .is_none_or(|deadline| Utc::now() >= deadline)
         })
+    }
+
+    pub(crate) fn ocsp_snapshot(&self, periodic: bool) -> Vec<Arc<Certificate>> {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        if periodic {
+            state
+                .certificates
+                .values()
+                .map(|entry| Arc::clone(&entry.certificate))
+                .collect()
+        } else {
+            state
+                .ocsp_deadlines
+                .range(..=Utc::now())
+                .flat_map(|(_, hashes)| hashes)
+                .filter_map(|hash| state.certificates.get(hash))
+                .map(|entry| Arc::clone(&entry.certificate))
+                .collect()
+        }
     }
 
     /// Stop all registered maintenance loops and wait for their guards to drop.
@@ -638,23 +708,13 @@ impl CertCache {
     /// Time-invalid entries remain available as lifecycle metadata, but are
     /// excluded from TLS selection until their validity period begins.
     pub async fn add(&self, cert: Certificate) {
-        let key = PreparedKey::for_certificate(&cert).await;
-        let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
-        let options = self
-            .options
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let mut events = Vec::new();
-        self.state.write().unwrap_or_else(|e| e.into_inner()).add(
-            cert,
-            key,
-            leaf_hash,
-            &options,
-            &mut events,
-        );
-        self.ocsp_changed.send_replace(());
-        dispatch_events(&options, events);
+        let _ = self.publish_prepared(None, cert, None).await;
+    }
+
+    /// Managed publication rechecks time at the write-lock linearization point,
+    /// after any asynchronous OCSP/AIA preparation has finished.
+    pub(crate) async fn add_managed(&self, cert: Certificate, domain: &str) -> Result<()> {
+        self.publish_prepared(None, cert, Some(domain)).await
     }
 
     /// Remove a certificate by hash.
@@ -676,7 +736,7 @@ impl CertCache {
                 .filter_map(|hash| state.remove(hash))
                 .collect()
         };
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, events);
     }
 
@@ -713,14 +773,33 @@ impl CertCache {
                 .filter_map(|hash| state.remove(hash))
                 .collect()
         };
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, events);
     }
 
     /// Replace metadata and the prebuilt serving key in one critical section.
     pub async fn replace(&self, old_hash: &str, new_cert: Certificate) {
-        let key = PreparedKey::for_certificate(&new_cert).await;
-        let leaf_hash = crate::storage::certificate_leaf_hash(&new_cert);
+        let _ = self.publish_prepared(Some(old_hash), new_cert, None).await;
+    }
+
+    pub(crate) async fn replace_managed(
+        &self,
+        old_hash: &str,
+        cert: Certificate,
+        domain: &str,
+    ) -> Result<()> {
+        self.publish_prepared(Some(old_hash), cert, Some(domain))
+            .await
+    }
+
+    async fn publish_prepared(
+        &self,
+        old_hash: Option<&str>,
+        cert: Certificate,
+        domain: Option<&str>,
+    ) -> Result<()> {
+        let key = PreparedKey::for_certificate(&cert).await;
+        let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
         let options = self
             .options
             .read()
@@ -729,19 +808,34 @@ impl CertCache {
         let mut events = Vec::new();
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(domain) = domain {
+                if cert.not_before > Utc::now() {
+                    return Err(crate::error::CertError::NotYetValid(domain.to_owned()).into());
+                }
+                if cert.expired() {
+                    return Err(crate::error::CertError::Expired(domain.to_owned()).into());
+                }
+            }
             if leaf_hash
                 .as_ref()
                 .is_some_and(|hash| state.revoked_leaf_hashes.contains(hash))
             {
-                return;
+                return Err(crate::error::CertError::Revoked(
+                    "certificate leaf is quarantined in this cache".into(),
+                )
+                .into());
             }
-            if let Some(event) = state.remove(old_hash) {
+            // Reject invalid managed input before removing the old working leaf.
+            if let Some(old_hash) = old_hash
+                && let Some(event) = state.remove(old_hash)
+            {
                 events.push(event);
             }
-            state.add(new_cert, key, leaf_hash, &options, &mut events);
+            state.add(cert, key, leaf_hash, &options, &mut events);
         }
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, events);
+        Ok(())
     }
 
     /// Irreversibly quarantine this leaf for the lifetime of this cache. A
@@ -769,7 +863,7 @@ impl CertCache {
                 .filter_map(|hash| state.remove(hash))
                 .collect()
         };
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, events);
     }
 
@@ -808,6 +902,7 @@ impl CertCache {
             {
                 return Some(OcspUpdateState::from(current.certificate.as_ref()));
             }
+            let old_deadline = current.ocsp_deadline();
             let certificate = Arc::make_mut(&mut current.certificate);
             certificate.ocsp_status = status;
             certificate.ocsp_response = response.clone();
@@ -831,15 +926,18 @@ impl CertCache {
             } else {
                 None
             };
-            (
+            let new_deadline = current.ocsp_deadline();
+            let result = (
                 CacheEvent::Updated {
                     names: current.certificate.names.clone(),
                     hash: hash.to_owned(),
                 },
                 OcspUpdateState::from(current.certificate.as_ref()),
-            )
+            );
+            state.change_ocsp_deadline(hash, old_deadline, new_deadline);
+            result
         };
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, vec![event]);
         Some(published)
     }
@@ -1117,7 +1215,7 @@ impl CertCache {
             }
             state.add(cert, key, leaf_hash, &options, &mut events);
         }
-        self.ocsp_changed.send_replace(());
+        self.notify_ocsp_schedule();
         dispatch_events(&options, events);
         Ok(())
     }
@@ -1199,6 +1297,202 @@ pub(crate) mod tests {
             Utc::now(),
             Utc::now() + chrono::Duration::seconds(seconds),
         )
+    }
+
+    #[tokio::test]
+    async fn ocsp_index_is_bounded_and_untracked_imports_do_not_wake_maintenance() {
+        let cache = CertCache::new(CacheOptions::default());
+        let mut changes = cache.subscribe_ocsp();
+        for index in 0..1000 {
+            cache
+                .add(make_cert(
+                    &[&format!("host-{index}.example.com")],
+                    &index.to_string(),
+                    false,
+                ))
+                .await;
+        }
+        assert!(!changes.has_changed().unwrap());
+        assert!(cache.next_ocsp_deadline().is_none());
+        let (mut cert, issuer) = signed_certificate();
+        cert.ocsp_status = Some(crate::ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(signed_staple(&cert, &issuer, 3600));
+        let hash = cert.hash.clone();
+        cache.add(cert.clone()).await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        for index in 0..20 {
+            let response = signed_staple(&cert, &issuer, 4000 + index);
+            cache
+                .update_ocsp_if_present(&hash, Some(crate::ocsp::OcspStatus::Good), Some(response))
+                .await
+                .unwrap();
+            let state = cache.state.read().unwrap();
+            let records: usize = state.ocsp_deadlines.values().map(HashSet::len).sum();
+            assert_eq!(records, 1, "an old deadline survived an OCSP update");
+            assert_eq!(
+                state.next_ocsp_deadline(),
+                state.certificates[&hash].ocsp_deadline()
+            );
+        }
+        changes.borrow_and_update();
+        cache
+            .add(make_cert(&["untracked.example.com"], "untracked", false))
+            .await;
+        assert!(!changes.has_changed().unwrap());
+        cache.remove(&hash).await;
+        assert!(cache.next_ocsp_deadline().is_none());
+        assert!(cache.state.read().unwrap().ocsp_deadlines.is_empty());
+        cache.add(cert).await;
+        let leaf_hash = cache.state.read().unwrap().certificates[&hash]
+            .leaf_hash
+            .clone()
+            .unwrap();
+        cache.deny_revoked_certificate(&leaf_hash).await;
+        assert!(cache.state.read().unwrap().ocsp_deadlines.is_empty());
+        assert!(cache.ocsp_snapshot(false).is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_publication_rechecks_time_after_real_aia_wait_before_replacing() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for replacing in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/issuer", listener.local_addr().unwrap());
+            let issuer_key = rcgen::KeyPair::generate().unwrap();
+            let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+            let ca_cert = ca.self_signed(&issuer_key).unwrap();
+            let issuer = rcgen::Issuer::new(ca, &issuer_key);
+            let leaf_key = rcgen::KeyPair::generate().unwrap();
+            let mut params =
+                rcgen::CertificateParams::new(vec!["ocsp.example.com".into()]).unwrap();
+            params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+            params.not_after = params.not_before
+                + Duration::from_secs((Utc::now().timestamp() + 2).try_into().unwrap());
+            let wrap = |tag: u8, value: &[u8]| {
+                assert!(value.len() < 128);
+                [vec![tag, value.len() as u8], value.to_vec()].concat()
+            };
+            let access = wrap(
+                0x30,
+                &[
+                    vec![0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02],
+                    wrap(0x86, url.as_bytes()),
+                ]
+                .concat(),
+            );
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 5, 5, 7, 1, 1],
+                    wrap(0x30, &access),
+                ));
+            let leaf = params.signed_by(&leaf_key, &issuer).unwrap();
+            let mut incoming =
+                Certificate::from_pem(leaf.pem().as_bytes(), leaf_key.serialize_pem().as_bytes())
+                    .unwrap();
+            incoming.managed = true;
+            incoming.ocsp_status = Some(crate::ocsp::OcspStatus::Good);
+            incoming.ocsp_response = Some(crate::ocsp::tests::signed_response(
+                &[leaf.der().clone(), ca_cert.der().clone()],
+                &issuer_key,
+                0,
+                Utc::now(),
+                Utc::now() + chrono::Duration::hours(1),
+            ));
+            assert!(!incoming.expired());
+            let expires = incoming.not_after + chrono::Duration::seconds(1);
+            let hash = incoming.hash.clone();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let server = tokio::spawn({
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    entered.notify_one();
+                    release.notified().await;
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", ca_cert.der().len()).as_bytes()).await.unwrap();
+                    socket.write_all(ca_cert.der()).await.unwrap();
+                }
+            });
+            let cache = CertCache::new(CacheOptions::default());
+            let (old, _) = signed_certificate();
+            let root = old.cert_chain[1].clone();
+            let old_leaf = old.cert_chain[0].clone();
+            let old_hash = old.hash.clone();
+            cache.add(old).await;
+            let before = cache.resolve("ocsp.example.com").unwrap().key;
+            let worker = tokio::spawn({
+                let cache = cache.clone();
+                let old_hash = old_hash.clone();
+                let incoming = incoming.clone();
+                async move {
+                    if replacing {
+                        cache
+                            .replace_managed(&old_hash, incoming, "ocsp.example.com")
+                            .await
+                    } else {
+                        cache.add_managed(incoming, "ocsp.example.com").await
+                    }
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .unwrap();
+            assert!(cache.get_by_hash(&hash).await.is_none());
+            assert!(Arc::ptr_eq(
+                &before,
+                &cache.resolve("ocsp.example.com").unwrap().key
+            ));
+            tokio::time::sleep(
+                (expires - Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(20),
+            )
+            .await;
+            release.notify_one();
+            let error = worker.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                crate::Error::Cert(crate::error::CertError::Expired(_))
+            ));
+            server.await.unwrap();
+            assert!(cache.get_by_hash(&hash).await.is_none());
+            assert!(cache.get_by_hash(&old_hash).await.is_some());
+            assert!(Arc::ptr_eq(
+                &before,
+                &cache.resolve("ocsp.example.com").unwrap().key
+            ));
+            crate::install_default_crypto_provider();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(root).unwrap();
+            let client = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(crate::handshake::CertResolver::new(cache.clone())));
+            let (server_io, client_io) = tokio::io::duplex(16384);
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            let (server_tls, client_tls) = tokio::join!(
+                acceptor.accept(server_io),
+                connector.connect("ocsp.example.com".try_into().unwrap(), client_io)
+            );
+            server_tls.unwrap();
+            assert_eq!(
+                client_tls.unwrap().get_ref().1.peer_certificates().unwrap()[0],
+                old_leaf
+            );
+            // The public low-level API intentionally retains historical-import
+            // semantics, independent of guarded managed publication.
+            incoming.ocsp_response = None;
+            cache.add(incoming).await;
+            assert!(cache.get_by_hash(&hash).await.is_some());
+        }
     }
 
     #[tokio::test]

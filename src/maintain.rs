@@ -310,20 +310,23 @@ async fn maintenance_loop(
                     None => std::future::pending::<()>().await,
                 }
             };
-            tokio::select! {
-                _ = ocsp_ticker.tick() => {},
-                _ = due => {},
+            let periodic = tokio::select! {
+                _ = ocsp_ticker.tick() => true,
+                _ = due => false,
                 _ = changed.changed() => continue,
-            }
+            };
             debug!("maintenance: running OCSP staple check");
-            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+            if periodic
+                && let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await
+            {
                 warn!(%error, "maintenance: failed to refresh revocation intent");
             }
-            update_ocsp_staples(
+            update_ocsp_staples_for(
                 &cache,
                 config.storage.as_ref(),
                 &config.ocsp,
                 policy.renew.as_ref(),
+                periodic,
             )
             .await;
         }
@@ -517,8 +520,10 @@ async fn try_reload_from_storage(
             new_hash = %stored_cert.hash,
             "maintenance: certificate already renewed by another instance; reloading from storage",
         );
-        cache.replace(&cached_cert.hash, stored_cert).await;
-        return true;
+        return cache
+            .replace_managed(&cached_cert.hash, stored_cert, domain)
+            .await
+            .is_ok();
     }
 
     false
@@ -540,18 +545,29 @@ async fn try_reload_from_storage(
 ///
 /// If a certificate's OCSP status is `Revoked` and `config.replace_revoked`
 /// is enabled, a force-renewal is triggered via `renew_func`.
+#[cfg(test)]
 async fn update_ocsp_staples(
     cache: &CertCache,
     storage: &dyn Storage,
     config: &OcspConfig,
     renew_func: &ReasonedRenewFn,
 ) {
+    update_ocsp_staples_for(cache, storage, config, renew_func, true).await;
+}
+
+async fn update_ocsp_staples_for(
+    cache: &CertCache,
+    storage: &dyn Storage,
+    config: &OcspConfig,
+    renew_func: &ReasonedRenewFn,
+    periodic: bool,
+) {
     if config.disable_stapling {
         debug!("maintenance: OCSP stapling is disabled; skipping update");
         return;
     }
 
-    let all_certs = cache.maintenance_snapshot(false);
+    let all_certs = cache.ocsp_snapshot(periodic);
 
     if all_certs.is_empty() {
         debug!("maintenance: no certificates to check for OCSP updates");
@@ -904,6 +920,7 @@ mod tests {
     /// Pause the actual OCSP cache read while another lifecycle operation runs.
     struct GatedOcspStorage {
         files: crate::FileStorage,
+        loads: AtomicUsize,
         block_next_load: AtomicBool,
         offline: AtomicBool,
         entered: tokio::sync::Notify,
@@ -914,6 +931,7 @@ mod tests {
         fn new(path: &std::path::Path) -> Self {
             Self {
                 files: crate::FileStorage::new(path),
+                loads: AtomicUsize::new(0),
                 block_next_load: AtomicBool::new(false),
                 offline: AtomicBool::new(false),
                 entered: tokio::sync::Notify::new(),
@@ -925,6 +943,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Storage for GatedOcspStorage {
         async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
             if self.block_next_load.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
                 self.release.notified().await;
@@ -1002,6 +1021,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn certificates_without_ocsp_support_keep_the_periodic_hour_poll() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut cert, _) = signed_certificate();
+        cert.managed = false;
+        cache.add(cert).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(GatedOcspStorage::new(directory.path()));
+        // Make storage failure immediate; with no AIA or responder override it
+        // must not convert the ordinary periodic poll into a short retry timer.
+        storage.offline.store(true, Ordering::SeqCst);
+        let maintenance = start_maintenance(
+            cache.clone(),
+            MaintenanceConfig {
+                renew_check_interval: DEFAULT_RENEW_CHECK_INTERVAL,
+                ocsp_check_interval: DEFAULT_OCSP_CHECK_INTERVAL,
+                ocsp: OcspConfig::default(),
+                storage: storage.clone(),
+            },
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 0);
+        tokio::time::advance(DEFAULT_OCSP_CHECK_INTERVAL - Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 1);
+        assert!(cache.next_ocsp_deadline().is_none());
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.loads.load(Ordering::SeqCst), 1);
+        cache.stop_and_wait().await;
+        maintenance.await.unwrap();
     }
 
     #[tokio::test]
