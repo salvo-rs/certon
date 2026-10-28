@@ -35,7 +35,8 @@ use crate::cache::CertCache;
 use crate::cert_store::{CertStore, KeyValueCertStore};
 use crate::certificates::{Certificate, subject_qualifies_for_cert};
 use crate::crypto::{
-    KeyType, decode_private_key_pem, encode_private_key_pem, generate_csr, generate_private_key,
+    KeyType, decode_private_key_pem, encode_private_key_pem, generate_csr,
+    generate_private_key_async,
 };
 use crate::error::{Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
@@ -985,7 +986,7 @@ impl CertManager {
         let (private_key, private_key_pem) = if self.policy.reuse_private_keys {
             self.load_or_generate_private_key(domain).await?
         } else {
-            let pk = generate_private_key(self.policy.key_type)?;
+            let pk = generate_private_key_async(self.policy.key_type).await?;
             let pem = encode_private_key_pem(&pk)?;
             (pk, pem)
         };
@@ -1099,7 +1100,7 @@ impl CertManager {
         }
 
         // No existing key found; generate a new one.
-        let pk = generate_private_key(self.policy.key_type)?;
+        let pk = generate_private_key_async(self.policy.key_type).await?;
         let pem = encode_private_key_pem(&pk)?;
         Ok((pk, pem))
     }
@@ -1266,7 +1267,7 @@ impl CertManager {
             let key = decode_private_key_pem(pem)?;
             (key, pem.to_owned())
         } else {
-            let pk = generate_private_key(self.policy.key_type)?;
+            let pk = generate_private_key_async(self.policy.key_type).await?;
             let pem = encode_private_key_pem(&pk)?;
             (pk, pem)
         };
@@ -1944,7 +1945,7 @@ mod tests {
             }
         }
         let store = Arc::new(crate::cert_store::tests::InMemory::default());
-        let key = generate_private_key(KeyType::EcdsaP256).unwrap();
+        let key = crate::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
         let pem = encode_private_key_pem(&key).unwrap();
         store
             .save(

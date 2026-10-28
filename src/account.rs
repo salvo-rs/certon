@@ -367,7 +367,9 @@ pub async fn get_or_create_account(
                 ca = ca_url,
                 "creating new ACME account (no existing account found in storage)"
             );
-            let account = new_account(email, key_type)?;
+            let email = email.to_owned();
+            let account =
+                crate::crypto::run_key_generation(move || new_account(&email, key_type)).await?;
             Ok((account, true))
         }
     }
