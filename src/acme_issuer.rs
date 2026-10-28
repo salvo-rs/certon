@@ -1334,7 +1334,7 @@ impl AcmeIssuer {
         let result = self.do_issue(csr_der, domains, false, attempt).await;
 
         match result {
-            Ok((cert, _used_test)) => return Ok(cert),
+            Ok((cert, _used_test)) => Ok(cert),
             Err(first_err) => {
                 // If a test CA is configured and different from production,
                 // try the test CA as a fallback to verify our setup is
@@ -1368,7 +1368,7 @@ impl AcmeIssuer {
                     }
                 }
 
-                return Err(first_err);
+                Err(first_err)
             }
         }
     }
