@@ -561,14 +561,17 @@ async fn maintenance_repairs_fresh_partial_storage_and_keeps_the_lookup_key_on_r
     let directory = tempfile::tempdir().unwrap();
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
     let mut issuer = TestIssuer::new();
-    issuer.not_after_year = chrono::Utc::now().year() + 2;
+    // An explicitly expired leaf makes this independent of the current month.
+    issuer.not_before_year = chrono::Utc::now().year() - 4;
+    issuer.not_after_year = chrono::Utc::now().year() - 1;
     let ab = resource_with_names(
         &issuer,
         &["a.example.com", "b.example.com"],
         "a.example.com",
     )
     .await;
-    issuer.not_after_year += 2;
+    issuer.not_before_year = chrono::Utc::now().year() - 2;
+    issuer.not_after_year = chrono::Utc::now().year() + 4;
     let ac = resource_with_names(
         &issuer,
         &["a.example.com", "c.example.com"],
