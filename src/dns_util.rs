@@ -264,6 +264,9 @@ pub async fn check_dns_propagation_with_resolvers(
     );
 
     loop {
+        // Propagation checks must observe new authoritative data rather than
+        // retaining the previous TXT value or NXDOMAIN for its full TTL.
+        resolver.clear_cache();
         // Perform a real DNS TXT record lookup via hickory-resolver.
         let lookup = async {
             let response = resolver

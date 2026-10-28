@@ -728,6 +728,7 @@ pub struct Dns01Solver {
 
 /// Information remembered about a presented DNS record, used for cleanup.
 #[cfg(feature = "dns-01")]
+#[derive(Clone)]
 struct DnsRecordMemory {
     zone: String,
     relative_name: String,
@@ -828,20 +829,21 @@ impl Solver for Dns01Solver {
             "creating DNS TXT record for ACME challenge"
         );
 
-        self.provider
-            .set_record(&zone, &relative_name, &txt_value, self.ttl)
-            .await?;
-
-        // Remember for cleanup.
+        // Remember the intended record before contacting the provider: a
+        // cancelled request may already have created the remote TXT record.
         let memory = DnsRecordMemory {
-            zone,
-            relative_name,
+            zone: zone.clone(),
+            relative_name: relative_name.clone(),
             value: txt_value.clone(),
         };
         {
             let mut records = self.records.write().await;
-            records.insert((dns_name, txt_value), memory);
+            records.insert((dns_name, txt_value.clone()), memory);
         }
+
+        self.provider
+            .set_record(&zone, &relative_name, &txt_value, self.ttl)
+            .await?;
 
         Ok(())
     }
@@ -883,8 +885,8 @@ impl Solver for Dns01Solver {
         let txt_value = challenge_record_value(key_auth);
 
         let memory = {
-            let mut records = self.records.write().await;
-            records.remove(&(dns_name.clone(), txt_value))
+            let records = self.records.read().await;
+            records.get(&(dns_name.clone(), txt_value.clone())).cloned()
         };
 
         if let Some(mem) = memory {
@@ -896,6 +898,9 @@ impl Solver for Dns01Solver {
             self.provider
                 .delete_record(&mem.zone, &mem.relative_name, &mem.value)
                 .await?;
+            // Retain the intent while deletion is in flight so cancellation
+            // cleanup can retry an interrupted provider request.
+            self.records.write().await.remove(&(dns_name, txt_value));
         } else {
             warn!(
                 dns_name = %dns_name,
