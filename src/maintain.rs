@@ -133,7 +133,9 @@ pub fn start_maintenance(
         "starting certificate maintenance loop",
     );
 
+    let maintenance = cache.maintenance_guard();
     tokio::spawn(async move {
+        let _maintenance = maintenance;
         maintenance_loop_with_recovery(cache, config, renew_func, renew_interval, ocsp_interval)
             .await;
     })
@@ -154,14 +156,27 @@ async fn maintenance_loop_with_recovery(
         let config_clone = config.clone();
         let renew_func_clone = Arc::clone(&renew_func);
 
-        let result = tokio::task::spawn(maintenance_loop(
-            cache_clone,
-            config_clone,
-            renew_func_clone,
-            renew_interval,
-            ocsp_interval,
-        ))
-        .await;
+        let inner_maintenance = cache_clone.maintenance_guard();
+        let task = tokio::task::spawn(async move {
+            let _maintenance = inner_maintenance;
+            maintenance_loop(
+                cache_clone,
+                config_clone,
+                renew_func_clone,
+                renew_interval,
+                ocsp_interval,
+            )
+            .await;
+        });
+        // The recovery wrapper must not detach its loop when aborted.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _abort_on_drop = AbortOnDrop(task.abort_handle());
+        let result = task.await;
 
         match result {
             Ok(()) => {
@@ -192,9 +207,6 @@ async fn maintenance_loop_with_recovery(
             }
         }
     }
-
-    // Signal that the maintenance loop is done so stop_and_wait can resolve.
-    cache.signal_done();
 }
 
 /// The inner maintenance loop, running inside a spawned task.
@@ -206,6 +218,9 @@ async fn maintenance_loop(
     ocsp_interval: Duration,
 ) {
     let mut stop_rx = cache.subscribe_stop();
+    if *stop_rx.borrow() {
+        return;
+    }
     let job_queue = JobQueue::new("renewal");
 
     let mut renew_ticker = tokio::time::interval(renew_interval);
@@ -1022,5 +1037,56 @@ mod tests {
         async fn unlock(&self, _name: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn maintenance_shutdown_is_registered_before_task_start() {
+        for stopped_before_start in [false, true] {
+            let cache = CertCache::new(CacheOptions::default());
+            if stopped_before_start {
+                cache.stop();
+            }
+            let handle = start_maintenance(
+                Arc::clone(&cache),
+                MaintenanceConfig {
+                    renew_check_interval: Duration::from_secs(3600),
+                    ocsp_check_interval: Duration::from_secs(3600),
+                    ocsp: OcspConfig::default(),
+                    storage: Arc::new(DummyStorage),
+                },
+                Arc::new(|_| Box::pin(async { Ok(()) })),
+            );
+            tokio::time::timeout(Duration::from_secs(1), cache.stop_and_wait())
+                .await
+                .unwrap();
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn aborting_outer_maintenance_joins_inner_registration() {
+        let cache = CertCache::new(CacheOptions::default());
+        let handle = start_maintenance(
+            Arc::clone(&cache),
+            MaintenanceConfig {
+                renew_check_interval: Duration::from_secs(3600),
+                ocsp_check_interval: Duration::from_secs(3600),
+                ocsp: OcspConfig::default(),
+                storage: Arc::new(DummyStorage),
+            },
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        );
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), cache.stop_and_wait())
+            .await
+            .unwrap();
+        assert_eq!(
+            Arc::strong_count(&cache),
+            1,
+            "inner maintenance task was detached"
+        );
     }
 }
