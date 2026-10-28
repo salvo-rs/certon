@@ -44,6 +44,20 @@ const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// deployments. For multi-server / clustered deployments, consider a
 /// shared-filesystem or database-backed implementation.
 ///
+/// # Directory trust
+///
+/// The root and its parent directories must be controlled by trusted operators.
+/// Keep certificate files and private keys inaccessible to other accounts using
+/// Unix permissions or Windows ACLs. Key validation rejects lexical traversal,
+/// but filesystem operations can follow symbolic links, junctions and other
+/// reparse points. This backend does not confine an attacker who can replace
+/// directories or links beneath the root. Do not use an attacker-writable tree
+/// or allow untrusted uploads in the storage directory.
+///
+/// Unix writes create restricted files and attempt to restrict the immediate
+/// parent directory. This does not verify ownership or all ancestor permissions;
+/// Windows ACLs must be configured by the operator before use.
+///
 /// # Locking
 ///
 /// Locks are OS advisory locks on permanent files under
