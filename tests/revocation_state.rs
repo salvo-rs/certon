@@ -171,6 +171,13 @@ async fn handshake(
     manager: &CertManager,
     issuer: &TestIssuer,
 ) -> std::result::Result<Vec<u8>, String> {
+    handshake_for_domain(manager, issuer, "example.com").await
+}
+async fn handshake_for_domain(
+    manager: &CertManager,
+    issuer: &TestIssuer,
+    domain: &str,
+) -> std::result::Result<Vec<u8>, String> {
     certon::install_default_crypto_provider();
     let mut roots = rustls::RootCertStore::empty();
     roots.add(issuer.root.clone()).unwrap();
@@ -182,7 +189,7 @@ async fn handshake(
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
     let (server, client) = tokio::join!(
         acceptor.accept(server_io),
-        connector.connect("example.com".try_into().unwrap(), client_io)
+        connector.connect(domain.to_owned().try_into().unwrap(), client_io)
     );
     server.map_err(|error| error.to_string())?;
     Ok(client
@@ -457,6 +464,7 @@ struct MarkerFaultStorage {
     inner: Arc<dyn Storage>,
     fail_read: std::sync::atomic::AtomicBool,
     fail_write: std::sync::atomic::AtomicBool,
+    failed_key: std::sync::Mutex<Option<String>>,
 }
 #[async_trait::async_trait]
 impl Storage for MarkerFaultStorage {
@@ -467,7 +475,9 @@ impl Storage for MarkerFaultStorage {
         self.inner.store(key, value).await
     }
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
-        if key.starts_with("revocations/") && self.fail_read.load(Ordering::SeqCst) {
+        if self.failed_key.lock().unwrap().as_deref() == Some(key)
+            || (key.starts_with("revocations/") && self.fail_read.load(Ordering::SeqCst))
+        {
             return Err(certon::Error::Other("marker read unavailable".into()));
         }
         self.inner.load(key).await
@@ -499,6 +509,7 @@ async fn intent_storage_failure_prevents_ca_call_and_failed_marker_reads_prevent
         inner: storage.clone(),
         fail_read: false.into(),
         fail_write: true.into(),
+        failed_key: Default::default(),
     });
     let manager = self::manager(faulty.clone(), store.clone(), issuer.clone());
     assert!(
@@ -644,4 +655,147 @@ async fn custom_store_aliases_serialize_the_same_leaf_before_revoking_the_replac
     assert_ne!(revoked, resource.certificate_pem);
     assert!(store.resource.lock().unwrap().is_none());
     assert!(handshake(&manager, &issuer).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmanaged_admission_rejects_quarantined_leaf_without_deleting_its_replacement() {
+    let (_dir, _storage, store, issuer, manager) = fixture().await;
+    let old_resource = store.resource.lock().unwrap().clone().unwrap();
+    let old = manager.cache.get_all().await[0].clone();
+    issuer.revoke_mode.store(2, Ordering::SeqCst);
+    assert!(manager.revoke("example.com", None).await.is_err());
+    manager.renew("example.com", true).await.unwrap();
+    let fresh = handshake(&manager, &issuer).await.unwrap();
+    let replacement = manager
+        .cache
+        .cache_unmanaged_replacing(
+            &old_resource.certificate_pem,
+            &old_resource.private_key_pem,
+            vec![],
+        )
+        .await;
+    assert_eq!(
+        handshake(&manager, &issuer).await.unwrap(),
+        fresh,
+        "stale admission deleted the valid replacement"
+    );
+    assert!(
+        replacement.is_err(),
+        "stale replacement must be rejected before deleting the current certificate"
+    );
+    assert!(
+        manager
+            .cache
+            .cache_unmanaged_pem(
+                &old_resource.certificate_pem,
+                &old_resource.private_key_pem,
+                vec![]
+            )
+            .await
+            .is_err(),
+        "non-replacing admission falsely reported success"
+    );
+    assert!(
+        manager
+            .cache
+            .cache_unmanaged_certified_key(
+                old.cert_chain.clone(),
+                rustls::pki_types::PrivateKeyDer::try_from(old.private_key_der.clone().unwrap())
+                    .unwrap(),
+                vec![]
+            )
+            .await
+            .is_err(),
+        "DER admission falsely reported success"
+    );
+    assert_eq!(handshake(&manager, &issuer).await.unwrap(), fresh);
+    assert_eq!(manager.cache.get_all().await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_quarantines_later_leaves_after_an_earlier_marker_failure() {
+    for corrupt_json in [true, false] {
+        let (_dir, storage, _store, issuer, manager) = fixture().await;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["other.example.com".into()])
+            .unwrap()
+            .signed_by(&key, &issuer.ca)
+            .unwrap();
+        let mut extra =
+            certon::Certificate::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes())
+                .unwrap();
+        extra.managed = true;
+        manager.cache.add(extra).await;
+        // Use the cache's actual snapshot order to place the failure first;
+        // neither HashMap randomization nor certificate selection can hide it.
+        let snapshot = manager.cache.get_managed_certificates().await;
+        assert_eq!(snapshot.len(), 2);
+        let marker_key = |cert: &certon::Certificate| {
+            format!(
+                "revocations/{}.json",
+                certon::certificates::hash_certificate_chain(&cert.cert_chain[..1])
+            )
+        };
+        let first = marker_key(&snapshot[0]);
+        let later = marker_key(&snapshot[1]);
+        storage
+            .store(
+                &first,
+                if corrupt_json {
+                    b"invalid JSON"
+                } else {
+                    br#"{"version":1,"confirmed":true}"#
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .store(&later, br#"{"version":1,"confirmed":true}"#)
+            .await
+            .unwrap();
+        let faulty = Arc::new(MarkerFaultStorage {
+            inner: storage,
+            fail_read: false.into(),
+            fail_write: false.into(),
+            failed_key: std::sync::Mutex::new((!corrupt_json).then_some(first)),
+        });
+        let observer = CertManager::builder()
+            .storage(faulty)
+            .cache(manager.cache.clone())
+            .build();
+        assert!(
+            observer.refresh_revocations().await.is_err(),
+            "partial failure must be reported"
+        );
+        assert!(
+            manager.cache.get_by_hash(&snapshot[1].hash).await.is_none(),
+            "a bad earlier marker prevented quarantine of another revoked leaf"
+        );
+        assert!(
+            handshake_for_domain(
+                &manager,
+                &issuer,
+                snapshot[1]
+                    .names
+                    .iter()
+                    .find(|name| name.ends_with("example.com"))
+                    .unwrap()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            handshake_for_domain(
+                &manager,
+                &issuer,
+                snapshot[0]
+                    .names
+                    .iter()
+                    .find(|name| name.ends_with("example.com"))
+                    .unwrap()
+            )
+            .await
+            .is_ok()
+        );
+    }
 }

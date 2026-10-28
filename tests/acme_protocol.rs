@@ -22,6 +22,7 @@ struct Server {
     url: String,
     requests: Arc<Mutex<Vec<Request>>>,
     task: tokio::task::JoinHandle<()>,
+    revoke_responses: Arc<Mutex<std::collections::VecDeque<(u16, Value)>>>,
 }
 
 trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -53,6 +54,9 @@ impl Server {
         let requests = Arc::new(Mutex::new(Vec::<Request>::new()));
         let recorded = Arc::clone(&requests);
         let base = url.clone();
+        let revoke_responses =
+            Arc::new(Mutex::new(std::collections::VecDeque::<(u16, Value)>::new()));
+        let responses = revoke_responses.clone();
         let task = tokio::spawn(async move {
             let mut orders = 0;
             loop {
@@ -141,6 +145,11 @@ impl Server {
                     } else { json!({"status":"valid", "identifier":{"type":"dns", "value":"review.example.com"}}).to_string() },
                     "/finalize" => json!({"status":"valid", "certificate":format!("{base}/cert")}).to_string(),
                     "/cert" => "test certificate chain".into(),
+                    "/revoke" => {
+                        let response = responses.lock().unwrap().pop_front().unwrap_or((200, Value::Null));
+                        status = response.0;
+                        if response.1.is_null() { String::new() } else { response.1.to_string() }
+                    }
                     "/ari/id" => {
                         extra = "Retry-After: 120\r\n".into();
                         json!({"suggestedWindow":{"start":"2026-01-01T00:00:00Z", "end":"2026-01-02T00:00:00Z"}, "retryAfter":999}).to_string()
@@ -158,6 +167,7 @@ impl Server {
             url,
             requests,
             task,
+            revoke_responses,
         }
     }
 }
@@ -369,4 +379,231 @@ async fn total_timeout_cleans_presented_challenge() {
     tokio::time::timeout(Duration::from_secs(2), cleaned.notified())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn acme_revocation_accepts_only_the_exact_already_revoked_problem() {
+    let server = Server::start(false).await;
+    let client = AcmeClient::new(&format!("{}/directory", server.url))
+        .await
+        .unwrap();
+    let supplied = rcgen::KeyPair::generate().unwrap();
+    let key = certon::crypto::decode_private_key_pem(&supplied.serialize_pem()).unwrap();
+    for (status, problem_type, succeeds) in [
+        (400, "urn:ietf:params:acme:error:alreadyRevoked", true),
+        (400, "urn:ietf:params:acme:error:unauthorized", false),
+        (400, "urn:example:alreadyRevoked", false),
+        (
+            400,
+            "urn:ietf:params:acme:error:alreadyRevokedSuffix",
+            false,
+        ),
+        (500, "urn:ietf:params:acme:error:alreadyRevoked", false),
+    ] {
+        server.revoke_responses.lock().unwrap().push_back((
+            status,
+            json!({"type":problem_type,"detail":"alreadyRevoked text is not authoritative"}),
+        ));
+        assert_eq!(
+            client
+                .revoke_certificate(
+                    &key,
+                    &format!("{}/account", server.url),
+                    b"certificate-der",
+                    Some(1)
+                )
+                .await
+                .is_ok(),
+            succeeds,
+            "status={status}, type={problem_type}"
+        );
+    }
+    // A nonce retry must preserve the same narrowly accepted outcome.
+    server.revoke_responses.lock().unwrap().extend([
+        (400, json!({"type":"urn:ietf:params:acme:error:badNonce"})),
+        (
+            400,
+            json!({"type":"urn:ietf:params:acme:error:alreadyRevoked"}),
+        ),
+    ]);
+    client
+        .revoke_certificate(
+            &key,
+            &format!("{}/account", server.url),
+            b"certificate-der",
+            Some(1),
+        )
+        .await
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let revocations: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/revoke")
+        .collect();
+    assert_eq!(revocations.len(), 7);
+    for request in revocations {
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.protected["url"], format!("{}/revoke", server.url));
+        assert_eq!(request.protected["kid"], format!("{}/account", server.url));
+        assert_eq!(
+            request.payload,
+            json!({"certificate":URL_SAFE_NO_PAD.encode(b"certificate-der"),"reason":1})
+        );
+        #[cfg(feature = "aws-lc-rs")]
+        use aws_lc_rs as provider;
+        #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+        use ring as provider;
+        provider::signature::UnparsedPublicKey::new(
+            &provider::signature::ECDSA_P256_SHA256_FIXED,
+            supplied.public_key_raw(),
+        )
+        .verify(&request.signing_input, &request.signature)
+        .unwrap();
+    }
+}
+
+struct ConfirmationFaultStorage {
+    inner: Arc<dyn certon::Storage>,
+    fail_confirmation: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl certon::Storage for ConfirmationFaultStorage {
+    async fn store(&self, key: &str, value: &[u8]) -> certon::Result<()> {
+        if key.starts_with("revocations/")
+            && serde_json::from_slice::<Value>(value).unwrap()["confirmed"] == true
+            && self
+                .fail_confirmation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(certon::Error::Other(
+                "injected confirmation write failure".into(),
+            ));
+        }
+        self.inner.store(key, value).await
+    }
+    async fn load(&self, key: &str) -> certon::Result<Vec<u8>> {
+        self.inner.load(key).await
+    }
+    async fn delete(&self, key: &str) -> certon::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> certon::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn list(&self, path: &str, recursive: bool) -> certon::Result<Vec<String>> {
+        self.inner.list(path, recursive).await
+    }
+    async fn stat(&self, key: &str) -> certon::Result<certon::storage::KeyInfo> {
+        self.inner.stat(key).await
+    }
+    async fn lock(&self, name: &str) -> certon::Result<()> {
+        self.inner.lock(name).await
+    }
+    async fn unlock(&self, name: &str) -> certon::Result<()> {
+        self.inner.unlock(name).await
+    }
+}
+
+#[tokio::test]
+async fn acme_revocation_retries_confirmation_failure_and_cleans_up_already_revoked_leaf() {
+    use certon::Storage;
+    let server = Server::start(false).await;
+    server.revoke_responses.lock().unwrap().extend([
+        (200, Value::Null),
+        (
+            400,
+            json!({"type":"urn:ietf:params:acme:error:alreadyRevoked"}),
+        ),
+    ]);
+    let directory = tempfile::tempdir().unwrap();
+    let inner = Arc::new(FileStorage::new(directory.path()));
+    let storage = Arc::new(ConfirmationFaultStorage {
+        inner: inner.clone(),
+        fail_confirmation: true.into(),
+    });
+    let ca = format!("{}/directory", server.url);
+    let issuer = Arc::new(
+        AcmeIssuer::builder()
+            .ca(&ca)
+            .test_ca(&ca)
+            .storage(storage.clone())
+            .email("review@example.com")
+            .agreed(true)
+            .build(),
+    );
+    let manager = certon::CertManager::builder()
+        .storage(storage)
+        .issuers(vec![issuer.clone()])
+        .ocsp(certon::OcspConfig {
+            disable_stapling: true,
+            ..Default::default()
+        })
+        .build();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["review.example.com".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let resource = certon::CertificateResource {
+        sans: vec!["review.example.com".into()],
+        certificate_pem: cert.pem().into_bytes(),
+        private_key_pem: key.serialize_pem().into_bytes(),
+        issuer_key: issuer.issuer_key(),
+        issuer_data: None,
+    };
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &resource)
+        .await
+        .unwrap();
+    manager
+        .manage(&["review.example.com".into()])
+        .await
+        .unwrap();
+    let first_error = manager
+        .revoke("review.example.com", Some(1))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(first_error.contains("confirmation write failure"));
+    let marker_keys = inner.list("revocations", true).await.unwrap();
+    assert_eq!(marker_keys.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&inner.load(&marker_keys[0]).await.unwrap()).unwrap()["confirmed"],
+        false
+    );
+    assert!(manager.cache.get_all().await.is_empty());
+    assert!(
+        manager
+            .load_certificate("review.example.com")
+            .await
+            .is_err()
+    );
+    manager.revoke("review.example.com", Some(1)).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&inner.load(&marker_keys[0]).await.unwrap()).unwrap()["confirmed"],
+        true
+    );
+    assert!(
+        manager
+            .certificates
+            .load(&issuer.issuer_key(), "review.example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let requests = server.requests.lock().unwrap();
+    let revocations: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/revoke")
+        .collect();
+    assert_eq!(revocations.len(), 2);
+    for request in revocations {
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(request.payload["certificate"].as_str().unwrap())
+                .unwrap(),
+            cert.der().as_ref()
+        );
+    }
 }

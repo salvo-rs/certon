@@ -88,3 +88,19 @@ need no changes. ZeroSSL REST overrides it to use
 that issuer directly. Passing JSON metadata in the PEM argument is no longer
 supported. A successful HTTP status alone is not provider confirmation:
 ZeroSSL's response must contain a positive success field and no error.
+
+
+ACME revocation retries treat only HTTP 400 with the exact RFC 8555
+`urn:ietf:params:acme:error:alreadyRevoked` problem as provider confirmation.
+This lets pending intent recover when the CA succeeded but recording local
+confirmation failed. Other problem types and HTTP statuses remain errors.
+See [RFC 8555 section 7.6](https://www.rfc-editor.org/rfc/rfc8555.html#section-7.6).
+Detached revocation workers log operation errors even when their caller no
+longer awaits the result. Revocation refresh reports partial failures while
+continuing to quarantine other leaves with readable intent markers.
+
+The Result-returning unmanaged cache helpers reject a quarantined leaf with
+an error. Replacing admission checks revocation and updates membership under
+one lock, so stale input cannot delete a valid replacement before rejection.
+The low-level `CertCache::add()` signature stays unchanged and silently ignores
+quarantined leaves.

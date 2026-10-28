@@ -1373,9 +1373,15 @@ impl CertManager {
         let domain = domain.to_lowercase();
         // Dropping the caller's future must not interrupt an irreversible CA
         // operation between acknowledgement and local invalidation/cleanup.
-        tokio::spawn(async move { worker.revoke_locked(&domain, reason).await })
-            .await
-            .map_err(|error| Error::Other(format!("revocation task failed: {error}")))?
+        tokio::spawn(async move {
+            let result = worker.revoke_locked(&domain, reason).await;
+            if let Err(error) = &result {
+                error!(%domain, %error, "certificate revocation failed");
+            }
+            result
+        })
+        .await
+        .map_err(|error| Error::Other(format!("revocation task failed: {error}")))?
     }
 
     async fn revoke_locked(&self, domain: &str, reason: Option<u8>) -> Result<()> {

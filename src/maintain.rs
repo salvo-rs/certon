@@ -316,17 +316,28 @@ async fn maintenance_loop(
 
 pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
     let mut invalidated = 0;
+    let mut first_error = None;
     for cert in cache.get_managed_certificates().await {
-        if let Some(hash) = crate::storage::certificate_leaf_hash(&cert)
-            && crate::storage::load_revocation(storage, &hash)
-                .await?
-                .is_some()
-        {
-            cache.deny_revoked_certificate(&hash).await;
-            invalidated += 1;
+        let Some(hash) = crate::storage::certificate_leaf_hash(&cert) else {
+            continue;
+        };
+        match crate::storage::load_revocation(storage, &hash).await {
+            Ok(Some(_)) => {
+                cache.deny_revoked_certificate(&hash).await;
+                invalidated += 1;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // One damaged or unavailable marker must not permanently
+                // shield every later revoked leaf from quarantine.
+                first_error.get_or_insert(error);
+            }
         }
     }
-    Ok(invalidated)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(invalidated),
+    }
 }
 
 // ---------------------------------------------------------------------------
