@@ -34,8 +34,12 @@ pub enum IssuerPolicy {
 /// A hook rather than a setting, which is why it is not part of [`Policy`]:
 /// it holds behaviour, and `Policy` holds values.
 pub trait CertificateSelector: Send + Sync {
-    /// Pick one of `choices` for this handshake by index, or `None` to leave
-    /// the decision to the default rules.
+    /// Pick one of `choices` for this handshake by index. Choices match the
+    /// lookup name and support the client's signature schemes, ordered by the
+    /// default certificate preferences. `None` or an out-of-range index leaves
+    /// the decision to those defaults.
+    ///
+    /// Called synchronously with the real ClientHello, without a cache lock.
     fn select_certificate(
         &self,
         hello: &rustls::server::ClientHello<'_>,

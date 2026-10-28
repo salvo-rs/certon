@@ -45,6 +45,7 @@ use tracing::{debug, warn};
 use crate::cache::CertCache;
 use crate::certificates::{Certificate, PrivateKeyKind};
 use crate::error::{CryptoError, Result};
+use crate::policy::CertificateSelector;
 use crate::rate_limiter::RateLimiter;
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,8 @@ pub struct CertResolver {
     /// trigger background certificate acquisition for uncached names.
     on_demand: Option<Arc<OnDemandConfig>>,
 
+    cert_selection: Option<Arc<dyn CertificateSelector>>,
+
     /// A default certificate to return when no matching certificate is found
     /// in the cache (and on-demand TLS is not configured or the name is not
     /// allowed).
@@ -197,6 +200,7 @@ impl fmt::Debug for CertResolver {
         f.debug_struct("CertResolver")
             .field("cache", &self.cache)
             .field("on_demand", &self.on_demand.as_ref().map(|_| "..."))
+            .field("cert_selection", &self.cert_selection.is_some())
             .field("default_cert", &"<RwLock<Option<Arc<CertifiedKey>>>>")
             .field("default_server_name", &self.default_server_name)
             .field("fallback_server_name", &self.fallback_server_name)
@@ -214,6 +218,7 @@ impl CertResolver {
         Self {
             cache,
             on_demand: None,
+            cert_selection: None,
             default_cert: RwLock::new(None),
             default_server_name: None,
             fallback_server_name: None,
@@ -233,6 +238,7 @@ impl CertResolver {
         Self {
             cache,
             on_demand: Some(on_demand),
+            cert_selection: None,
             default_cert: RwLock::new(None),
             default_server_name: None,
             fallback_server_name: None,
@@ -251,6 +257,10 @@ impl CertResolver {
     /// Set the fallback server name to try when no certificate matches the SNI.
     pub fn set_fallback_server_name(&mut self, name: Option<String>) {
         self.fallback_server_name = name;
+    }
+
+    pub(crate) fn set_certificate_selector(&mut self, selector: Arc<dyn CertificateSelector>) {
+        self.cert_selection = Some(selector);
     }
 
     /// Register a TLS-ALPN-01 challenge certificate for the given domain.
@@ -299,14 +309,15 @@ impl CertResolver {
     /// `None` if no certificate is available.
     #[cfg(test)]
     fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
-        self.resolve_name_with_schemes(server_name, None)
+        self.resolve_name_for_client(server_name, None)
     }
 
-    fn resolve_name_with_schemes(
+    fn resolve_name_for_client(
         &self,
         server_name: Option<&str>,
-        schemes: Option<&[SignatureScheme]>,
+        hello: Option<&ClientHello<'_>>,
     ) -> Option<Arc<CertifiedKey>> {
+        let schemes = hello.map(ClientHello::signature_schemes);
         let name = match server_name {
             Some(n) if !n.is_empty() => n.to_lowercase(),
             _ => {
@@ -327,7 +338,7 @@ impl CertResolver {
         debug!(sni = %name, "resolving certificate for TLS handshake");
 
         // Step 1: Look up the exact name in the certificate cache.
-        let (cached_match, selected) = self.try_resolve_from_cache_with_ocsp_check(&name, schemes);
+        let (cached_match, selected) = self.try_resolve_from_cache_with_ocsp_check(&name, hello);
         if let Some(result) = selected {
             return Some(result);
         }
@@ -359,7 +370,7 @@ impl CertResolver {
                 fallback = %fallback,
                 "trying fallback_server_name",
             );
-            if let Some(result) = self.try_resolve_from_cache(fallback, schemes) {
+            if let Some(result) = self.try_resolve_from_cache(fallback, hello) {
                 return Some(result);
             }
         }
@@ -372,9 +383,9 @@ impl CertResolver {
     fn try_resolve_from_cache(
         &self,
         name: &str,
-        schemes: Option<&[SignatureScheme]>,
+        hello: Option<&ClientHello<'_>>,
     ) -> Option<Arc<CertifiedKey>> {
-        self.resolve_cached_key(name, schemes)
+        self.resolve_cached_key(name, hello)
             .selected
             .map(|cached| cached.key)
     }
@@ -382,8 +393,28 @@ impl CertResolver {
     fn resolve_cached_key(
         &self,
         name: &str,
-        schemes: Option<&[SignatureScheme]>,
+        hello: Option<&ClientHello<'_>>,
     ) -> crate::cache::CachedKeyLookup {
+        let schemes = hello.map(ClientHello::signature_schemes);
+        if let (Some(selector), Some(hello)) = (&self.cert_selection, hello) {
+            let (matched, mut candidates) = self
+                .cache
+                .selection_candidates(name, |key| accepts_schemes(key, schemes));
+            let selected = if candidates.is_empty() {
+                None
+            } else {
+                let choices: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| candidate.certificate.as_ref())
+                    .collect();
+                let index = selector
+                    .select_certificate(hello, &choices)
+                    .filter(|index| *index < candidates.len())
+                    .unwrap_or(0);
+                Some(candidates.swap_remove(index).key)
+            };
+            return crate::cache::CachedKeyLookup { matched, selected };
+        }
         match schemes {
             Some(schemes) => self
                 .cache
@@ -401,9 +432,9 @@ impl CertResolver {
     fn try_resolve_from_cache_with_ocsp_check(
         &self,
         name: &str,
-        schemes: Option<&[SignatureScheme]>,
+        hello: Option<&ClientHello<'_>>,
     ) -> (bool, Option<Arc<CertifiedKey>>) {
-        let lookup = self.resolve_cached_key(name, schemes);
+        let lookup = self.resolve_cached_key(name, hello);
         let Some(cached) = lookup.selected else {
             return (lookup.matched, None);
         };
@@ -506,10 +537,7 @@ impl ResolvesServerCert for CertResolver {
             return None;
         }
 
-        self.resolve_name_with_schemes(
-            client_hello.server_name(),
-            Some(client_hello.signature_schemes()),
-        )
+        self.resolve_name_for_client(client_hello.server_name(), Some(&client_hello))
     }
 }
 

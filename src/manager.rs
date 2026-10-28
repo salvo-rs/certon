@@ -207,6 +207,10 @@ impl CertManagerBuilder {
     }
 
     /// Set the on-demand TLS configuration.
+    ///
+    /// If no obtain callback is supplied, TLS cache misses use this manager's
+    /// normal obtain and cache publication flow, subject to the configured
+    /// decision, allowlist and rate limit.
     pub fn on_demand(mut self, on_demand: Arc<OnDemandConfig>) -> Self {
         self.on_demand = Some(on_demand);
         self
@@ -1484,9 +1488,33 @@ impl CertManager {
     /// If [`default_server_name`](Policy::default_server_name) or
     /// [`fallback_server_name`](Policy::fallback_server_name) are
     /// configured, they are applied to the resolver.
+    /// On-demand issuance and custom certificate selection are also applied.
+    /// Without an explicit on-demand obtain callback, this manager performs
+    /// issuance in the background; the first handshake may still fail.
     pub fn server_config(&self) -> rustls::ServerConfig {
         crate::install_default_crypto_provider();
-        let mut resolver = CertResolver::new(self.cache.clone());
+        let mut resolver = if let Some(on_demand) = &self.on_demand {
+            let configured = if on_demand.obtain_func.is_some() {
+                Arc::clone(on_demand)
+            } else {
+                let manager = Arc::new(self.detached("on_demand"));
+                Arc::new(OnDemandConfig {
+                    decision_func: on_demand.decision_func.clone(),
+                    host_allowlist: on_demand.host_allowlist.clone(),
+                    rate_limit: on_demand.rate_limit.clone(),
+                    obtain_func: Some(Arc::new(move |domain| {
+                        let manager = Arc::clone(&manager);
+                        Box::pin(async move { manager.obtain(&domain).await })
+                    })),
+                })
+            };
+            CertResolver::with_on_demand(self.cache.clone(), configured)
+        } else {
+            CertResolver::new(self.cache.clone())
+        };
+        if let Some(selector) = &self.cert_selection {
+            resolver.set_certificate_selector(Arc::clone(selector));
+        }
 
         // Apply default/fallback server names if configured.
         if self.policy.default_server_name.is_some() {
