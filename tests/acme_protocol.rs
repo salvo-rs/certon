@@ -341,6 +341,7 @@ async fn custom_ca_root_changes_real_https_trust() {
 }
 
 struct HangingSolver {
+    waiting: Arc<tokio::sync::Notify>,
     cleaned: Arc<tokio::sync::Notify>,
 }
 
@@ -350,6 +351,7 @@ impl certon::Solver for HangingSolver {
         Ok(())
     }
     async fn wait(&self, _: &str, _: &str, _: &str) -> certon::Result<()> {
+        self.waiting.notify_one();
         std::future::pending().await
     }
     async fn cleanup(&self, _: &str, _: &str, _: &str) -> certon::Result<()> {
@@ -363,6 +365,7 @@ async fn total_timeout_cleans_presented_challenge() {
     let server = Server::start_transport(false, None, true).await;
     let directory = tempfile::tempdir().unwrap();
     let ca = format!("{}/directory", server.url);
+    let waiting = Arc::new(tokio::sync::Notify::new());
     let cleaned = Arc::new(tokio::sync::Notify::new());
     let issuer = AcmeIssuer::builder()
         .ca(&ca)
@@ -370,15 +373,32 @@ async fn total_timeout_cleans_presented_challenge() {
         .agreed(true)
         .storage(Arc::new(FileStorage::new(directory.path())))
         .http01_solver(Arc::new(HangingSolver {
+            waiting: Arc::clone(&waiting),
             cleaned: Arc::clone(&cleaned),
         }))
-        .cert_obtain_timeout(Duration::from_millis(500))
+        .cert_obtain_timeout(Duration::from_secs(30))
         .build();
-    let result = issuer.issue(b"csr", &["review.example.com".into()]).await;
+    let mut issuance =
+        tokio::spawn(async move { issuer.issue(b"csr", &["review.example.com".into()]).await });
+    // Let real HTTP/account preparation finish before freezing the clock.
+    // Otherwise a slow runner can expire the issuance budget before any
+    // challenge exists and this test incorrectly demands its cleanup.
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(10), waiting.notified()) => {
+            result.expect("issuance did not reach the presented challenge");
+        }
+        result = &mut issuance => panic!("issuance ended before challenge wait: {result:?}"),
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let result = issuance.await.unwrap();
+    // Cleanup also performs real shared-storage I/O. Do not let automatic
+    // virtual-time advancement outrun that I/O while waiting for its result.
+    tokio::time::resume();
     assert!(matches!(result, Err(certon::Error::Timeout(_))));
-    tokio::time::timeout(Duration::from_secs(2), cleaned.notified())
+    tokio::time::timeout(Duration::from_secs(5), cleaned.notified())
         .await
-        .unwrap();
+        .expect("the presented challenge was not cleaned after issuance timed out");
 }
 
 #[tokio::test]

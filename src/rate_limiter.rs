@@ -1,15 +1,18 @@
 //! Rate limiting for ACME operations.
 //!
-//! This module provides a sliding-window rate limiter backed by a ring buffer,
-//! backed by a ring buffer. It is used to throttle
+//! This module provides a sliding-window rate limiter backed by a ring buffer.
+//! It is used to throttle
 //! certificate obtain and renewal requests so that the ACME CA is not
 //! overwhelmed.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
+use tokio::time::Instant;
+
+use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // RateLimiter
@@ -33,6 +36,7 @@ pub struct RateLimiter {
     /// current `max_events` and `window` settings (stored together so they
     /// can be atomically updated).
     inner: Mutex<RateLimiterInner>,
+    changed: watch::Sender<()>,
 }
 
 /// Internal state for [`RateLimiter`], protected by a single mutex.
@@ -49,12 +53,10 @@ impl RateLimiter {
     /// # Panics
     ///
     /// Panics if `max_events` is `0` while `window` is non-zero, because that
-    /// configuration would never allow any events.
+    /// configuration would never allow any events, or if the window exceeds
+    /// the monotonic clock range.
     pub fn new(max_events: usize, window: Duration) -> Self {
-        assert!(
-            max_events != 0 || window.is_zero(),
-            "invalid configuration: max_events = 0 and window != 0 would never allow any events"
-        );
+        validate(max_events, window).unwrap_or_else(|error| panic!("{error}"));
 
         Self {
             inner: Mutex::new(RateLimiterInner {
@@ -62,25 +64,56 @@ impl RateLimiter {
                 max_events,
                 window,
             }),
+            changed: watch::channel(()).0,
         }
+    }
+
+    /// Atomically update both settings, retaining recorded event history.
+    ///
+    /// Returns a configuration error without changing either setting when the
+    /// pair would allow no events or exceeds the monotonic clock range. Waiting
+    /// callers recheck the new settings immediately. `(0, Duration::ZERO)`
+    /// disables the limiter.
+    pub async fn configure(&self, max_events: usize, window: Duration) -> Result<()> {
+        validate(max_events, window)?;
+        let mut inner = self.inner.lock().await;
+        inner.max_events = max_events;
+        inner.window = window;
+        drop(inner);
+        self.changed.send_replace(());
+        Ok(())
     }
 
     /// Update the maximum number of events allowed in the sliding window.
     ///
-    /// Takes effect on the next call to [`wait`](RateLimiter::wait) or
-    /// [`try_allow`](RateLimiter::try_allow).
+    /// Waiting callers immediately recheck the updated configuration.
+    /// Use [`Self::configure`] for fallible, atomic updates of both settings.
+    ///
+    /// # Panics
+    /// Panics without changing the configuration if zero is supplied while the
+    /// current window is non-zero.
     pub async fn set_max_events(&self, max_events: usize) {
         let mut inner = self.inner.lock().await;
+        validate(max_events, inner.window).unwrap_or_else(|error| panic!("{error}"));
         inner.max_events = max_events;
+        drop(inner);
+        self.changed.send_replace(());
     }
 
     /// Update the size of the sliding window.
     ///
-    /// Takes effect on the next call to [`wait`](RateLimiter::wait) or
-    /// [`try_allow`](RateLimiter::try_allow).
+    /// Waiting callers immediately recheck the updated configuration.
+    /// Use [`Self::configure`] for fallible, atomic updates of both settings.
+    ///
+    /// # Panics
+    /// Panics without changing the configuration if the pair would allow no
+    /// events or the window exceeds the monotonic clock range.
     pub async fn set_window(&self, window: Duration) {
         let mut inner = self.inner.lock().await;
+        validate(inner.max_events, window).unwrap_or_else(|error| panic!("{error}"));
         inner.window = window;
+        drop(inner);
+        self.changed.send_replace(());
     }
 
     /// Wait until the rate limit permits the next event.
@@ -91,6 +124,7 @@ impl RateLimiter {
     /// waiting (which is [`Duration::ZERO`] when no delay was needed).
     pub async fn wait(&self) -> Duration {
         let start = Instant::now();
+        let mut changed = self.changed.subscribe();
 
         loop {
             let wait_duration = {
@@ -140,7 +174,10 @@ impl RateLimiter {
                 // case of timing jitter.
                 tokio::task::yield_now().await;
             } else {
-                tokio::time::sleep(wait_duration).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(wait_duration) => {},
+                    _ = changed.changed() => {},
+                }
             }
         }
     }
@@ -187,6 +224,20 @@ impl RateLimiter {
         let inner = self.inner.lock().await;
         inner.window
     }
+}
+
+fn validate(max_events: usize, window: Duration) -> Result<()> {
+    if max_events == 0 && !window.is_zero() {
+        return Err(Error::Config(
+            "max_events = 0 and window != 0 would never allow any events".into(),
+        ));
+    }
+    if Instant::now().checked_add(window).is_none() {
+        return Err(Error::Config(
+            "rate limit window exceeds the monotonic clock range".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

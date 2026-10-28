@@ -69,7 +69,7 @@ pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(30 * 24 * 60 * 60
 /// Configuration for retry behaviour.
 ///
 /// Controls the timing and limits for [`do_with_retry`]. The default
-/// configuration uses escalating intervals from 1 second to 10 minutes,
+/// configuration uses escalating intervals from 1 minute to 6 hours,
 /// with a maximum total duration of 30 days and unlimited retries.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -80,11 +80,12 @@ pub struct RetryConfig {
     pub intervals: Vec<Duration>,
 
     /// Maximum total wall-clock time to keep retrying. Once this duration has
-    /// elapsed since the first attempt, no more retries are made.
+    /// elapsed since the first attempt, the in-flight operation or backoff is cancelled.
     pub max_duration: Duration,
 
-    /// Maximum number of retries.  `0` means unlimited — the retry loop is
-    /// governed solely by `max_duration`.
+    /// Maximum number of failed attempts, including the initial attempt.
+    /// The historical field name is retained for compatibility. `0` means
+    /// unlimited — the retry loop is governed solely by `max_duration`.
     pub max_retries: usize,
 }
 
@@ -177,81 +178,61 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    if config.intervals.is_empty() {
+        return Err(Error::Config("retry intervals must not be empty".into()));
+    }
     let start = Instant::now();
-    // Start at -1 so the first attempt executes without any delay.
-    let mut interval_index: isize = -1;
+    let deadline = start
+        .checked_add(config.max_duration)
+        .ok_or_else(|| Error::Config("retry duration exceeds the monotonic clock range".into()))?;
     let mut attempts: usize = 0;
-
-    loop {
-        // --- wait before this attempt (skip wait on the very first try) ---
-        if interval_index >= 0 {
-            let idx = (interval_index as usize).min(config.intervals.len().saturating_sub(1));
-            let wait = config.intervals[idx];
-            tokio::time::sleep(wait).await;
-        }
-
-        // --- check whether we've exceeded the time budget ---
-        if start.elapsed() >= config.max_duration {
-            tracing::error!(
-                attempts,
-                elapsed = ?start.elapsed(),
-                max_duration = ?config.max_duration,
-                "retry budget exhausted; giving up",
-            );
-            // If we had a previous error we would have returned it below on
-            // the prior iteration. Reaching here means the timer expired
-            // between attempts, so just return a timeout.
-            return Err(Error::Timeout(format!(
-                "retry budget of {:?} exhausted after {attempts} attempts",
-                config.max_duration,
-            )));
-        }
-
-        // --- execute the operation ---
-        match f(attempts).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                attempts += 1;
-
-                // Non-retriable errors are returned immediately.
-                if !should_retry(&err) {
-                    tracing::warn!(
-                        %err,
-                        attempts,
-                        "non-retriable error; will not retry",
-                    );
-                    return Err(err);
-                }
-
-                // Respect max_retries (0 = unlimited).
-                if config.max_retries > 0 && attempts >= config.max_retries {
+    // One timer covers backoff and every operation. Cancelling the operation
+    // drops its future, allowing its RAII guards to release resources.
+    let result = tokio::time::timeout_at(deadline, async {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(retry_budget_error(config, attempts));
+            }
+            match f(attempts).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    attempts = attempts.saturating_add(1);
+                    if !should_retry(&err)
+                        || (config.max_retries > 0 && attempts >= config.max_retries)
+                    {
+                        return Err(err);
+                    }
+                    let idx = (attempts - 1).min(config.intervals.len() - 1);
+                    let next_wait = config.intervals[idx];
                     tracing::error!(
                         %err,
                         attempts,
-                        max_retries = config.max_retries,
-                        "max retries reached; giving up",
+                        retrying_in = ?next_wait,
+                        elapsed = ?start.elapsed(),
+                        max_duration = ?config.max_duration,
+                        "will retry",
                     );
-                    return Err(err);
+                    if next_wait.is_zero() {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(next_wait).await;
+                    }
                 }
-
-                // Advance to the next interval (clamped to the last element).
-                if interval_index < config.intervals.len() as isize - 1 {
-                    interval_index += 1;
-                }
-
-                let next_wait = config.intervals[interval_index.max(0) as usize];
-
-                tracing::error!(
-                    %err,
-                    attempts,
-                    retrying_in = ?next_wait,
-                    elapsed = ?start.elapsed(),
-                    max_duration = ?config.max_duration,
-                    "will retry",
-                );
             }
         }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(retry_budget_error(config, attempts)),
     }
+}
+
+fn retry_budget_error(config: &RetryConfig, attempts: usize) -> Error {
+    Error::Timeout(format!(
+        "retry budget of {:?} exhausted after {attempts} failed attempts",
+        config.max_duration,
+    ))
 }
 
 // ---------------------------------------------------------------------------
