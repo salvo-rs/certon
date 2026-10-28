@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use certon::{
-    CertIssuer, CertManager, FileStorage, IssuedCertificate, OcspConfig, Result, Storage,
+    CertIssuer, CertManager, CertStore, CertificateResource, FileStorage, IssuedCertificate,
+    KeyValueCertStore, OcspConfig, Result, Storage,
 };
 use chrono::Datelike;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PublicKeyData};
@@ -233,4 +234,227 @@ async fn restart_uses_the_new_certificate_from_a_fallback_issuer() {
     assert_eq!(loaded[0].hash, renewed.hash);
     assert_eq!(preferred.calls.load(Ordering::SeqCst), 2);
     assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_forced_renewal_keeps_an_already_cached_new_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let issuer = Arc::new(TestIssuer::new());
+    let serving = manager(storage.clone(), issuer.clone());
+    serving.manage(&["example.com".into()]).await.unwrap();
+    let old = serving.cache.get_by_name("example.com").await.unwrap();
+    let writer = manager(storage, issuer.clone());
+    writer.renew("example.com", true).await.unwrap();
+    let fresh = serving.cache_certificate("example.com").await.unwrap();
+    assert_ne!(fresh.hash, old.hash);
+    // The name index preserves insertion order; do not use get_all(), which
+    // iterates a HashMap and might choose the incoming hash as the old entry.
+    let hashes: Vec<_> = serving
+        .cache
+        .all_matching_certificates("example.com")
+        .await
+        .into_iter()
+        .map(|cert| cert.hash)
+        .collect();
+    assert_eq!(hashes, [old.hash.clone(), fresh.hash.clone()]);
+
+    serving.renew("example.com", false).await.unwrap();
+
+    assert!(serving.cache.get_by_hash(&old.hash).await.is_none());
+    assert!(serving.cache.get_by_hash(&fresh.hash).await.is_some());
+    assert_eq!(serving.cache.count().await, 1);
+    assert_eq!(
+        handshake(&serving, &issuer).await,
+        fresh.cert_chain[0].as_ref()
+    );
+    assert_eq!(issuer.calls.load(Ordering::SeqCst), 2);
+}
+
+async fn certificate_resource(issuer: &TestIssuer) -> CertificateResource {
+    let key = certon::crypto::generate_private_key(certon::KeyType::EcdsaP256).unwrap();
+    let sans = vec!["example.com".to_owned()];
+    let csr = certon::crypto::generate_csr(&key, &sans, false).unwrap();
+    let issued = issuer.issue(&csr, &sans).await.unwrap();
+    CertificateResource {
+        sans,
+        certificate_pem: issued.certificate_pem,
+        private_key_pem: certon::crypto::encode_private_key_pem(&key)
+            .unwrap()
+            .into_bytes(),
+        issuer_key: issuer.issuer_key(),
+        issuer_data: None,
+    }
+}
+
+fn multiple_issuer_manager(
+    storage: Arc<dyn Storage>,
+    certificates: Arc<dyn CertStore>,
+    issuers: Vec<Arc<dyn CertIssuer>>,
+) -> CertManager {
+    CertManager::builder()
+        .storage(storage)
+        .certificates(certificates)
+        .issuers(issuers)
+        .ocsp(OcspConfig {
+            disable_stapling: true,
+            ..Default::default()
+        })
+        .build()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_invalid_candidates_do_not_shadow_a_usable_certificate() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+    let primary = Arc::new(TestIssuer::new());
+    let primary_resource = certificate_resource(&primary).await;
+    certificates
+        .save(&primary.issuer_key(), &primary_resource)
+        .await
+        .unwrap();
+    let mut secondary = TestIssuer::new();
+    secondary.name = "secondary-ca";
+    secondary.not_before_year += 1;
+    let secondary = Arc::new(secondary);
+    for invalid_mode in [1, 2] {
+        secondary.mode.store(invalid_mode, Ordering::SeqCst);
+        let invalid = certificate_resource(&secondary).await;
+        let primary_certificate = certon::Certificate::from_pem(
+            &primary_resource.certificate_pem,
+            &primary_resource.private_key_pem,
+        )
+        .unwrap();
+        let secondary_certificate =
+            certon::Certificate::from_pem(&invalid.certificate_pem, &invalid.private_key_pem)
+                .unwrap();
+        assert!(secondary_certificate.not_before > primary_certificate.not_before);
+        certificates
+            .save(&secondary.issuer_key(), &invalid)
+            .await
+            .unwrap();
+        // A bad resource must be skipped both before and after a good resource.
+        for invalid_first in [false, true] {
+            let issuers: Vec<Arc<dyn CertIssuer>> = if invalid_first {
+                vec![secondary.clone(), primary.clone()]
+            } else {
+                vec![primary.clone(), secondary.clone()]
+            };
+            let manager = multiple_issuer_manager(storage.clone(), certificates.clone(), issuers);
+            manager.manage(&["example.com".into()]).await.unwrap();
+            let cached = manager.cache.get_by_name("example.com").await.unwrap();
+            assert_eq!(cached.issuer_key, primary.issuer_key());
+            assert_eq!(
+                handshake(&manager, &primary).await,
+                primary_certificate.cert_chain[0].as_ref()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn all_invalid_candidates_return_validation_errors_rather_than_absence() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+    let primary = Arc::new(TestIssuer::new());
+    primary.mode.store(1, Ordering::SeqCst);
+    let mut secondary = TestIssuer::new();
+    secondary.name = "secondary-ca";
+    secondary.mode.store(2, Ordering::SeqCst);
+    let secondary = Arc::new(secondary);
+    for issuer in [&primary, &secondary] {
+        certificates
+            .save(&issuer.issuer_key(), &certificate_resource(issuer).await)
+            .await
+            .unwrap();
+    }
+    let manager = multiple_issuer_manager(storage, certificates, vec![primary, secondary]);
+    let error = manager.load_certificate("example.com").await.unwrap_err();
+    assert!(matches!(error, certon::Error::Config(_)));
+    let message = error.to_string();
+    assert!(
+        message.contains("no valid certificate resource"),
+        "{message}"
+    );
+    assert!(
+        message.contains("test-ca") && message.contains("secondary-ca"),
+        "{message}"
+    );
+    assert!(
+        message.contains("mismatch") && message.contains("does not cover"),
+        "{message}"
+    );
+}
+
+#[derive(Debug)]
+struct FailingSecondaryStore {
+    inner: KeyValueCertStore,
+    storage_error: bool,
+}
+#[async_trait::async_trait]
+impl CertStore for FailingSecondaryStore {
+    async fn load(&self, issuer: &str, domain: &str) -> Result<Option<CertificateResource>> {
+        if issuer == "secondary-ca" {
+            return Err(if self.storage_error {
+                certon::Error::Storage(certon::error::StorageError::Io(std::io::Error::other(
+                    "secondary backend offline",
+                )))
+            } else {
+                certon::Error::Other("secondary backend offline".into())
+            });
+        }
+        self.inner.load(issuer, domain).await
+    }
+    async fn save(&self, issuer: &str, resource: &CertificateResource) -> Result<()> {
+        self.inner.save(issuer, resource).await
+    }
+    async fn has(&self, issuer: &str, domain: &str) -> Result<bool> {
+        self.inner.has(issuer, domain).await
+    }
+    async fn remove(&self, issuer: &str, domain: &str) -> Result<()> {
+        self.inner.remove(issuer, domain).await
+    }
+}
+
+#[tokio::test]
+async fn candidate_backend_errors_propagate_after_valid_or_invalid_resources() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let primary = Arc::new(TestIssuer::new());
+    let mut secondary = TestIssuer::new();
+    secondary.name = "secondary-ca";
+    let secondary = Arc::new(secondary);
+    for primary_mode in [0, 1] {
+        primary.mode.store(primary_mode, Ordering::SeqCst);
+        for storage_error in [false, true] {
+            let certificates = Arc::new(FailingSecondaryStore {
+                inner: KeyValueCertStore::new(storage.clone()),
+                storage_error,
+            });
+            certificates
+                .save(&primary.issuer_key(), &certificate_resource(&primary).await)
+                .await
+                .unwrap();
+            let manager = multiple_issuer_manager(
+                storage.clone(),
+                certificates,
+                vec![primary.clone(), secondary.clone()],
+            );
+            let error = manager.load_certificate("example.com").await.unwrap_err();
+            if storage_error {
+                assert!(matches!(
+                    error,
+                    certon::Error::Storage(certon::error::StorageError::Io(_))
+                ));
+            } else {
+                assert!(matches!(error, certon::Error::Other(_)));
+            }
+            assert!(
+                error.to_string().contains("secondary backend offline"),
+                "{error}"
+            );
+        }
+    }
 }

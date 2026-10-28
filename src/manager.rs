@@ -455,11 +455,20 @@ impl CertManager {
     /// preferred CA must not shadow a certificate renewed through a fallback.
     async fn load_cert_resource_any_issuer(&self, domain: &str) -> Result<CertificateResource> {
         let mut selected = None;
+        let mut validation_errors = Vec::new();
+        let now = chrono::Utc::now();
         for issuer in &self.issuers {
-            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
-                let cert =
-                    Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
-                let now = chrono::Utc::now();
+            let issuer_key = issuer.issuer_key();
+            // Backend failures must remain failures even if another issuer has
+            // a usable resource. Only invalid certificate contents are skipped.
+            if let Some(resource) = self.certificates.load(&issuer_key, domain).await? {
+                let cert = match Self::parse_managed_certificate(&resource, domain) {
+                    Ok(cert) => cert,
+                    Err(error) => {
+                        validation_errors.push(format!("{issuer_key}: {error}"));
+                        continue;
+                    }
+                };
                 let rank = (
                     cert.not_before <= now && !cert.expired(),
                     cert.not_before,
@@ -470,11 +479,18 @@ impl CertManager {
                 }
             }
         }
-        selected.map(|(_, resource)| resource).ok_or_else(|| {
-            Error::Storage(StorageError::NotFound(format!(
-                "no certificate resource found for '{domain}' from any configured issuer"
+        if let Some((_, resource)) = selected {
+            Ok(resource)
+        } else if !validation_errors.is_empty() {
+            Err(Error::Config(format!(
+                "no valid certificate resource for '{domain}': {}",
+                validation_errors.join("; ")
             )))
-        })
+        } else {
+            Err(Error::Storage(StorageError::NotFound(format!(
+                "no certificate resource found for '{domain}' from any configured issuer"
+            ))))
+        }
     }
 
     /// Delete certificate assets (cert, key, meta) for `domain` under
@@ -740,6 +756,7 @@ impl CertManager {
     }
 
     async fn publish_certificate(&self, cert: Certificate, domain: &str) {
+        let incoming_hash = cert.hash.clone();
         let previous = self.cache.all_matching_certificates(domain).await;
         let old = previous.iter().find(|old| {
             old.managed
@@ -753,6 +770,7 @@ impl CertManager {
             for other in previous.iter().filter(|other| {
                 other.managed
                     && other.hash != old.hash
+                    && other.hash != incoming_hash
                     && other
                         .names
                         .iter()
