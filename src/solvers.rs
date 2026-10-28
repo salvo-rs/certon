@@ -21,7 +21,9 @@
 //! just the instance that initiated the certificate order.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -35,9 +37,10 @@ use ring as crypto_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex, RwLock, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 #[cfg(feature = "dns-01")]
@@ -48,9 +51,157 @@ use crate::dns_util::{
 use crate::error::{Error, Result};
 use crate::storage::Storage;
 
-/// Shared map of domain -> (cert chain DER, private key DER) for TLS-ALPN-01 challenges.
-type ChallengeMap =
-    Arc<RwLock<HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>>>;
+/// Prebuilt challenge signing keys shared by every connection.
+type ChallengeMap = Arc<SyncRwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>>;
+
+#[derive(Clone, Copy)]
+struct ChallengeLimits {
+    max_connections: usize,
+    connection_timeout: Duration,
+}
+
+impl Default for ChallengeLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 128,
+            connection_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl ChallengeLimits {
+    fn checked(max_connections: usize, connection_timeout: Duration) -> Result<Self> {
+        if max_connections == 0
+            || connection_timeout.is_zero()
+            || Instant::now().checked_add(connection_timeout).is_none()
+        {
+            return Err(Error::Config("invalid challenge server limits".into()));
+        }
+        Ok(Self {
+            max_connections,
+            connection_timeout,
+        })
+    }
+}
+
+/// The listener owns every accepted connection. Stopping it aborts and joins
+/// all workers before its completion is acknowledged. Drop requests the same
+/// shutdown; synchronous destructors cannot wait for the runtime to drain it.
+struct ChallengeServer {
+    stop: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl ChallengeServer {
+    fn spawn<F, Fut>(listener: TcpListener, limits: ChallengeLimits, handler: F) -> Self
+    where
+        F: FnMut(TcpStream, SocketAddr) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = Arc::new(listener);
+        Self::spawn_with_accept(
+            move || {
+                let listener = Arc::clone(&listener);
+                async move { listener.accept().await }
+            },
+            limits,
+            handler,
+        )
+    }
+
+    fn spawn_with_accept<A, Accepted, F, Fut>(
+        mut accept: A,
+        limits: ChallengeLimits,
+        mut handler: F,
+    ) -> Self
+    where
+        A: FnMut() -> Accepted + Send + 'static,
+        Accepted: Future<Output = std::io::Result<(TcpStream, SocketAddr)>> + Send,
+        F: FnMut(TcpStream, SocketAddr) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (stop, mut stopped) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut workers = JoinSet::new();
+            let mut retry_at = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
+                    _ = workers.join_next(), if !workers.is_empty() => {},
+                    accepted = async {
+                        if let Some(retry_at) = retry_at {
+                            tokio::time::sleep_until(retry_at).await;
+                        }
+                        accept().await
+                    }, if workers.len() < limits.max_connections => {
+                        let (stream, peer) = match accepted {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                warn!(%error, "challenge listener accept failed; retrying");
+                                retry_at = Some(Instant::now() + Duration::from_millis(100));
+                                continue;
+                            }
+                        };
+                        retry_at = None;
+                        let deadline = Instant::now() + limits.connection_timeout;
+                        let connection = handler(stream, peer);
+                        workers.spawn(async move {
+                            let _ = tokio::time::timeout_at(deadline, connection).await;
+                        });
+                    }
+                }
+            }
+            drop(accept);
+            workers.shutdown().await;
+        });
+        Self {
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    fn request_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    #[cfg(test)]
+    fn id(&self) -> tokio::task::Id {
+        self.task.id()
+    }
+}
+
+impl Drop for ChallengeServer {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+// Retain the handle in its slot while awaiting. If a cleanup future is
+// cancelled, the next publication still observes the stopping generation and
+// waits for its listener and all accepted sockets to be released before bind.
+async fn stop_challenge_server(handle: &mut Option<ChallengeServer>) {
+    if let Some(server) = handle.as_mut() {
+        server.request_stop();
+        let _ = (&mut server.task).await;
+    }
+    *handle = None;
+}
+
+async fn finish_stopped_challenge_server(handle: &mut Option<ChallengeServer>) {
+    if handle
+        .as_ref()
+        .is_some_and(|server| server.stop.is_none() || server.is_finished())
+    {
+        stop_challenge_server(handle).await;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Active challenges global tracking
@@ -86,9 +237,22 @@ pub fn get_active_challenge(identifier: &str) -> Option<String> {
 }
 
 /// Register an active challenge in the global map.
-async fn register_active_challenge(identifier: &str, key_auth: &str) {
+async fn register_active_challenge(identifier: &str, key_auth: &str) -> Option<String> {
+    active_challenges()
+        .write()
+        .await
+        .insert(identifier.to_string(), key_auth.to_string())
+}
+
+async fn restore_active_challenge(identifier: &str, attempted: &str, previous: Option<String>) {
     let mut map = active_challenges().write().await;
-    map.insert(identifier.to_string(), key_auth.to_string());
+    if map.get(identifier).is_some_and(|auth| auth == attempted) {
+        if let Some(previous) = previous {
+            map.insert(identifier.to_owned(), previous);
+        } else {
+            map.remove(identifier);
+        }
+    }
 }
 
 /// Remove an active challenge from the global map.
@@ -162,6 +326,11 @@ fn challenge_tokens_key(issuer_prefix: &str, domain: &str) -> String {
 /// The solver lazily starts a TCP listener on the configured port (default: 80)
 /// when the first challenge is presented, and stops it when all challenges have
 /// been cleaned up. Multiple concurrent challenges share the same server.
+/// It handles at most 128 accepted connections, each with a total 10-second
+/// read/write deadline; [`Self::with_limits`] overrides both limits. At capacity
+/// peers wait in the operating system's accept backlog. Final cleanup waits for
+/// all accepted connections to be released. Dropping the solver requests the
+/// same shutdown without blocking for the runtime to finish it.
 ///
 /// **Important**: Port 80 must be reachable from the internet for the ACME
 /// CA's validation server to reach this solver.
@@ -172,7 +341,8 @@ pub struct Http01Solver {
     pub port: u16,
     /// Serializes HTTP challenge publication, cleanup and listener lifetime.
     /// Holds the background HTTP server task while it is running.
-    server_handle: Mutex<Option<JoinHandle<()>>>,
+    server_handle: Mutex<Option<ChallengeServer>>,
+    limits: ChallengeLimits,
 }
 
 impl Http01Solver {
@@ -185,7 +355,24 @@ impl Http01Solver {
             challenges: Arc::new(RwLock::new(HashMap::new())),
             port,
             server_handle: Mutex::new(None),
+            limits: ChallengeLimits::default(),
         }
+    }
+
+    /// Use a custom accepted-connection budget and total connection timeout.
+    /// Defaults are 128 connections and 10 seconds. At capacity, new peers wait
+    /// in the operating system's accept backlog. Zero values or a timeout that
+    /// exceeds the monotonic clock range return a configuration error.
+    pub fn with_limits(
+        port: u16,
+        max_connections: usize,
+        connection_timeout: Duration,
+    ) -> Result<Self> {
+        let limits = ChallengeLimits::checked(max_connections, connection_timeout)?;
+        Ok(Self {
+            limits,
+            ..Self::new(port)
+        })
     }
 
     /// Start the challenge HTTP server if it is not already running.
@@ -195,7 +382,7 @@ impl Http01Solver {
     /// logged and `Ok(())` is returned under the assumption that an existing
     /// listener (e.g. from a previous solver or external process) can handle
     /// the challenge requests.
-    async fn ensure_server_running(&self, handle: &mut Option<JoinHandle<()>>) -> Result<()> {
+    async fn ensure_server_running(&self, handle: &mut Option<ChallengeServer>) -> Result<()> {
         if handle.is_some() {
             return Ok(());
         }
@@ -229,110 +416,98 @@ impl Http01Solver {
         debug!(addr = %addr, "HTTP-01 challenge server started");
 
         let challenges = Arc::clone(&self.challenges);
-        let jh = tokio::spawn(async move {
-            loop {
-                let accept_result = listener.accept().await;
-                let (mut stream, peer) = match accept_result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = %e, "HTTP-01 server accept error");
-                        continue;
-                    }
-                };
+        *handle = Some(ChallengeServer::spawn(
+            listener,
+            self.limits,
+            move |stream, peer| serve_http_challenge(stream, peer, Arc::clone(&challenges)),
+        ));
+        Ok(())
+    }
+}
 
-                let challenges = Arc::clone(&challenges);
-                tokio::spawn(async move {
-                    // Apply a 10-second connection timeout.
-                    let handler = async {
-                        // Read until we find the end of headers (\r\n\r\n) or
-                        // hit a size limit.
-                        let mut buf = Vec::with_capacity(8192);
-                        let mut tmp = [0u8; 1024];
-                        let headers_end;
-                        loop {
-                            let n = match stream.read(&mut tmp).await {
-                                Ok(0) => return,
-                                Ok(n) => n,
-                                Err(_) => return,
-                            };
-                            buf.extend_from_slice(&tmp[..n]);
+async fn serve_http_challenge<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    peer: SocketAddr,
+    challenges: Arc<RwLock<HashMap<String, String>>>,
+) {
+    // Read until we find the end of headers (\r\n\r\n) or
+    // hit a size limit.
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 1024];
+    let headers_end;
+    loop {
+        let n = match stream.read(&mut tmp).await {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(_) => return,
+        };
+        buf.extend_from_slice(&tmp[..n]);
 
-                            // Check for end-of-headers marker.
-                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                headers_end = pos;
-                                break;
-                            }
+        // Check for end-of-headers marker.
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            headers_end = pos;
+            break;
+        }
 
-                            // Prevent unbounded reads (64 KB limit for headers).
-                            if buf.len() > 65536 {
-                                return;
-                            }
-                        }
+        // Prevent unbounded reads (64 KB limit for headers).
+        if buf.len() > 65536 {
+            return;
+        }
+    }
 
-                        let request = String::from_utf8_lossy(&buf[..headers_end]);
-                        // Parse the request line: "METHOD PATH VERSION".
-                        let request_line = match request.lines().next() {
-                            Some(line) => line,
-                            None => return,
-                        };
-                        let mut parts = request_line.split_whitespace();
-                        let method = parts.next().unwrap_or("");
-                        let path = parts.next().unwrap_or("");
+    let request = String::from_utf8_lossy(&buf[..headers_end]);
+    // Parse the request line: "METHOD PATH VERSION".
+    let request_line = match request.lines().next() {
+        Some(line) => line,
+        None => return,
+    };
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
 
-                        // Only respond to GET requests.
-                        if !method.eq_ignore_ascii_case("GET") {
-                            let response = "HTTP/1.1 405 Method Not Allowed\r\n\
+    // Only respond to GET requests.
+    if !method.eq_ignore_ascii_case("GET") {
+        let response = "HTTP/1.1 405 Method Not Allowed\r\n\
                                             Content-Length: 0\r\n\
                                             Content-Type: text/plain\r\n\
                                             Connection: close\r\n\
                                             \r\n";
-                            let _ = stream.write_all(response.as_bytes()).await;
-                            return;
-                        }
+        let _ = stream.write_all(response.as_bytes()).await;
+        return;
+    }
 
-                        const CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
+    const CHALLENGE_PATH_PREFIX: &str = "/.well-known/acme-challenge/";
 
-                        if let Some(token) = path.strip_prefix(CHALLENGE_PATH_PREFIX) {
-                            let challenges = challenges.read().await;
-                            if let Some(key_auth) = challenges.get(token) {
-                                let body = key_auth.as_bytes();
-                                let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
+    if let Some(token) = path.strip_prefix(CHALLENGE_PATH_PREFIX) {
+        let key_auth = challenges.read().await.get(token).cloned();
+        if let Some(key_auth) = key_auth {
+            let body = key_auth.as_bytes();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
                                      Content-Type: text/plain\r\n\
                                      Content-Length: {}\r\n\
                                      Connection: close\r\n\
                                      \r\n",
-                                    body.len()
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                let _ = stream.write_all(body).await;
-                                debug!(token = token, peer = %peer, "served HTTP-01 challenge");
-                            } else {
-                                let response = "HTTP/1.1 404 Not Found\r\n\
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+            debug!(token = token, peer = %peer, "served HTTP-01 challenge");
+        } else {
+            let response = "HTTP/1.1 404 Not Found\r\n\
                                                 Content-Length: 0\r\n\
                                                 Content-Type: text/plain\r\n\
                                                 Connection: close\r\n\
                                                 \r\n";
-                                let _ = stream.write_all(response.as_bytes()).await;
-                            }
-                        } else {
-                            let response = "HTTP/1.1 404 Not Found\r\n\
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    } else {
+        let response = "HTTP/1.1 404 Not Found\r\n\
                                             Content-Length: 0\r\n\
                                             Content-Type: text/plain\r\n\
                                             Connection: close\r\n\
                                             \r\n";
-                            let _ = stream.write_all(response.as_bytes()).await;
-                        }
-                    };
-
-                    // Wrap the handler in a 10-second timeout.
-                    let _ = tokio::time::timeout(Duration::from_secs(10), handler).await;
-                });
-            }
-        });
-
-        *handle = Some(jh);
-        Ok(())
+        let _ = stream.write_all(response.as_bytes()).await;
     }
 }
 
@@ -353,16 +528,26 @@ impl std::fmt::Debug for Http01Solver {
 #[async_trait]
 impl Solver for Http01Solver {
     async fn present(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
-        // The listener lock covers the map and global registration as well as
-        // startup, so cleanup cannot stop the listener after a new publication.
         let mut handle = self.server_handle.lock().await;
-        {
+        finish_stopped_challenge_server(&mut handle).await;
+        let previous = self
+            .challenges
+            .write()
+            .await
+            .insert(token.to_owned(), key_auth.to_owned());
+        let previous_global = register_active_challenge(token, key_auth).await;
+        if let Err(error) = self.ensure_server_running(&mut handle).await {
             let mut challenges = self.challenges.write().await;
-            challenges.insert(token.to_string(), key_auth.to_string());
+            if let Some(previous) = previous {
+                challenges.insert(token.to_owned(), previous);
+            } else {
+                challenges.remove(token);
+            }
+            drop(challenges);
+            restore_active_challenge(token, key_auth, previous_global).await;
+            return Err(error);
         }
-        register_active_challenge(token, key_auth).await;
-        self.ensure_server_running(&mut handle).await?;
-        debug!(token = token, "HTTP-01 challenge presented");
+        debug!(token, "HTTP-01 challenge presented");
         Ok(())
     }
 
@@ -380,8 +565,8 @@ impl Solver for Http01Solver {
         };
         unregister_active_challenge_if_matching(token, key_auth).await;
 
-        if should_stop && let Some(jh) = handle.take() {
-            jh.abort();
+        if should_stop {
+            stop_challenge_server(&mut handle).await;
             debug!("HTTP-01 challenge server stopped (no more challenges)");
         }
         Ok(())
@@ -412,6 +597,10 @@ const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 ///
 /// Like [`Http01Solver`], the TLS server is started lazily and shared across
 /// concurrent challenges. The default port is 443.
+/// The default budget is 128 accepted connections with a total 10-second
+/// handshake deadline; [`Self::with_limits`] overrides both values. Final
+/// cleanup awaits every accepted connection. Drop requests shutdown without
+/// synchronously waiting for the runtime to release those connections.
 ///
 /// **Important**: Port 443 must be reachable from the internet, and the
 /// client's SNI value must match the domain being validated.
@@ -422,7 +611,8 @@ pub struct TlsAlpn01Solver {
     /// The port to listen on (default: 443).
     pub port: u16,
     /// Handle to the background TLS server task, if running.
-    server_handle: Mutex<Option<JoinHandle<()>>>,
+    server_handle: Mutex<Option<ChallengeServer>>,
+    limits: ChallengeLimits,
 }
 
 impl TlsAlpn01Solver {
@@ -432,10 +622,27 @@ impl TlsAlpn01Solver {
     /// the first time.
     pub fn new(port: u16) -> Self {
         Self {
-            challenges: Arc::new(RwLock::new(HashMap::new())),
+            challenges: Arc::new(SyncRwLock::new(HashMap::new())),
             port,
             server_handle: Mutex::new(None),
+            limits: ChallengeLimits::default(),
         }
+    }
+
+    /// Use a custom accepted-connection budget and total connection timeout.
+    /// Defaults are 128 connections and 10 seconds. At capacity, new peers wait
+    /// in the operating system's accept backlog. Zero values or a timeout that
+    /// exceeds the monotonic clock range return a configuration error.
+    pub fn with_limits(
+        port: u16,
+        max_connections: usize,
+        connection_timeout: Duration,
+    ) -> Result<Self> {
+        let limits = ChallengeLimits::checked(max_connections, connection_timeout)?;
+        Ok(Self {
+            limits,
+            ..Self::new(port)
+        })
     }
 
     /// Generate a self-signed challenge certificate for the TLS-ALPN-01
@@ -499,80 +706,38 @@ impl TlsAlpn01Solver {
     }
 
     /// Start the TLS-ALPN challenge server if not already running.
-    async fn ensure_server_running(&self) -> Result<()> {
-        let mut handle = self.server_handle.lock().await;
+    async fn ensure_server_running(&self, handle: &mut Option<ChallengeServer>) -> Result<()> {
         if handle.is_some() {
             return Ok(());
         }
-
         let addr = format!("0.0.0.0:{}", self.port);
         let listener = TcpListener::bind(&addr).await.map_err(|e| {
             Error::Other(format!(
                 "failed to bind TLS-ALPN-01 challenge server on {addr}: {e}"
             ))
         })?;
-
-        debug!(addr = %addr, "TLS-ALPN-01 challenge server started");
-
-        let challenges = Arc::clone(&self.challenges);
-        let jh = tokio::spawn(async move {
-            loop {
-                let (stream, peer) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = %e, "TLS-ALPN-01 server accept error");
-                        continue;
-                    }
-                };
-
-                let challenges = Arc::clone(&challenges);
-                tokio::spawn(async move {
-                    // Build a rustls ServerConfig that selects the challenge cert
-                    // based on the SNI value.
-                    let challenges_snapshot = challenges.read().await;
-                    if challenges_snapshot.is_empty() {
-                        return;
-                    }
-
-                    // We need a custom cert resolver. For simplicity, we build a
-                    // new TLS config per connection using the SNI from the
-                    // challenges we have. If the client's SNI doesn't match, the
-                    // handshake will fail, which is fine for challenge purposes.
-
-                    // Since we cannot peek at SNI before constructing the config,
-                    // we use a resolver that picks the right cert dynamically.
-                    let resolver = ChallengeCertResolver {
-                        challenges: challenges_snapshot
-                            .iter()
-                            .map(|(domain, (certs, key))| {
-                                (domain.clone(), (certs.clone(), key.clone_key()))
-                            })
-                            .collect(),
-                    };
-
-                    drop(challenges_snapshot);
-
-                    let mut config = rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(resolver));
-
-                    config.alpn_protocols = vec![ACME_TLS_ALPN_PROTOCOL.to_vec()];
-
-                    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let resolver = ChallengeCertResolver {
+            challenges: Arc::clone(&self.challenges),
+        };
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        config.alpn_protocols = vec![ACME_TLS_ALPN_PROTOCOL.to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        *handle = Some(ChallengeServer::spawn(
+            listener,
+            self.limits,
+            move |stream, peer| {
+                let acceptor = acceptor.clone();
+                async move {
                     match acceptor.accept(stream).await {
-                        Ok(_tls_stream) => {
-                            debug!(peer = %peer, "TLS-ALPN-01 handshake completed");
-                            // The handshake is all that matters; drop the connection.
-                        }
-                        Err(e) => {
-                            debug!(peer = %peer, error = %e, "TLS-ALPN-01 handshake failed");
-                        }
+                        Ok(_) => debug!(%peer, "TLS-ALPN-01 handshake completed"),
+                        Err(error) => debug!(%peer, %error, "TLS-ALPN-01 handshake failed"),
                     }
-                });
-            }
-        });
-
-        *handle = Some(jh);
+                }
+            },
+        ));
+        debug!(%addr, "TLS-ALPN-01 challenge server started");
         Ok(())
     }
 }
@@ -594,31 +759,44 @@ impl std::fmt::Debug for TlsAlpn01Solver {
 #[async_trait]
 impl Solver for TlsAlpn01Solver {
     async fn present(&self, domain: &str, _token: &str, key_auth: &str) -> Result<()> {
-        let (cert_chain, key_der) = Self::generate_challenge_cert(domain, key_auth)?;
-        {
-            let mut challenges = self.challenges.write().await;
-            challenges.insert(domain.to_string(), (cert_chain, key_der));
+        let (certs, key_der) = Self::generate_challenge_cert(domain, key_auth)?;
+        let key = crate::handshake::signing_key_from_der(&key_der)
+            .map_err(|e| Error::Other(format!("failed to load challenge signing key: {e}")))?;
+        let prepared = Arc::new(rustls::sign::CertifiedKey::new(certs, key));
+        let mut handle = self.server_handle.lock().await;
+        finish_stopped_challenge_server(&mut handle).await;
+        let previous = self
+            .challenges
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(domain.to_owned(), prepared);
+        let previous_global = register_active_challenge(domain, key_auth).await;
+        if let Err(error) = self.ensure_server_running(&mut handle).await {
+            {
+                let mut challenges = self.challenges.write().unwrap_or_else(|e| e.into_inner());
+                if let Some(previous) = previous {
+                    challenges.insert(domain.to_owned(), previous);
+                } else {
+                    challenges.remove(domain);
+                }
+            }
+            restore_active_challenge(domain, key_auth, previous_global).await;
+            return Err(error);
         }
-        register_active_challenge(domain, key_auth).await;
-        self.ensure_server_running().await?;
-        debug!(domain = domain, "TLS-ALPN-01 challenge presented");
+        debug!(domain, "TLS-ALPN-01 challenge presented");
         Ok(())
     }
 
     async fn cleanup(&self, domain: &str, _token: &str, _key_auth: &str) -> Result<()> {
+        let mut handle = self.server_handle.lock().await;
         let should_stop = {
-            let mut challenges = self.challenges.write().await;
+            let mut challenges = self.challenges.write().unwrap_or_else(|e| e.into_inner());
             challenges.remove(domain);
             challenges.is_empty()
         };
         unregister_active_challenge(domain).await;
-
         if should_stop {
-            let mut handle = self.server_handle.lock().await;
-            if let Some(jh) = handle.take() {
-                jh.abort();
-                debug!("TLS-ALPN-01 challenge server stopped (no more challenges)");
-            }
+            stop_challenge_server(&mut handle).await;
         }
         Ok(())
     }
@@ -638,7 +816,7 @@ impl Solver for TlsAlpn01Solver {
 /// (containing the `acmeIdentifier` extension) is presented.
 #[derive(Debug)]
 struct ChallengeCertResolver {
-    challenges: HashMap<String, (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    challenges: ChallengeMap,
 }
 
 impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
@@ -648,14 +826,10 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let sni = client_hello.server_name()?;
 
-        let (certs, key_der) = self.challenges.get(sni)?;
-
-        let signing_key = crate::handshake::signing_key_from_der(key_der).ok()?;
-
-        Some(Arc::new(rustls::sign::CertifiedKey::new(
-            certs.clone(),
-            signing_key,
-        )))
+        let challenges = self.challenges.read().unwrap_or_else(|e| e.into_inner());
+        let key = challenges.get(sni)?;
+        key.key.choose_scheme(client_hello.signature_schemes())?;
+        Some(Arc::clone(key))
     }
 }
 
@@ -1094,6 +1268,292 @@ mod tests {
         assert!(key.contains("wildcard_"));
     }
 
+    #[tokio::test]
+    async fn challenge_accept_error_backs_off_then_serves_a_real_peer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        tokio::time::pause();
+        let runnable = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut server = Some(ChallengeServer::spawn_with_accept(
+            {
+                let calls = calls.clone();
+                move || {
+                    let listener = listener.clone();
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            Err(std::io::Error::from(std::io::ErrorKind::ConnectionAborted))
+                        } else {
+                            listener.accept().await
+                        }
+                    }
+                }
+            },
+            ChallengeLimits::default(),
+            |mut stream, _| async move {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                stream.write_all(&byte).await.unwrap();
+            },
+        ));
+        while calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut peer = TcpStream::connect(address).await.unwrap();
+        peer.write_all(b"x").await.unwrap();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "accept failures must not form a hot loop"
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::time::resume();
+        runnable.abort();
+        let mut reply = [0];
+        tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"x");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        stop_challenge_server(&mut server).await;
+    }
+
+    #[tokio::test]
+    async fn challenge_deadline_includes_a_blocked_http_response_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let challenges = Arc::new(RwLock::new(HashMap::from([
+            ("blocked".to_owned(), "blocked.thumb".to_owned()),
+            ("fast".to_owned(), "ok".to_owned()),
+        ])));
+        tokio::time::pause();
+        let runnable = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let (mut stalled, controlled_server) = tokio::io::duplex(16);
+        let mut first = Some(controlled_server);
+        let mut server = Some(ChallengeServer::spawn(
+            listener,
+            ChallengeLimits::checked(1, Duration::from_secs(10)).unwrap(),
+            move |stream, peer| {
+                let first = first.take();
+                let challenges = challenges.clone();
+                async move {
+                    if let Some(controlled) = first {
+                        // Retain the real accepted socket and its budget while
+                        // the actual HTTP handler writes to a deterministic
+                        // 16-byte transport instead of an OS-sized buffer.
+                        serve_http_challenge(controlled, peer, challenges).await;
+                        drop(stream);
+                    } else {
+                        serve_http_challenge(stream, peer, challenges).await;
+                    }
+                }
+            },
+        ));
+        let _accepted = TcpStream::connect(address).await.unwrap();
+        stalled
+            .write_all(
+                b"GET /.well-known/acme-challenge/blocked HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut byte = [0];
+        stalled.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"H", "prove the response write has started");
+        let fast = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(
+                    b"GET /.well-known/acme-challenge/fast HTTP/1.1\r\nHost: example.com\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).await.unwrap();
+            reply
+        });
+        tokio::time::advance(Duration::from_secs(9)).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !fast.is_finished(),
+            "the unread response still owns the only connection slot"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        runnable.abort();
+        let reply = tokio::time::timeout(Duration::from_secs(5), fast)
+            .await
+            .expect("a blocked writer starved the next challenge")
+            .unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"));
+        assert!(reply.ends_with("ok"));
+        stop_challenge_server(&mut server).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_an_unpolled_challenge_server_releases_its_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = ChallengeServer::spawn(listener, ChallengeLimits::default(), |_, _| async {});
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match TcpListener::bind(address).await {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("unexpected bind failure: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_cleanup_keeps_the_stopping_generation_until_a_new_present_can_bind() {
+        struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Release {
+            fn open(&self) {
+                *self.0.0.lock().unwrap() = true;
+                self.0.1.notify_all();
+            }
+        }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.open();
+            }
+        }
+        struct BlockOnDrop {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl Drop for BlockOnDrop {
+            fn drop(&mut self) {
+                self.entered.notify_one();
+                let mut released = self.release.0.lock().unwrap();
+                while !*released {
+                    released = self.release.1.wait(released).unwrap();
+                }
+            }
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let address = listener.local_addr().unwrap();
+        let solver = Arc::new(Http01Solver::new(address.port()));
+        solver
+            .challenges
+            .write()
+            .await
+            .insert("cancelled-old".into(), "old.thumb".into());
+        register_active_challenge("cancelled-old", "old.thumb").await;
+        let accepting_second = Arc::new(tokio::sync::Notify::new());
+        let dropping_accept = Arc::new(tokio::sync::Notify::new());
+        let release = Release(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
+        let calls = Arc::new(AtomicUsize::new(0));
+        *solver.server_handle.lock().await = Some(ChallengeServer::spawn_with_accept(
+            {
+                let accepting_second = accepting_second.clone();
+                let dropping_accept = dropping_accept.clone();
+                let release = release.0.clone();
+                move || {
+                    let listener = listener.clone();
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    let accepting_second = accepting_second.clone();
+                    let entered = dropping_accept.clone();
+                    let release = release.clone();
+                    async move {
+                        let _drop = if attempt == 1 {
+                            accepting_second.notify_one();
+                            Some(BlockOnDrop { entered, release })
+                        } else {
+                            None
+                        };
+                        listener.accept().await
+                    }
+                }
+            },
+            ChallengeLimits::default(),
+            |mut stream, _| async move {
+                let mut byte = [0];
+                let _ = stream.read(&mut byte).await;
+            },
+        ));
+        let mut peer = TcpStream::connect(address).await.unwrap();
+        accepting_second.notified().await;
+        let cleanup = tokio::spawn({
+            let solver = solver.clone();
+            async move {
+                solver
+                    .cleanup("example.com", "cancelled-old", "old.thumb")
+                    .await
+            }
+        });
+        dropping_accept.notified().await;
+        cleanup.abort();
+        let _ = cleanup.await;
+        assert!(
+            solver
+                .server_handle
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .stop
+                .is_none()
+        );
+        let mut present = Box::pin(solver.present("example.com", "cancelled-new", "new.thumb"));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(present.as_mut().poll(&mut context).is_pending());
+        assert!(!solver.challenges.read().await.contains_key("cancelled-new"));
+        release.open();
+        tokio::time::timeout(Duration::from_secs(2), present)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let mut peer = TcpStream::connect(address).await.unwrap();
+        peer.write_all(
+            b"GET /.well-known/acme-challenge/cancelled-new HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        peer.read_to_string(&mut response).await.unwrap();
+        assert!(response.ends_with("new.thumb"));
+        solver
+            .cleanup("example.com", "cancelled-new", "new.thumb")
+            .await
+            .unwrap();
+    }
+
     // -- Http01Solver -------------------------------------------------------
 
     #[test]
@@ -1236,6 +1696,44 @@ mod tests {
     }
 
     // -- TlsAlpn01Solver ---------------------------------------------------
+
+    #[tokio::test]
+    async fn tls_bind_failure_rolls_back_only_its_attempted_challenge() {
+        crate::install_default_crypto_provider();
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let original = TlsAlpn01Solver::new(port);
+        let failed = TlsAlpn01Solver::new(port);
+        let domain = "tls-bind-rollback.example";
+        original.present(domain, "old", "old.thumb").await.unwrap();
+        let original_key = original.challenges.read().unwrap()[domain].clone();
+        assert!(failed.present(domain, "new", "new.thumb").await.is_err());
+        assert!(failed.challenges.read().unwrap().is_empty());
+        assert!(failed.server_handle.lock().await.is_none());
+        assert!(Arc::ptr_eq(
+            &original_key,
+            &original.challenges.read().unwrap()[domain]
+        ));
+        assert_eq!(
+            active_challenges()
+                .read()
+                .await
+                .get(domain)
+                .map(String::as_str),
+            Some("old.thumb")
+        );
+        assert!(
+            !original
+                .server_handle
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        original.cleanup(domain, "old", "old.thumb").await.unwrap();
+    }
 
     #[test]
     fn tls_alpn01_solver_default_port() {
