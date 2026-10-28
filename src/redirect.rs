@@ -584,7 +584,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn blocked_response_write_uses_the_same_deadline() {
         let handler = limited_handler(Duration::from_millis(100), 2);
         let (mut client, server) = tokio::io::duplex(16);
@@ -596,13 +596,23 @@ mod tests {
             "GET /{} HTTP/1.1\r\nHost: example.com\r\n\r\n",
             "p".repeat(4096)
         );
-        client.write_all(request.as_bytes()).await.unwrap();
-        // Do not read: the 16-byte output buffer forces the server write to wait.
+        client.write_all(&request.as_bytes()[..16]).await.unwrap();
+        tokio::time::advance(Duration::from_millis(80)).await;
+        client.write_all(&request.as_bytes()[16..]).await.unwrap();
+        // Observe one response byte to prove the read phase really completed.
+        // Then stop reading: the 16-byte buffer still forces writing to wait.
+        let mut first = [0];
+        client.read_exact(&mut first).await.unwrap();
+        assert_eq!(
+            tokio::time::Instant::now(),
+            deadline - Duration::from_millis(20)
+        );
         tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .unwrap()
             .unwrap();
-        let mut response = Vec::new();
+        assert_eq!(tokio::time::Instant::now(), deadline);
+        let mut response = first.to_vec();
         client.read_to_end(&mut response).await.unwrap();
         assert!(!response.is_empty());
         assert!(!response.windows(4).any(|w| w == b"\r\n\r\n"));

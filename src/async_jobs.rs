@@ -102,6 +102,27 @@ impl Default for RetryConfig {
     }
 }
 
+impl RetryConfig {
+    /// Validate retry intervals and monotonic-clock bounds without panicking.
+    pub fn validate(&self) -> Result<()> {
+        if self.intervals.is_empty() {
+            return Err(Error::Config("retry intervals must not be empty".into()));
+        }
+        let now = Instant::now();
+        if now.checked_add(self.max_duration).is_none()
+            || self
+                .intervals
+                .iter()
+                .any(|interval| now.checked_add(*interval).is_none())
+        {
+            return Err(Error::Config(
+                "retry duration exceeds the monotonic clock range".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error classification for retry
 // ---------------------------------------------------------------------------
@@ -255,12 +276,136 @@ pub struct JobQueue {
     name: String,
     semaphore: Option<Arc<Semaphore>>,
     admission: Option<Arc<Semaphore>>,
+    retry_records: Option<Arc<Semaphore>>,
     changed: watch::Sender<()>,
     closed: AtomicBool,
 }
 
 pub(crate) const CERTIFICATE_JOB_CONCURRENCY: usize = 4;
 pub(crate) const CERTIFICATE_JOB_PENDING: usize = 64;
+
+pub(crate) struct RetryFailure {
+    pub error: Error,
+    pub kind: &'static str,
+}
+
+struct RetryOperation<F> {
+    operation: Option<F>,
+    retained: Option<OwnedSemaphorePermit>,
+}
+
+impl<F> Drop for RetryOperation<F> {
+    fn drop(&mut self) {
+        drop(self.operation.take());
+        drop(self.retained.take());
+    }
+}
+
+async fn scheduled_retry<F, Fut>(
+    config: RetryConfig,
+    admitted_at: Instant,
+    execution: Arc<Semaphore>,
+    retry_records: Arc<Semaphore>,
+    operation: F,
+) -> std::result::Result<(), RetryFailure>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let deadline = admitted_at
+        .checked_add(config.max_duration)
+        .ok_or_else(|| RetryFailure {
+            error: Error::Config("retry duration exceeds the monotonic clock range".into()),
+            kind: "invalid_retry_config",
+        })?;
+    let mut attempts = 0;
+    let mut retry = RetryOperation {
+        operation: Some(operation),
+        retained: None,
+    };
+    let work = async {
+        // Retaining a retry must not consume every admission record. The
+        // execution-sized remainder is reserved for new first attempts.
+        loop {
+            if Instant::now() >= deadline {
+                return Err(RetryFailure {
+                    error: retry_budget_error(&config, attempts),
+                    kind: "retry_budget_exhausted",
+                });
+            }
+            let result = {
+                let permit = execution
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| RetryFailure {
+                        error: Error::Other("background job queue is closed".into()),
+                        kind: "queue_closed",
+                    })?;
+                // Timeout polls the inner future first. If a permit and the
+                // deadline become ready together, do not start a late attempt.
+                if Instant::now() >= deadline {
+                    return Err(RetryFailure {
+                        error: retry_budget_error(&config, attempts),
+                        kind: "retry_budget_exhausted",
+                    });
+                }
+                let mut attempt = QueuedWork {
+                    create: Some(|| {
+                        retry.operation.as_mut().expect("retry operation missing")(attempts)
+                    }),
+                    execution: Some(permit),
+                    completion: None,
+                };
+                let future = attempt.create.take().expect("retry factory missing")();
+                RunningWork {
+                    future: Some(Box::pin(future)),
+                    execution: attempt.execution.take(),
+                    completion: None,
+                }
+                .await
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    if !should_retry(&error)
+                        || (config.max_retries > 0 && attempts >= config.max_retries)
+                    {
+                        return Err(RetryFailure {
+                            error,
+                            kind: "operation_failed",
+                        });
+                    }
+                    if retry.retained.is_none() {
+                        retry.retained = Some(retry_records.clone().try_acquire_owned().map_err(|error| {
+                            let (message, kind) = match error {
+                                tokio::sync::TryAcquireError::Closed => ("background job queue is closed", "queue_closed"),
+                                tokio::sync::TryAcquireError::NoPermits => ("background retry backlog is full; resubmit this domain later", "retry_backlog_full"),
+                            };
+                            RetryFailure { error: Error::Other(message.into()), kind }
+                        })?);
+                    }
+                    let delay = config.intervals[(attempts - 1).min(config.intervals.len() - 1)];
+                    tracing::error!(%error, attempts, retrying_in = ?delay, "background attempt failed; releasing execution until retry");
+                    if delay.is_zero() {
+                        tokio::task::yield_now().await;
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+    };
+    tokio::time::timeout_at(deadline, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(RetryFailure {
+                error: retry_budget_error(&config, attempts),
+                kind: "retry_budget_exhausted",
+            })
+        })
+}
 
 struct Job {
     abort: Option<AbortHandle>,
@@ -355,6 +500,7 @@ impl JobQueue {
             name: name.into(),
             semaphore: (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent))),
             admission: None,
+            retry_records: None,
             changed: watch::channel(()).0,
             closed: AtomicBool::new(false),
         }
@@ -374,6 +520,7 @@ impl JobQueue {
             .expect("job capacity overflow");
         let mut queue = Self::with_max_concurrent(name, max_concurrent);
         queue.admission = Some(Arc::new(Semaphore::new(capacity)));
+        queue.retry_records = Some(Arc::new(Semaphore::new(max_pending)));
         queue
     }
 
@@ -385,6 +532,52 @@ impl JobQueue {
     pub async fn submit<F, Fut>(&self, name: String, f: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.submit_inner(name, move |_| f(), self.semaphore.clone())
+            .await;
+    }
+
+    pub(crate) async fn submit_retrying<F, Fut, C>(
+        &self,
+        name: String,
+        config: RetryConfig,
+        operation: F,
+        complete: C,
+    ) where
+        F: FnMut(usize) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+        C: FnOnce(std::result::Result<(), RetryFailure>) + Send + 'static,
+    {
+        if let Err(error) = config.validate() {
+            complete(Err(RetryFailure {
+                error,
+                kind: "invalid_retry_config",
+            }));
+            return;
+        }
+        let (Some(execution), Some(records)) = (&self.semaphore, &self.retry_records) else {
+            complete(Err(RetryFailure {
+                error: Error::Config("retry scheduling requires bounded admission".into()),
+                kind: "invalid_retry_config",
+            }));
+            return;
+        };
+        let execution = execution.clone();
+        let records = records.clone();
+        self.submit_inner(
+            name,
+            move |admitted_at| async move {
+                complete(scheduled_retry(config, admitted_at, execution, records, operation).await);
+            },
+            None,
+        )
+        .await;
+    }
+
+    async fn submit_inner<F, Fut>(&self, name: String, f: F, semaphore: Option<Arc<Semaphore>>)
+    where
+        F: FnOnce(Instant) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let runtime = tokio::runtime::Handle::current();
@@ -418,6 +611,7 @@ impl JobQueue {
             None
         };
         let (done, completion) = watch::channel(false);
+        let admitted_at = Instant::now();
         let identity = Arc::new(());
         {
             let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -445,12 +639,11 @@ impl JobQueue {
             admission,
         };
         let queued = QueuedWork {
-            create: Some(f),
+            create: Some(move || f(admitted_at)),
             execution: None,
             completion: Some(cleanup),
         };
         self.changed.send_replace(());
-        let semaphore = self.semaphore.clone();
         tracing::debug!(queue = %self.name, job = %name, "submitting background job");
         let handle = runtime.spawn(async move {
             let mut queued = queued;
@@ -565,6 +758,9 @@ impl JobQueue {
         }
         if let Some(execution) = &self.semaphore {
             execution.close();
+        }
+        if let Some(records) = &self.retry_records {
+            records.close();
         }
         self.changed.send_replace(());
         for abort in aborts {
@@ -1251,5 +1447,339 @@ mod tests {
             }
             queue.shutdown().await;
         }
+    }
+
+    fn background_config() -> RetryConfig {
+        RetryConfig {
+            intervals: vec![Duration::from_secs(3600)],
+            max_duration: Duration::from_secs(2 * 86400),
+            max_retries: 0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_retries_leave_room_for_new_work_and_reject_overflow_explicitly() {
+        let queue = JobQueue::with_limits("fair-retries", 4, 64);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        for index in 0..68 {
+            queue
+                .submit_retrying(
+                    index.to_string(),
+                    background_config(),
+                    {
+                        let attempts = attempts.clone();
+                        move |_| {
+                            attempts.fetch_add(1, Ordering::SeqCst);
+                            std::future::ready(Err(Error::Other("temporary".into())))
+                        }
+                    },
+                    {
+                        let failures = failures.clone();
+                        move |result| failures.lock().unwrap().push(result.unwrap_err().kind)
+                    },
+                )
+                .await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while attempts.load(Ordering::SeqCst) != 68 || failures.lock().unwrap().len() != 4 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(queue.len().await, 64);
+        assert_eq!(*failures.lock().unwrap(), vec!["retry_backlog_full"; 4]);
+        assert_eq!(queue.semaphore.as_ref().unwrap().available_permits(), 4);
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 4);
+        assert_eq!(queue.retry_records.as_ref().unwrap().available_permits(), 0);
+        let duplicate = queue.jobs.lock().unwrap().keys().next().unwrap().clone();
+        queue
+            .submit_retrying(
+                duplicate.clone(),
+                background_config(),
+                |_| async { panic!("duplicate attempt ran") },
+                |_| panic!("duplicate completed"),
+            )
+            .await;
+        let healthy = Arc::new(AtomicUsize::new(0));
+        queue
+            .submit_retrying(
+                "healthy".into(),
+                background_config(),
+                {
+                    let healthy = healthy.clone();
+                    move |_| {
+                        healthy.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(()))
+                    }
+                },
+                |result| assert!(result.is_ok()),
+            )
+            .await;
+        queue.wait("healthy").await;
+        assert_eq!(healthy.load(Ordering::SeqCst), 1);
+        assert_eq!(queue.len().await, 64);
+
+        for index in 0..4 {
+            queue
+                .submit_retrying(
+                    format!("active-{index}"),
+                    background_config(),
+                    |_| std::future::pending(),
+                    |_| {},
+                )
+                .await;
+        }
+        assert_eq!(queue.len().await, 68);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let token = Dropped(dropped.clone());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                queue.submit_retrying(
+                    "unadmitted".into(),
+                    background_config(),
+                    move |_| {
+                        std::hint::black_box(&token);
+                        std::future::ready(Ok(()))
+                    },
+                    |_| {}
+                )
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(!queue.is_running("unadmitted").await);
+        queue.cancel(&duplicate).await;
+        assert_eq!(queue.retry_records.as_ref().unwrap().available_permits(), 1);
+        queue.shutdown().await;
+        assert!(queue.is_empty().await);
+        assert_eq!(
+            queue.retry_records.as_ref().unwrap().available_permits(),
+            64
+        );
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 68);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_deadline_is_absolute_and_includes_execution_wait() {
+        let queue = JobQueue::with_limits("deadline", 1, 2);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let outcome = Arc::new(Mutex::new(None));
+        queue
+            .submit_retrying(
+                "retries".into(),
+                RetryConfig {
+                    intervals: vec![Duration::from_secs(4)],
+                    max_duration: Duration::from_secs(12),
+                    max_retries: 0,
+                },
+                {
+                    let attempts = attempts.clone();
+                    move |_| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err(Error::Other("temporary".into())))
+                    }
+                },
+                {
+                    let outcome = outcome.clone();
+                    move |result| *outcome.lock().unwrap() = Some(result.unwrap_err().kind)
+                },
+            )
+            .await;
+        for expected in 1..=3 {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), expected);
+            assert!(outcome.lock().unwrap().is_none());
+            tokio::time::advance(Duration::from_secs(if expected < 3 { 5 } else { 3 })).await;
+        }
+        queue.wait("retries").await;
+        assert_eq!(*outcome.lock().unwrap(), Some("retry_budget_exhausted"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        queue.submit("blocker".into(), std::future::pending).await;
+        let outcome = Arc::new(Mutex::new(None));
+        queue
+            .submit_retrying(
+                "waiting".into(),
+                RetryConfig {
+                    max_duration: Duration::from_secs(2),
+                    ..background_config()
+                },
+                |_| async { panic!("expired waiting attempt ran") },
+                {
+                    let outcome = outcome.clone();
+                    move |result| *outcome.lock().unwrap() = Some(result.unwrap_err().kind)
+                },
+            )
+            .await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        queue.wait("waiting").await;
+        assert_eq!(*outcome.lock().unwrap(), Some("retry_budget_exhausted"));
+        queue.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_failures_and_panics_release_all_budgets() {
+        let queue = JobQueue::with_limits("retry-errors", 1, 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        queue
+            .submit_retrying(
+                "finite".into(),
+                RetryConfig {
+                    intervals: vec![Duration::ZERO],
+                    max_retries: 2,
+                    ..background_config()
+                },
+                {
+                    let calls = calls.clone();
+                    move |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err(Error::Other("temporary".into())))
+                    }
+                },
+                |result| assert_eq!(result.unwrap_err().kind, "operation_failed"),
+            )
+            .await;
+        queue.wait("finite").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        queue
+            .submit_retrying(
+                "factory-panic".into(),
+                background_config(),
+                |_| -> std::future::Ready<Result<()>> { panic!("retry factory panic") },
+                |_| {},
+            )
+            .await;
+        queue.wait("factory-panic").await;
+        queue
+            .submit_retrying(
+                "future-panic".into(),
+                background_config(),
+                |_| async { panic!("retry future panic") },
+                |_| {},
+            )
+            .await;
+        queue.wait("future-panic").await;
+        assert!(queue.is_empty().await);
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 2);
+        assert_eq!(queue.semaphore.as_ref().unwrap().available_permits(), 1);
+        assert_eq!(queue.retry_records.as_ref().unwrap().available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_backoff_drops_the_factory_before_retention_and_completion() {
+        struct Barrier {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for Barrier {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+        }
+        let queue = Arc::new(JobQueue::with_limits("retry-drop", 1, 1));
+        let (entered, dropped) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let resource = Barrier {
+            entered,
+            release: released,
+        };
+        queue
+            .submit_retrying(
+                "probe".into(),
+                background_config(),
+                move |_| {
+                    std::hint::black_box(&resource);
+                    std::future::ready(Err(Error::Other("temporary".into())))
+                },
+                |_| {},
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.retry_records.as_ref().unwrap().available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let completion = queue.jobs.lock().unwrap()["probe"].completion.clone();
+        let (finished, receive) = tokio::sync::oneshot::channel();
+        let observer_queue = queue.clone();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let worker_queue = observer_queue.clone();
+            let worker = std::thread::spawn(move || runtime.block_on(worker_queue.cancel("probe")));
+            dropped.recv_timeout(Duration::from_secs(2)).unwrap();
+            let state = (
+                *completion.borrow(),
+                observer_queue
+                    .retry_records
+                    .as_ref()
+                    .unwrap()
+                    .available_permits(),
+                observer_queue
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .available_permits(),
+            );
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            let _ = finished.send(state);
+        });
+        let observed = tokio::time::timeout(Duration::from_secs(4), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed, (false, 0, 1));
+        assert_eq!(queue.retry_records.as_ref().unwrap().available_permits(), 1);
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 2);
+        queue.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permit_arriving_after_deadline_cannot_start_an_attempt() {
+        let execution = Arc::new(Semaphore::new(1));
+        let permit = execution.clone().acquire_owned().await.unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let future = scheduled_retry(
+            RetryConfig {
+                max_duration: Duration::from_secs(1),
+                ..background_config()
+            },
+            Instant::now(),
+            execution,
+            Arc::new(Semaphore::new(1)),
+            {
+                let calls = calls.clone();
+                move |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Ok(()))
+                }
+            },
+        );
+        tokio::pin!(future);
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(permit);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(std::task::Waker::noop()))
+        {
+            Poll::Ready(Err(error)) => assert_eq!(error.kind, "retry_budget_exhausted"),
+            _ => panic!("expired queued retry was not rejected"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

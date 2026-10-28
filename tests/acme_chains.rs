@@ -186,6 +186,30 @@ impl Server {
             .cloned()
             .collect()
     }
+
+    async fn wait_for_request(&self, path: &str) {
+        let wall_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, requested)| requested == path)
+            {
+                return;
+            }
+            assert!(!self.task.is_finished(), "test server exited before {path}");
+            assert!(
+                std::time::Instant::now() < wall_deadline,
+                "test server never received {path}"
+            );
+            // Keep the paused runtime runnable while real socket/filesystem
+            // setup progresses; its automatic clock must not consume the
+            // issuance budget before the controlled protocol phase starts.
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 fn chains() -> (String, String) {
@@ -459,7 +483,7 @@ fn stalled_response() -> Response {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn short_issuance_timeout_keeps_default_despite_stalled_alternates() {
     let (default, _) = chains();
     let server = Server::start_with_finalize_delay(
@@ -479,19 +503,32 @@ async fn short_issuance_timeout_keeps_default_despite_stalled_alternates() {
         Duration::from_millis(500),
     )
     .await;
-    // Most of this short issuance budget is consumed before downloading the
-    // default. A new relative timeout at discovery would overrun the caller.
+    // Consume 500 ms only after the real server reaches finalization. Crypto,
+    // filesystem and HTTP setup must not depend on a runner's wall-clock speed.
     let issued = issue_with_timeout(
         &server,
         Some(ChainPreference::default()),
         Some(Duration::from_millis(800)),
-    )
-    .await;
+    );
+    tokio::pin!(issued);
+    tokio::select! {
+        _ = &mut issued => panic!("issuance finished before finalization"),
+        _ = server.wait_for_request("/finalize") => {},
+    }
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tokio::select! {
+        _ = &mut issued => panic!("issuance did not attempt the stalled alternate"),
+        _ = server.wait_for_request("/cert/stall-1") => {},
+    }
+    // With the response genuinely stalled, automatic time advance exercises
+    // discovery's remaining-time budget. A fresh relative timeout would instead
+    // hit the outer 800 ms issuance timeout and fail this test.
+    let issued = issued.await;
     assert_eq!(issued, default);
     assert_eq!(server.certificate_requests().len(), 2);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn short_issuance_timeout_keeps_a_collected_chain_despite_stalled_alternates() {
     let (default, alternate) = chains();
     let server = Server::start_with_finalize_delay(HashMap::from([
@@ -504,8 +541,18 @@ async fn short_issuance_timeout_keeps_a_collected_chain_despite_stalled_alternat
         root_common_name: vec!["Compact Root".into()],
         ..Default::default()
     };
-    let issued =
-        issue_with_timeout(&server, Some(preference), Some(Duration::from_millis(800))).await;
+    let issued = issue_with_timeout(&server, Some(preference), Some(Duration::from_millis(800)));
+    tokio::pin!(issued);
+    tokio::select! {
+        _ = &mut issued => panic!("issuance finished before finalization"),
+        _ = server.wait_for_request("/finalize") => {},
+    }
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tokio::select! {
+        _ = &mut issued => panic!("issuance did not attempt the stalled alternate"),
+        _ = server.wait_for_request("/cert/stall-1") => {},
+    }
+    let issued = issued.await;
     assert_eq!(issued, alternate);
     assert_eq!(server.certificate_requests().len(), 3);
 }

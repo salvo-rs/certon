@@ -153,6 +153,7 @@ pub struct CertManager {
 
     /// Background job queue for async certificate operations.
     job_queue: Arc<JobQueue>,
+    background_retry: RetryConfig,
 }
 
 impl std::fmt::Debug for CertManager {
@@ -180,6 +181,7 @@ impl std::fmt::Debug for CertManager {
 /// Created via [`CertManager::builder()`]. At a minimum, a [`Storage`]
 /// implementation must be provided before calling [`build()`](CertManagerBuilder::build).
 pub struct CertManagerBuilder {
+    background_retry: RetryConfig,
     policy: Policy,
     on_demand: Option<Arc<OnDemandConfig>>,
     issuers: Option<Vec<Arc<dyn CertIssuer>>>,
@@ -192,6 +194,12 @@ pub struct CertManagerBuilder {
 }
 
 impl CertManagerBuilder {
+    /// Configure retries for queued background management. Invalid clock bounds
+    /// or empty intervals are rejected by `manage_in_background` before submit.
+    pub fn background_retry_config(mut self, config: RetryConfig) -> Self {
+        self.background_retry = config;
+        self
+    }
     /// Set the renewal window ratio.
     /// Replace every setting at once.
     ///
@@ -363,6 +371,7 @@ impl CertManagerBuilder {
             subject_transformer: self.subject_transformer,
             cert_selection: self.cert_selection,
             job_queue: Arc::new(JobQueue::certificate_jobs("cert_management")),
+            background_retry: self.background_retry,
         }
     }
 }
@@ -397,6 +406,7 @@ impl CertManager {
             subject_transformer: self.subject_transformer.clone(),
             cert_selection: self.cert_selection.clone(),
             job_queue: Arc::clone(&self.job_queue),
+            background_retry: self.background_retry.clone(),
         }
     }
 
@@ -407,6 +417,7 @@ impl CertManager {
     /// hooks — starts empty, and a [`Storage`] must be given.
     pub fn builder() -> CertManagerBuilder {
         CertManagerBuilder {
+            background_retry: RetryConfig::default(),
             policy: Policy::default(),
             on_demand: None,
             issuers: None,
@@ -613,11 +624,26 @@ impl CertManager {
     /// ready when this method returns.
     /// At most four jobs execute and 68 are admitted per manager family;
     /// further submissions apply backpressure until capacity is available.
+    /// Backoff releases execution. At most 64 jobs retain retry records, leaving
+    /// four admission records for new work. When retention is full, a failed job
+    /// ends with `cert_failed` / `error_kind = "retry_backlog_full"`; it can be
+    /// resubmitted later. Success here means submitted, not issued successfully.
     pub async fn manage_in_background(&self, domains: &[String]) -> Result<()> {
+        self.background_retry.validate()?;
         for domain in domains {
             let domain = domain.to_lowercase();
 
-            if self.has_current_managed_certificate(&domain).await {
+            // A rejected retry may have left the old leaf managed in cache.
+            // Explicit resubmission must still be able to renew that due leaf.
+            let cached_certs = self.cache.all_matching_certificates(&domain).await;
+            let already_managed = cached_certs.iter().any(|c| {
+                c.managed
+                    && c.not_before <= chrono::Utc::now()
+                    && !c.expired()
+                    && !c.needs_renewal(self.policy.renewal_window_ratio)
+                    && c.ocsp_status != Some(OcspStatus::Revoked)
+            });
+            if already_managed {
                 continue;
             }
 
@@ -626,20 +652,43 @@ impl CertManager {
             // domain are coalesced.
             let job_name = format!("manage_{domain}");
             // We need to clone the parts of self that the closure needs.
-            let detached = self.detached("bg_manage");
+            let detached = Arc::new(self.detached("bg_manage"));
             let domain_owned = domain.clone();
 
             self.job_queue
-                .submit(job_name, move || async move {
-                    let cfg = detached;
-                    if let Err(e) = cfg.manage_one(&domain_owned, true).await {
-                        error!(
-                            domain = %domain_owned,
-                            error = %e,
-                            "background certificate management failed"
-                        );
-                    }
-                })
+                .submit_retrying(
+                    job_name,
+                    self.background_retry.clone(),
+                    {
+                        let detached = detached.clone();
+                        move |_| {
+                            let cfg = detached.clone();
+                            let domain = domain_owned.clone();
+                            // Each attempt uses the existing locked single-attempt
+                            // transaction; there is no nested retry loop.
+                            async move { cfg.manage_from_storage(&domain, false).await }
+                        }
+                    },
+                    move |result| {
+                        if let Err(failure) = result {
+                            error!(
+                                domain = %domain,
+                                error = %failure.error,
+                                error_kind = failure.kind,
+                                "background certificate management failed"
+                            );
+                            let _ = detached.emit(
+                                EVENT_CERT_FAILED,
+                                &serde_json::json!({
+                                    "identifier": domain,
+                                    "background": true,
+                                    "error_kind": failure.kind,
+                                    "error": failure.error.to_string(),
+                                }),
+                            );
+                        }
+                    },
+                )
                 .await;
         }
         Ok(())
@@ -670,6 +719,12 @@ impl CertManager {
             return Ok(());
         }
 
+        self.manage_from_storage(domain, r#async).await
+    }
+
+    // Unlike manage_one's initial cache shortcut, a retry must re-read storage
+    // even when an earlier failed renewal already cached the old managed leaf.
+    async fn manage_from_storage(&self, domain: &str, r#async: bool) -> Result<()> {
         // Planning may read an expired/future resource for its SANs and issuer,
         // but those credentials must not be published before renewal succeeds.
         match self.load_stored_certificate(domain).await {
@@ -691,11 +746,14 @@ impl CertManager {
                 }
                 Ok(())
             }
-            Err(error) => {
-                if !matches!(&error, Error::Storage(StorageError::NotFound(_))) {
-                    return Err(Error::Other(format!(
-                        "{domain}: loading certificate: {error}"
-                    )));
+            Err(e) => {
+                // Check if it is a "not found" error.
+                let is_not_found = matches!(&e, Error::Storage(StorageError::NotFound(_)));
+                if !is_not_found {
+                    // Preserve permanent certificate/configuration errors for
+                    // the retry classifier; the background failure event/log
+                    // already carries this domain as context.
+                    return Err(e);
                 }
                 if r#async {
                     self.obtain_in_background(domain).await
