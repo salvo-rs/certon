@@ -54,6 +54,7 @@ pub mod async_jobs;
 pub mod cache;
 pub mod cert_store;
 pub mod certificates;
+mod challenge;
 pub mod crypto;
 #[cfg(feature = "dns-01")]
 pub mod dns_util;

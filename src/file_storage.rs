@@ -204,12 +204,11 @@ impl FileStorage {
             }
         }
 
-        // Build a temp file name in the same directory.
-        let temp_name = format!(
-            "{}.tmp.{}",
-            path.file_name().unwrap_or_default().to_string_lossy(),
-            rand::random::<u64>(),
-        );
+        // Use an independent bounded basename: appending a suffix to the
+        // destination would exceed filesystem limits for valid long keys.
+        // Keeping the temporary file beside its destination preserves rename
+        // atomicity and the existing create_new/permission/cleanup behavior.
+        let temp_name = format!(".certon-write-{:032x}.tmp", rand::random::<u128>());
         let temp_path = path.with_file_name(temp_name);
 
         let data = data.to_vec();
@@ -657,6 +656,33 @@ mod tests {
 
         fs.delete("test/key.txt").await.unwrap();
         assert!(!fs.exists("test/key.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maximum_filename_round_trip_preserves_secret_mode_and_leaves_no_temp_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let key = format!("nested/{}.key", "p".repeat(251));
+        assert_eq!(key.rsplit('/').next().unwrap().len(), 255);
+        storage.store(&key, b"first").await.unwrap();
+        storage.store(&key, b"replacement").await.unwrap();
+        assert_eq!(storage.load(&key).await.unwrap(), b"replacement");
+        assert_eq!(
+            storage.list("nested", false).await.unwrap(),
+            vec![key.clone()]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(directory.path().join(&key))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
     }
 
     #[tokio::test]

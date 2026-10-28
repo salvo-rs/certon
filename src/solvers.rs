@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 #[cfg(feature = "dns-01")]
 use crate::dns_util::{
@@ -46,7 +46,7 @@ use crate::dns_util::{
     challenge_record_value, check_dns_propagation_with_resolvers, find_zone_by_fqdn, from_fqdn,
 };
 use crate::error::{Error, Result};
-use crate::storage::{Storage, safe_key};
+use crate::storage::Storage;
 
 /// Shared map of domain -> (cert chain DER, private key DER) for TLS-ALPN-01 challenges.
 type ChallengeMap =
@@ -97,6 +97,17 @@ async fn unregister_active_challenge(identifier: &str) {
     map.remove(identifier);
 }
 
+/// Remove only the authorization owned by this HTTP cleanup operation.
+async fn unregister_active_challenge_if_matching(identifier: &str, key_auth: &str) {
+    let mut map = active_challenges().write().await;
+    if map
+        .get(identifier)
+        .is_some_and(|current| current == key_auth)
+    {
+        map.remove(identifier);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Solver trait
 // ---------------------------------------------------------------------------
@@ -136,20 +147,9 @@ pub trait Solver: Send + Sync {
 // Challenge token storage key helpers
 // ---------------------------------------------------------------------------
 
-/// Storage key prefix for challenge tokens used by the distributed solver.
-const CHALLENGE_TOKENS_PREFIX: &str = "challenge_tokens";
-
-/// Build the storage key for challenge data.
-///
-/// The key format is: `"<issuer_prefix>/challenge_tokens/<safe_domain>.json"`.
-/// The stored value is a JSON object mapping tokens to key authorizations.
+#[cfg(test)]
 fn challenge_tokens_key(issuer_prefix: &str, domain: &str) -> String {
-    let safe_domain = safe_key(domain);
-    if issuer_prefix.is_empty() {
-        format!("{CHALLENGE_TOKENS_PREFIX}/{safe_domain}.json")
-    } else {
-        format!("{issuer_prefix}/{CHALLENGE_TOKENS_PREFIX}/{safe_domain}.json")
-    }
+    crate::challenge::legacy_key(issuer_prefix, domain)
 }
 
 // ===========================================================================
@@ -170,7 +170,8 @@ pub struct Http01Solver {
     challenges: Arc<RwLock<HashMap<String, String>>>,
     /// The port to listen on (default: 80).
     pub port: u16,
-    /// Handle to the background HTTP server task, if running.
+    /// Serializes HTTP challenge publication, cleanup and listener lifetime.
+    /// Holds the background HTTP server task while it is running.
     server_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -194,8 +195,7 @@ impl Http01Solver {
     /// logged and `Ok(())` is returned under the assumption that an existing
     /// listener (e.g. from a previous solver or external process) can handle
     /// the challenge requests.
-    async fn ensure_server_running(&self) -> Result<()> {
-        let mut handle = self.server_handle.lock().await;
+    async fn ensure_server_running(&self, handle: &mut Option<JoinHandle<()>>) -> Result<()> {
         if handle.is_some() {
             return Ok(());
         }
@@ -353,30 +353,36 @@ impl std::fmt::Debug for Http01Solver {
 #[async_trait]
 impl Solver for Http01Solver {
     async fn present(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        // The listener lock covers the map and global registration as well as
+        // startup, so cleanup cannot stop the listener after a new publication.
+        let mut handle = self.server_handle.lock().await;
         {
             let mut challenges = self.challenges.write().await;
             challenges.insert(token.to_string(), key_auth.to_string());
         }
         register_active_challenge(token, key_auth).await;
-        self.ensure_server_running().await?;
+        self.ensure_server_running(&mut handle).await?;
         debug!(token = token, "HTTP-01 challenge presented");
         Ok(())
     }
 
-    async fn cleanup(&self, _domain: &str, token: &str, _key_auth: &str) -> Result<()> {
+    async fn cleanup(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        let mut handle = self.server_handle.lock().await;
         let should_stop = {
             let mut challenges = self.challenges.write().await;
-            challenges.remove(token);
+            if challenges
+                .get(token)
+                .is_some_and(|current| current == key_auth)
+            {
+                challenges.remove(token);
+            }
             challenges.is_empty()
         };
-        unregister_active_challenge(token).await;
+        unregister_active_challenge_if_matching(token, key_auth).await;
 
-        if should_stop {
-            let mut handle = self.server_handle.lock().await;
-            if let Some(jh) = handle.take() {
-                jh.abort();
-                debug!("HTTP-01 challenge server stopped (no more challenges)");
-            }
+        if should_stop && let Some(jh) = handle.take() {
+            jh.abort();
+            debug!("HTTP-01 challenge server stopped (no more challenges)");
         }
         Ok(())
     }
@@ -951,18 +957,14 @@ impl DistributedSolver {
     /// prefix.
     ///
     /// The prefix is prepended to the challenge tokens storage path, e.g.
-    /// `"<prefix>/challenge_tokens/<domain>/<token>.json"`.
+    /// `"<prefix>/challenge_tokens/v2/<domain-hash>/<token-hash>.json"`.
+    /// Each entry binds the exact token to its canonical domain.
     pub fn with_prefix(inner: Box<dyn Solver>, storage: Arc<dyn Storage>, prefix: String) -> Self {
         Self {
             inner,
             storage,
             storage_key_issuer_prefix: prefix,
         }
-    }
-
-    /// Build the storage key for a challenge identified by domain.
-    fn challenge_key(&self, domain: &str) -> String {
-        challenge_tokens_key(&self.storage_key_issuer_prefix, domain)
     }
 }
 
@@ -977,29 +979,14 @@ impl std::fmt::Debug for DistributedSolver {
 #[async_trait]
 impl Solver for DistributedSolver {
     async fn present(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
-        // Store challenge data in shared storage so other instances can read it.
-        // The storage key is per-domain; the value is a JSON object mapping
-        // token -> key_auth.
-        let storage_key = self.challenge_key(domain);
-
-        // Load existing map (if any), merge the new token, then store.
-        let mut token_map: HashMap<String, String> = match self.storage.load(&storage_key).await {
-            Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
-            Err(_) => HashMap::new(),
-        };
-        token_map.insert(token.to_string(), key_auth.to_string());
-
-        let json_bytes = serde_json::to_vec(&token_map)
-            .map_err(|e| Error::Other(format!("serializing challenge tokens: {e}")))?;
-        self.storage.store(&storage_key, &json_bytes).await?;
-
-        // Delegate to the inner solver.
-        self.inner
-            .present(domain, token, key_auth)
-            .await
-            .map_err(|e| Error::Other(format!("presenting with inner solver: {e}")))?;
-
-        Ok(())
+        let canonical = crate::challenge::domain(domain)?;
+        let data = crate::challenge::encode(&canonical, token, key_auth)?;
+        let key = crate::challenge::key(&self.storage_key_issuer_prefix, &canonical, token);
+        let _guard =
+            crate::storage::acquire(self.storage.clone(), &crate::challenge::lock_key(&key))
+                .await?;
+        self.storage.store(&key, &data).await?;
+        self.inner.present(domain, token, key_auth).await
     }
 
     async fn wait(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
@@ -1007,51 +994,71 @@ impl Solver for DistributedSolver {
     }
 
     async fn cleanup(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
-        // Remove the token from the per-domain JSON map in shared storage.
-        let storage_key = self.challenge_key(domain);
-        match self.storage.load(&storage_key).await {
-            Ok(data) => {
-                let mut token_map: HashMap<String, String> =
-                    serde_json::from_slice(&data).unwrap_or_default();
-                token_map.remove(token);
-                if token_map.is_empty() {
-                    // No more tokens for this domain — delete the key entirely.
-                    if let Err(e) = self.storage.delete(&storage_key).await {
-                        error!(
-                            key = %storage_key,
-                            error = %e,
-                            "failed to delete challenge token from storage during cleanup"
-                        );
+        let canonical = crate::challenge::domain(domain)?;
+        crate::challenge::validate_auth(token, key_auth)?;
+        let storage_result: Result<()> = async {
+            let key = crate::challenge::key(&self.storage_key_issuer_prefix, &canonical, token);
+            let _guard =
+                crate::storage::acquire(self.storage.clone(), &crate::challenge::lock_key(&key))
+                    .await?;
+            // Retire legacy entries under a separate shared domain lock. New writers
+            // never update the old map, so different v2 tokens remain independent.
+            let legacy = crate::challenge::legacy_key(&self.storage_key_issuer_prefix, &canonical);
+            let legacy_compatible = crate::challenge::legacy_compatible(&canonical);
+            let _legacy_guard = if legacy_compatible {
+                Some(
+                    crate::storage::acquire(
+                        self.storage.clone(),
+                        &crate::challenge::lock_key(&legacy),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let current = crate::challenge::load(
+                self.storage.as_ref(),
+                &self.storage_key_issuer_prefix,
+                &canonical,
+                token,
+            )
+            .await?;
+            if legacy_compatible {
+                match self.storage.load(&legacy).await {
+                    Ok(data) => {
+                        let mut map = crate::challenge::legacy_map(&data)?;
+                        if current.as_deref() == Some(key_auth)
+                            || map.get(token).is_some_and(|auth| auth == key_auth)
+                        {
+                            map.remove(token);
+                            if map.is_empty() {
+                                self.storage.delete(&legacy).await?;
+                            } else {
+                                self.storage
+                                    .store(
+                                        &legacy,
+                                        &serde_json::to_vec(&map)
+                                            .map_err(|e| Error::Other(e.to_string()))?,
+                                    )
+                                    .await?;
+                            }
+                        }
                     }
-                } else {
-                    // Store the updated map.
-                    if let Ok(json_bytes) = serde_json::to_vec(&token_map)
-                        && let Err(e) = self.storage.store(&storage_key, &json_bytes).await
-                    {
-                        error!(
-                            key = %storage_key,
-                            error = %e,
-                            "failed to update challenge tokens in storage during cleanup"
-                        );
-                    }
+                    Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                    Err(e) => return Err(e),
                 }
             }
-            Err(e) => {
-                error!(
-                    key = %storage_key,
-                    error = %e,
-                    "failed to load challenge tokens from storage during cleanup"
-                );
+            if current.as_deref() == Some(key_auth) {
+                match self.storage.delete(&key).await {
+                    Ok(()) | Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                    Err(e) => return Err(e),
+                }
             }
+            Ok(())
         }
-
-        // Delegate cleanup to the inner solver.
-        self.inner
-            .cleanup(domain, token, key_auth)
-            .await
-            .map_err(|e| Error::Other(format!("cleaning up inner solver: {e}")))?;
-
-        Ok(())
+        .await;
+        let inner_result = self.inner.cleanup(domain, token, key_auth).await;
+        storage_result.and(inner_result)
     }
 }
 
@@ -1099,6 +1106,133 @@ mod tests {
     fn http01_solver_custom_port() {
         let solver = Http01Solver::new(8080);
         assert_eq!(solver.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn http01_stale_cleanup_preserves_new_local_authorization_and_listener() {
+        let solver = Http01Solver::new(0);
+        let token = "http-local-stale-cleanup";
+        solver
+            .present("example.com", token, "old-auth")
+            .await
+            .unwrap();
+        let original_task = solver.server_handle.lock().await.as_ref().unwrap().id();
+        solver
+            .present("example.com", token, "new-auth")
+            .await
+            .unwrap();
+        solver
+            .cleanup("example.com", token, "old-auth")
+            .await
+            .unwrap();
+        assert_eq!(
+            solver
+                .challenges
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        assert_eq!(
+            active_challenges()
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        let handle = solver.server_handle.lock().await;
+        let task = handle
+            .as_ref()
+            .expect("new challenge must keep its listener");
+        assert_eq!(task.id(), original_task);
+        assert!(!task.is_finished());
+        drop(handle);
+        solver
+            .cleanup("example.com", token, "new-auth")
+            .await
+            .unwrap();
+        assert!(solver.server_handle.lock().await.is_none());
+        assert!(!active_challenges().read().await.contains_key(token));
+    }
+
+    #[tokio::test]
+    async fn http01_cleanup_of_another_solver_preserves_new_global_registration() {
+        let old = Http01Solver::new(0);
+        let new = Http01Solver::new(0);
+        let token = "http-global-stale-cleanup";
+        old.present("example.com", token, "old-auth").await.unwrap();
+        new.present("example.com", token, "new-auth").await.unwrap();
+        old.cleanup("example.com", token, "old-auth").await.unwrap();
+        assert_eq!(
+            active_challenges()
+                .read()
+                .await
+                .get(token)
+                .map(String::as_str),
+            Some("new-auth")
+        );
+        assert!(old.server_handle.lock().await.is_none());
+        assert!(new.server_handle.lock().await.is_some());
+        new.cleanup("example.com", token, "new-auth").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http01_concurrent_last_cleanup_and_present_keep_new_listener() {
+        let solver = Arc::new(Http01Solver::new(0));
+        for iteration in 0..32 {
+            let old = format!("http-lifetime-old-{iteration}");
+            let new = format!("http-lifetime-new-{iteration}");
+            solver
+                .present("example.com", &old, "old-auth")
+                .await
+                .unwrap();
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            let cleanup = {
+                let solver = solver.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    solver
+                        .cleanup("example.com", &old, "old-auth")
+                        .await
+                        .unwrap();
+                })
+            };
+            let present = {
+                let solver = solver.clone();
+                let barrier = barrier.clone();
+                let new = new.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    solver
+                        .present("example.com", &new, "new-auth")
+                        .await
+                        .unwrap();
+                })
+            };
+            barrier.wait().await;
+            cleanup.await.unwrap();
+            present.await.unwrap();
+            assert_eq!(
+                solver.challenges.read().await.get(&new).map(String::as_str),
+                Some("new-auth")
+            );
+            assert!(
+                !solver
+                    .server_handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .expect("new challenge requires a listener")
+                    .is_finished()
+            );
+            solver
+                .cleanup("example.com", &new, "new-auth")
+                .await
+                .unwrap();
+        }
     }
 
     // -- TlsAlpn01Solver ---------------------------------------------------
