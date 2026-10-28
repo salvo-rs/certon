@@ -69,6 +69,22 @@ Certificate lifecycle corrections:
   four execution slots and capacity for 68 admitted jobs (four running plus
   64 pending). Cancelling the caller drops its not-yet-admitted submissions;
   already-admitted jobs continue running.
+- Queued management retries acquire execution capacity per attempt; backoff
+  does not keep an execution slot or a domain/leaf transaction lock. Each
+  attempt reacquires its locks and rechecks current storage and revocation.
+  At most 64 admitted jobs retain retry records, reserving four admission
+  records for new work. If retention is full, another failed job ends with a
+  `cert_failed` event containing `background: true` and
+  `error_kind: "retry_backlog_full"`, as well as an error log; resubmit it later.
+  A successful `manage_in_background` return confirms submission, not final
+  issuance. No extra tasks are spawned to bypass these bounds.
+- Set `CertManagerBuilder::background_retry_config(RetryConfig)` to configure
+  queued management retries. The default remains 30 days. One absolute budget
+  starts at admission and includes execution-queue waits and every backoff;
+  attempts do not restart it. Empty intervals or overflowing durations return
+  a configuration error before any submissions. Direct `obtain_in_background`,
+  `renew_in_background`, and arbitrary public `JobQueue::submit` futures keep
+  their existing semantics.
 - Each maintenance loop has a separate four-execution, 68-admitted expiration
   renewal budget. These are not process-wide limits: foreground operations,
   handshake on-demand work, and sequential OCSP force-renewals are independent.
