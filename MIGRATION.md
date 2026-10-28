@@ -1,5 +1,24 @@
 # Migrating to CertManager and Policy
 
+Short-lived certificates containing the actual TLS Feature `status_request`
+(Must-Staple, feature 5) now receive OCSP staples even below seven days of
+validity. Other short-lived certificates retain the existing skip optimization.
+The certificate's extension is authoritative, independently of the CSR policy.
+Managed obtain/renew rejects an unusable Must-Staple response before saving,
+and managed cache publication rechecks that a verified Good staple is still
+current before replacing a working entry.
+
+After a Must-Staple response expires, the certificate remains tracked for
+maintenance but is excluded from default and custom TLS candidate selection.
+A usable compatible sibling or configured fallback can take over. Without a
+usable candidate, an already-configured OCSP callback may request recovery for
+a signature-compatible key, with the same concurrency cap and cooldown; a
+cached Must-Staple leaf does not trigger duplicate on-demand issuance. A fresh
+authenticated in-memory response survives storage/responder failure only until
+its original expiry.
+The public reload helper obtains a required staple before guarded admission;
+ordinary certificate reloads keep their existing behavior.
+
 Live OCSP staples now have a verified serving deadline. New certificate
 lookups omit responses after `nextUpdate` (or 24 hours after `thisUpdate` when
 `nextUpdate` is absent), and configured handshake refresh callbacks become

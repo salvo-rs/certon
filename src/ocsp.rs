@@ -237,8 +237,60 @@ const CERT_STATUS_REVOKED: u8 = 1;
 // Public API: high-level OCSP stapling
 // ---------------------------------------------------------------------------
 
-/// Skip OCSP for certificates with a total lifetime shorter than seven days.
+/// Skip optional OCSP for certificates with a lifetime shorter than seven days.
 const SHORT_LIVED_CERT_DAYS: i64 = 7;
+
+/// Inspect the actual leaf's TLS Feature extension, not a CSR preference.
+/// Only status_request (5) requires an OCSP staple through this mechanism.
+pub(crate) fn requires_ocsp_staple(cert: &Certificate) -> Result<bool> {
+    let Some(leaf) = cert.cert_chain.first() else {
+        return Ok(false);
+    };
+    let (_, leaf) = X509Certificate::from_der(leaf.as_ref()).map_err(|error| {
+        CryptoError::InvalidCertificate(format!("invalid TLS Feature certificate: {error}"))
+    })?;
+    let mut extensions = leaf
+        .extensions()
+        .iter()
+        .filter(|extension| extension.oid.to_id_string() == "1.3.6.1.5.5.7.1.24");
+    let Some(extension) = extensions.next() else {
+        return Ok(false);
+    };
+    if extensions.next().is_some() {
+        return Err(CertError::OcspFailed("duplicate TLS Feature extensions".into()).into());
+    }
+    let sequence = read_der_tlv(extension.value)?;
+    if sequence.tag != 0x30 || !sequence.rest.is_empty() {
+        return Err(CertError::OcspFailed("invalid TLS Feature sequence".into()).into());
+    }
+    let mut remaining = sequence.value;
+    let mut required = false;
+    while !remaining.is_empty() {
+        let feature = read_der_tlv(remaining)?;
+        if feature.tag != 0x02 || feature.value.first().is_none_or(|byte| byte & 0x80 != 0) {
+            return Err(CertError::OcspFailed("invalid TLS Feature identifier".into()).into());
+        }
+        required |= parse_der_u32(feature.value)? == 5;
+        remaining = feature.rest;
+    }
+    Ok(required)
+}
+
+pub(crate) async fn ensure_required_staple(cert: &Certificate) -> Result<()> {
+    if !requires_ocsp_staple(cert)? {
+        return Ok(());
+    }
+    if let Some(raw) = &cert.ocsp_response {
+        let response = parse_ocsp_response_for_cert_chain(raw, &cert.cert_chain).await?;
+        if response.status == OcspStatus::Good {
+            return Ok(());
+        }
+    }
+    Err(CertError::OcspFailed(
+        "Must-Staple certificate requires a current signed Good OCSP response".into(),
+    )
+    .into())
+}
 
 /// Attempt to staple an OCSP response to `cert`.
 ///
@@ -266,7 +318,7 @@ pub async fn staple_ocsp(
     // revocation is sticky for this certificate: an outage, Unknown response or
     // replay of an older, still-fresh Good response cannot make it usable again.
     // Replacing the certificate creates a new Certificate with no OCSP status.
-    cert.ocsp_response = None;
+    let attached = cert.ocsp_response.take();
     if cert.ocsp_status == Some(OcspStatus::Revoked) {
         return Ok(false);
     }
@@ -279,7 +331,7 @@ pub async fn staple_ocsp(
     // typically need refreshing, so stapling adds overhead with little
     // benefit.
     let lifetime = cert.not_after - cert.not_before;
-    if lifetime < ChronoDuration::days(SHORT_LIVED_CERT_DAYS) {
+    if lifetime < ChronoDuration::days(SHORT_LIVED_CERT_DAYS) && !requires_ocsp_staple(cert)? {
         debug!(
             lifetime_hours = lifetime.num_hours(),
             "certificate lifetime is shorter than {SHORT_LIVED_CERT_DAYS} days; skipping OCSP stapling"
@@ -295,7 +347,14 @@ pub async fn staple_ocsp(
     // Parse the leaf to extract its first SAN for storage key generation.
     let first_name = cert.names.first().cloned().unwrap_or_default();
     let ocsp_storage_key = storage::ocsp_key(&first_name, &cert.hash);
-    let mut fresh_fallback = None;
+    let mut fresh_fallback = match attached {
+        Some(raw) => parse_ocsp_response_for_cert_chain(&raw, &cert.cert_chain)
+            .await
+            .ok()
+            .filter(|parsed| parsed.status == OcspStatus::Good)
+            .map(|parsed| (raw, parsed)),
+        None => None,
+    };
 
     // Try loading a cached OCSP response from storage.
     match storage.load(&ocsp_storage_key).await {
@@ -1712,6 +1771,125 @@ fn parse_generalized_time_from_bytes(bytes: &[u8]) -> Option<DateTime<Utc>> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn short_lived_certificate(feature: Option<u8>) -> (Certificate, rcgen::KeyPair) {
+        let issuer_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca = params.self_signed(&issuer_key).unwrap();
+        let issuer = rcgen::Issuer::new(params, &issuer_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["ocsp.example.com".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1)
+            + std::time::Duration::from_secs((Utc::now().timestamp() - 3600).try_into().unwrap());
+        params.not_after = params.not_before + std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        if let Some(feature) = feature {
+            params
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[1, 3, 6, 1, 5, 5, 7, 1, 24],
+                    vec![0x30, 0x03, 0x02, 0x01, feature],
+                ));
+        }
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+        let cert = Certificate::from_pem(
+            format!("{}{}", leaf.pem(), ca.pem()).as_bytes(),
+            key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        (cert, issuer_key)
+    }
+
+    #[tokio::test]
+    async fn short_lived_status_request_uses_a_verified_staple_but_other_features_still_skip() {
+        for feature in [None, Some(5), Some(17)] {
+            let (mut cert, issuer) = short_lived_certificate(feature);
+            let raw = signed_response(
+                &cert.cert_chain,
+                &issuer,
+                0,
+                Utc::now(),
+                Utc::now() + ChronoDuration::hours(4),
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::FileStorage::new(directory.path());
+            storage
+                .store(&storage::ocsp_key(&cert.names[0], &cert.hash), &raw)
+                .await
+                .unwrap();
+            assert_eq!(requires_ocsp_staple(&cert).unwrap(), feature == Some(5));
+            assert_eq!(
+                staple_ocsp(&storage, &mut cert, &OcspConfig::default())
+                    .await
+                    .unwrap(),
+                feature == Some(5)
+            );
+            assert_eq!(cert.ocsp_response, (feature == Some(5)).then_some(raw));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_attached_must_staple_survives_storage_and_responder_failure_until_expiry() {
+        struct Offline;
+        #[async_trait::async_trait]
+        impl Storage for Offline {
+            async fn load(&self, _: &str) -> Result<Vec<u8>> {
+                Err(Error::Other("storage backend is offline".into()))
+            }
+            async fn store(&self, _: &str, _: &[u8]) -> Result<()> {
+                unreachable!()
+            }
+            async fn delete(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            async fn exists(&self, _: &str) -> Result<bool> {
+                unreachable!()
+            }
+            async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+                unreachable!()
+            }
+            async fn stat(&self, _: &str) -> Result<storage::KeyInfo> {
+                unreachable!()
+            }
+            async fn lock(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+            async fn unlock(&self, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+        let (mut cert, issuer) = short_lived_certificate(Some(5));
+        let raw = signed_response(
+            &cert.cert_chain,
+            &issuer,
+            0,
+            Utc::now(),
+            Utc::now() + ChronoDuration::seconds(3),
+        );
+        cert.ocsp_status = Some(OcspStatus::Good);
+        cert.ocsp_response = Some(raw.clone());
+        let storage = Offline;
+        // A backend I/O failure and no reachable responder must not discard
+        // the still-current, authenticated in-memory fallback.
+        assert!(
+            staple_ocsp(&storage, &mut cert, &OcspConfig::default())
+                .await
+                .unwrap()
+        );
+        assert_eq!(cert.ocsp_response.as_ref(), Some(&raw));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(
+            !staple_ocsp(&storage, &mut cert, &OcspConfig::default())
+                .await
+                .unwrap()
+        );
+        assert!(cert.ocsp_response.is_none());
+    }
 
     pub(crate) fn signed_chain() -> (
         Vec<rustls::pki_types::CertificateDer<'static>>,

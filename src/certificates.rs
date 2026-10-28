@@ -429,7 +429,8 @@ impl Certificate {
 ///
 /// Returns an error if the certificate or key cannot be loaded from storage,
 /// if the PEM data is invalid, or if the certificate is outside its validity
-/// period. Invalid replacements leave the existing cached certificate intact.
+/// period, or a required Must-Staple response is unavailable. Invalid
+/// replacements leave the existing cached certificate intact.
 pub async fn reload_managed_certificate(
     cache: &crate::cache::CertCache,
     storage: &dyn crate::storage::Storage,
@@ -457,6 +458,9 @@ pub async fn reload_managed_certificate(
     }
     cert.managed = true;
     cert.issuer_key = issuer_key.to_owned();
+    if crate::ocsp::requires_ocsp_staple(&cert)? {
+        crate::ocsp::staple_ocsp(storage, &mut cert, &crate::ocsp::OcspConfig::default()).await?;
+    }
 
     // Find the existing certificate in the cache for replacement.
     let existing = cache.get_by_name(domain).await;
@@ -1258,5 +1262,108 @@ mod tests {
             .await
             .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn public_reload_requires_and_uses_the_actual_must_staple_response() {
+        use crate::storage::{CertificateResource, Storage, store_certificate};
+        for good in [false, true] {
+            let (cert, issuer) = crate::ocsp::tests::short_lived_certificate(Some(5));
+            let directory = tempfile::tempdir().unwrap();
+            let storage = crate::FileStorage::new(directory.path());
+            let resource = CertificateResource {
+                sans: vec!["ocsp.example.com".into()],
+                certificate_pem: cert
+                    .cert_chain
+                    .iter()
+                    .map(|der| ::pem::encode(&::pem::Pem::new("CERTIFICATE", der.as_ref())))
+                    .collect::<String>()
+                    .into_bytes(),
+                private_key_pem: ::pem::encode(&::pem::Pem::new(
+                    "PRIVATE KEY",
+                    cert.private_key_der.clone().unwrap(),
+                ))
+                .into_bytes(),
+                issuer_key: "test-ca".into(),
+                issuer_data: None,
+            };
+            store_certificate(&storage, "test-ca", &resource)
+                .await
+                .unwrap();
+            let raw = crate::cache::tests::signed_staple(&cert, &issuer, 3600);
+            if good {
+                storage
+                    .store(&crate::storage::ocsp_key(&cert.names[0], &cert.hash), &raw)
+                    .await
+                    .unwrap();
+            }
+            let cache = crate::CertCache::new(crate::CacheOptions::default());
+            let (ordinary, _) = crate::ocsp::tests::short_lived_certificate(None);
+            let old = ordinary.hash.clone();
+            cache.add(ordinary).await;
+            let result =
+                reload_managed_certificate(&cache, &storage, "ocsp.example.com", "test-ca").await;
+            assert_eq!(result.is_ok(), good, "good={good}: {result:?}");
+            let served = cache.resolve("ocsp.example.com").unwrap();
+            if good {
+                assert_eq!(served.hash, cert.hash);
+                assert_eq!(served.key.ocsp, Some(raw));
+                let before = cache.get_by_hash(&cert.hash).await.unwrap();
+                let mut changed = cache.subscribe_ocsp();
+                changed.borrow_and_update();
+                let revoked = crate::ocsp::tests::signed_response(
+                    &cert.cert_chain,
+                    &issuer,
+                    1,
+                    Utc::now(),
+                    Utc::now() + ChronoDuration::hours(1),
+                );
+                storage
+                    .store(
+                        &crate::storage::ocsp_key(&cert.names[0], &cert.hash),
+                        &revoked,
+                    )
+                    .await
+                    .unwrap();
+                // staple_ocsp verifies Revoked and removes its raw response.
+                // The later Must-Staple guard rejects this reload, but must
+                // still quarantine the existing same-hash Good entry.
+                let result =
+                    reload_managed_certificate(&cache, &storage, "ocsp.example.com", "test-ca")
+                        .await;
+                assert!(matches!(
+                    result,
+                    Err(crate::Error::Cert(crate::error::CertError::OcspFailed(_)))
+                ));
+                let after = cache.get_by_hash(&cert.hash).await.unwrap();
+                assert_eq!(after.ocsp_status, Some(crate::ocsp::OcspStatus::Revoked));
+                assert!(after.ocsp_response.is_none());
+                assert_eq!(after.managed, before.managed);
+                assert_eq!(after.issuer_key, before.issuer_key);
+                assert_eq!(after.names, before.names);
+                assert_eq!(after.tags, before.tags);
+                assert!(
+                    cache
+                        .get_managed_certificates()
+                        .await
+                        .iter()
+                        .any(|c| c.hash == cert.hash)
+                );
+                assert!(cache.resolve("ocsp.example.com").is_none());
+                assert!(
+                    cache
+                        .selection_candidates("ocsp.example.com", |_| true)
+                        .1
+                        .is_empty()
+                );
+                assert!(
+                    changed.has_changed().unwrap(),
+                    "failed admission must notify the updated revocation deadline"
+                );
+            } else {
+                assert_eq!(served.hash, old);
+                assert!(cache.get_by_hash(&cert.hash).await.is_none());
+            }
+        }
     }
 }
