@@ -308,3 +308,15 @@ including custom certificate selectors, while metadata lookups still return
 them. Maintenance repairs future certificates as well as expiring ones.
 Valid cached siblings remain available during failed repairs. Background
 management uses the same checks.
+
+## Invalid certificate responses and issuer fallback
+
+Obtain and renewal now try the next configured issuer when a successful issuer
+response contains an invalid certificate, mismatched key, missing requested SAN,
+or an expired/future validity period. These responses are never saved or
+published. Exhausted attempts still return the last issuer error; `cert_failed`
+events now also include `issuer_errors` with every attempted issuer's error.
+
+Revocation checks and certificate-store writes remain outside this fallback:
+their errors abort the operation, including errors from custom backends. A
+failed operation preserves any existing working cached certificate.
