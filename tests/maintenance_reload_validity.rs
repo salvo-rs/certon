@@ -71,7 +71,10 @@ impl CertIssuer for Issuer {
         );
         let mut params = CertificateParams::new(domains.to_vec()).unwrap();
         let year = chrono::Utc::now().year();
-        params.not_before = rcgen::date_time_ymd(year - 1, 1, 1);
+        // A successful renewal must leave even the takeover test's wide 95%
+        // renewal window, so later ticks cannot race another publication.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1)
+            + Duration::from_secs((chrono::Utc::now().timestamp() - 60).try_into().unwrap());
         params.not_after = rcgen::date_time_ymd(year + 4, 1, 1);
         let cert = params.signed_by(&public, &self.ca).unwrap();
         Ok(IssuedCertificate {
@@ -405,7 +408,7 @@ async fn unmanaged_import_is_taken_over_and_renewed_by_real_maintenance() {
     wait_for(|| outcomes.lock().unwrap().contains(&true)).await;
     fixture.manager.cache.stop_and_wait().await;
     maintenance.await.unwrap();
-    assert!(fixture.issuer.calls.load(Ordering::SeqCst) > 0);
+    assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 1);
     let renewed = fixture.handshake().await;
     assert_ne!(renewed, fixture.old.cert_chain[0].as_ref());
     let current = fixture
@@ -415,6 +418,7 @@ async fn unmanaged_import_is_taken_over_and_renewed_by_real_maintenance() {
         .await
         .unwrap();
     assert!(current.managed);
+    assert!(!current.needs_renewal(fixture.manager.policy.renewal_window_ratio));
     assert_eq!(renewed, current.cert_chain[0].as_ref());
     assert!(
         fixture
