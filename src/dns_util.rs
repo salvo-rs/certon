@@ -365,63 +365,152 @@ fn propagation_resolver(resolvers: Option<&[String]>) -> Result<TokioResolver> {
 /// TTL for zone cache entries (5 minutes).
 const ZONE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// An entry in the DNS zone cache.
+/// Maximum retained domains and the number of slots inspected per operation.
+const ZONE_CACHE_CAPACITY: usize = 1024;
+const ZONE_CACHE_SWEEP_BUDGET: usize = 2;
+const MAX_ZONE_CACHE_KEY_BYTES: usize = 253;
+const MAX_ZONE_CACHE_VALUE_BYTES: usize = 254; // A fully qualified zone may end in a dot.
+
 struct ZoneCacheEntry {
     zone: Option<String>,
     expires_at: StdInstant,
+    slot: usize,
 }
 
-/// Global DNS zone cache keyed by domain name.
-///
-/// Caches the result of SOA-based zone discovery to avoid repeated DNS
-/// lookups for the same domain hierarchy. Entries expire after
-/// [`ZONE_CACHE_TTL`].
-static ZONE_CACHE: std::sync::OnceLock<Mutex<HashMap<String, ZoneCacheEntry>>> =
-    std::sync::OnceLock::new();
-
-fn zone_cache() -> &'static Mutex<HashMap<String, ZoneCacheEntry>> {
-    ZONE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Fixed slots bound both entries and expiry bookkeeping. Hits and updates
+/// inspect only a small sweep budget; a full cache evicts one round-robin slot.
+/// Repeated updates do not append expiry tickets or grow auxiliary queues.
+struct ZoneCache {
+    entries: HashMap<String, ZoneCacheEntry>,
+    slots: Vec<Option<String>>,
+    free: Vec<usize>,
+    hand: usize,
 }
 
-/// Look up a cached zone for `domain`. Returns `Some(Some(zone))` on cache
-/// hit (zone found), `Some(None)` on negative cache hit (no zone), or
-/// `None` on cache miss.
-fn zone_cache_get(domain: &str) -> Option<Option<String>> {
-    let cache = zone_cache();
-    let map = cache.lock().ok()?;
-    let entry = map.get(domain)?;
-    if StdInstant::now() < entry.expires_at {
-        Some(entry.zone.clone())
-    } else {
-        None // expired
-    }
-}
-
-/// Insert a zone lookup result into the cache.
-fn zone_cache_set(domain: &str, zone: Option<String>) {
-    if let Ok(mut map) = zone_cache().lock() {
-        // Evict expired entries if the cache grows too large.
-        if map.len() > 1000 {
-            let now = StdInstant::now();
-            map.retain(|_, v| now < v.expires_at);
+impl ZoneCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::with_capacity(ZONE_CACHE_CAPACITY),
+            slots: vec![None; ZONE_CACHE_CAPACITY],
+            free: (0..ZONE_CACHE_CAPACITY).rev().collect(),
+            hand: 0,
         }
-        map.insert(
-            domain.to_string(),
+    }
+
+    fn key(domain: &str) -> Option<String> {
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
+        // Reject oversized input before allocating its lowercased copy. The
+        // second check also bounds Unicode lowercase expansions.
+        if domain.len() > MAX_ZONE_CACHE_KEY_BYTES {
+            return None;
+        }
+        let key = domain.to_lowercase();
+        (key.len() <= MAX_ZONE_CACHE_KEY_BYTES).then_some(key)
+    }
+
+    fn remove_slot(&mut self, slot: usize) {
+        if let Some(key) = self.slots[slot].take() {
+            let removed = self.entries.remove(&key);
+            debug_assert!(removed.is_some_and(|entry| entry.slot == slot));
+            self.free.push(slot);
+        }
+    }
+
+    fn sweep(&mut self, now: StdInstant) {
+        for _ in 0..ZONE_CACHE_SWEEP_BUDGET {
+            let slot = self.hand;
+            self.hand = (self.hand + 1) % ZONE_CACHE_CAPACITY;
+            if self.slots[slot].as_ref().is_some_and(|key| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|entry| now >= entry.expires_at)
+            }) {
+                self.remove_slot(slot);
+            }
+        }
+    }
+
+    fn get(&mut self, domain: &str, now: StdInstant) -> Option<Option<String>> {
+        let key = Self::key(domain)?;
+        self.sweep(now);
+        let entry = self.entries.get(&key)?;
+        if now >= entry.expires_at {
+            let slot = entry.slot;
+            self.remove_slot(slot);
+            return None;
+        }
+        Some(entry.zone.clone())
+    }
+
+    fn set(&mut self, domain: &str, zone: Option<&str>, now: StdInstant) {
+        if zone.is_some_and(|value| value.len() > MAX_ZONE_CACHE_VALUE_BYTES) {
+            return;
+        }
+        let Some(key) = Self::key(domain) else {
+            return;
+        };
+        self.sweep(now);
+        let expires_at = now + ZONE_CACHE_TTL;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.zone = zone.map(str::to_owned);
+            entry.expires_at = expires_at;
+            return;
+        }
+        if self.free.is_empty() {
+            self.remove_slot(self.hand);
+            self.hand = (self.hand + 1) % ZONE_CACHE_CAPACITY;
+        }
+        let slot = self
+            .free
+            .pop()
+            .expect("zone cache has a vacant or evicted slot");
+        self.slots[slot] = Some(key.clone());
+        self.entries.insert(
+            key,
             ZoneCacheEntry {
-                zone,
-                expires_at: StdInstant::now() + ZONE_CACHE_TTL,
+                zone: zone.map(str::to_owned),
+                expires_at,
+                slot,
             },
         );
     }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.slots.fill(None);
+        self.free.clear();
+        self.free.extend((0..ZONE_CACHE_CAPACITY).rev());
+        self.hand = 0;
+    }
 }
 
-/// Clear the DNS zone cache.
+/// Global DNS zone cache with five-minute positive and negative entries.
+static ZONE_CACHE: std::sync::OnceLock<Mutex<ZoneCache>> = std::sync::OnceLock::new();
+
+fn zone_cache() -> &'static Mutex<ZoneCache> {
+    ZONE_CACHE.get_or_init(|| Mutex::new(ZoneCache::new()))
+}
+
+/// `Some(Some(zone))` is a positive hit; `Some(None)` is a negative hit.
+fn zone_cache_get(domain: &str) -> Option<Option<String>> {
+    zone_cache().lock().ok()?.get(domain, StdInstant::now())
+}
+
+fn zone_cache_set(domain: &str, zone: Option<&str>) {
+    if let Ok(mut cache) = zone_cache().lock() {
+        cache.set(domain, zone, StdInstant::now());
+    }
+}
+
+/// Clear the DNS zone cache, including all expiry and eviction bookkeeping.
 ///
 /// This is primarily useful for testing or when DNS configuration has
 /// changed and cached results are stale.
+/// At most 1024 domains are retained for five minutes; capacity eviction may
+/// remove an entry sooner. Oversized keys or zone values are not cached.
 pub fn clear_zone_cache() {
-    if let Ok(mut map) = zone_cache().lock() {
-        map.clear();
+    if let Ok(mut cache) = zone_cache().lock() {
+        cache.clear();
     }
 }
 
@@ -436,7 +525,8 @@ pub fn clear_zone_cache() {
 /// (e.g. no network), falls back to a heuristic that returns the last two
 /// labels of the domain.
 ///
-/// Results are cached for `ZONE_CACHE_TTL` to avoid repeated DNS lookups.
+/// Results use a shared cache of at most 1024 domains, with a five-minute
+/// `ZONE_CACHE_TTL`. Capacity eviction may remove entries sooner.
 ///
 /// # Examples
 ///
@@ -454,15 +544,13 @@ pub fn clear_zone_cache() {
 /// assert_eq!(find_zone_by_fqdn("com"), None);
 /// ```
 pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {
-    let normalized = from_fqdn(fqdn).to_lowercase();
-
     // Check cache first.
-    if let Some(cached) = zone_cache_get(&normalized) {
+    if let Some(cached) = zone_cache_get(fqdn) {
         return cached;
     }
 
     let result = find_zone_by_fqdn_heuristic(fqdn);
-    zone_cache_set(&normalized, result.clone());
+    zone_cache_set(fqdn, result.as_deref());
     result
 }
 
@@ -472,19 +560,18 @@ pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {
 /// Returns the first domain that has an SOA record. Falls back to the
 /// heuristic if no SOA is found.
 ///
-/// Results are cached for `ZONE_CACHE_TTL` to avoid repeated DNS lookups.
+/// Results use a shared cache of at most 1024 domains, with a five-minute
+/// `ZONE_CACHE_TTL`. Capacity eviction may remove entries sooner.
 pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
-    let normalized = from_fqdn(fqdn).to_lowercase();
-
     // Check cache first.
-    if let Some(cached) = zone_cache_get(&normalized) {
+    if let Some(cached) = zone_cache_get(fqdn) {
         return cached;
     }
 
     let domain = from_fqdn(fqdn);
     let labels: Vec<&str> = domain.split('.').collect();
     if labels.len() < 2 {
-        zone_cache_set(&normalized, None);
+        zone_cache_set(fqdn, None);
         return None;
     }
 
@@ -492,7 +579,7 @@ pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
         Ok(resolver) => resolver,
         Err(_) => {
             let result = find_zone_by_fqdn_heuristic(fqdn);
-            zone_cache_set(&normalized, result.clone());
+            zone_cache_set(fqdn, result.as_deref());
             return result;
         }
     };
@@ -507,7 +594,7 @@ pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
             Ok(_) => {
                 debug!(zone = %candidate, "found SOA record for zone");
                 let result = Some(to_fqdn(&candidate));
-                zone_cache_set(&normalized, result.clone());
+                zone_cache_set(fqdn, result.as_deref());
                 return result;
             }
             Err(_) => continue,
@@ -516,7 +603,7 @@ pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
 
     // Fallback to heuristic.
     let result = find_zone_by_fqdn_heuristic(fqdn);
-    zone_cache_set(&normalized, result.clone());
+    zone_cache_set(fqdn, result.as_deref());
     result
 }
 
@@ -787,5 +874,279 @@ mod tests {
         let custom = vec!["10.0.0.1".to_string()];
         let servers = recursive_nameservers(&custom);
         assert_eq!(servers, vec!["10.0.0.1:53"]);
+    }
+
+    #[test]
+    fn zone_cache_enforces_hard_capacity_under_unique_insertions() {
+        let mut cache = ZoneCache::new();
+        let now = StdInstant::now();
+        for index in 0..10_000 {
+            cache.set(
+                &format!("cache-capacity-{index}.example.test"),
+                Some("example.test."),
+                now,
+            );
+            assert!(cache.entries.len() <= ZONE_CACHE_CAPACITY);
+            if index % 64 == 0 {
+                assert_zone_cache_slots(&cache);
+            }
+        }
+        assert_zone_cache_slots(&cache);
+        assert_eq!(cache.entries.len(), ZONE_CACHE_CAPACITY);
+        assert_eq!(cache.slots.len(), ZONE_CACHE_CAPACITY);
+        assert!(cache.free.is_empty());
+        assert_eq!(
+            cache.get("cache-capacity-9999.example.test", now),
+            Some(Some("example.test.".into()))
+        );
+        assert!(cache.get("cache-capacity-0.example.test", now).is_none());
+    }
+
+    fn assert_zone_cache_slots(cache: &ZoneCache) {
+        use std::collections::HashSet;
+        let free: HashSet<_> = cache.free.iter().copied().collect();
+        assert_eq!(free.len(), cache.free.len(), "duplicate vacant slot");
+        assert_eq!(cache.slots.len(), ZONE_CACHE_CAPACITY);
+        assert_eq!(cache.entries.len() + cache.free.len(), ZONE_CACHE_CAPACITY);
+        for (slot, key) in cache.slots.iter().enumerate() {
+            if let Some(key) = key {
+                assert!(!free.contains(&slot));
+                assert_eq!(cache.entries[key].slot, slot);
+            } else {
+                assert!(free.contains(&slot));
+            }
+        }
+        for (key, entry) in &cache.entries {
+            assert_eq!(cache.slots[entry.slot].as_deref(), Some(key.as_str()));
+        }
+    }
+
+    #[test]
+    fn zone_cache_preserves_positive_negative_and_exact_ttl_boundaries() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        cache.set("example.com", Some("example.com."), now);
+        cache.set("com", None, now);
+        let before = now + ZONE_CACHE_TTL - Duration::from_nanos(1);
+        assert_eq!(
+            cache.get("example.com", before),
+            Some(Some("example.com.".into()))
+        );
+        assert_eq!(cache.get("com", before), Some(None));
+        assert_eq!(cache.get("example.com", now + ZONE_CACHE_TTL), None);
+        assert_eq!(cache.get("com", now + ZONE_CACHE_TTL), None);
+        assert!(cache.entries.is_empty());
+        assert_zone_cache_slots(&cache);
+    }
+
+    #[test]
+    fn zone_cache_repeated_updates_refresh_ttl_without_growing_bookkeeping() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        cache.set("example.com", Some("old.example."), now);
+        let slot = cache.entries["example.com"].slot;
+        let allocations = (
+            cache.entries.capacity(),
+            cache.slots.capacity(),
+            cache.free.capacity(),
+        );
+        for index in 0..10_000 {
+            let at = now + Duration::from_millis(index);
+            cache.set(
+                "EXAMPLE.COM.",
+                (index % 2 == 0).then_some("new.example."),
+                at,
+            );
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.entries["example.com"].slot, slot);
+        }
+        assert_eq!(
+            allocations,
+            (
+                cache.entries.capacity(),
+                cache.slots.capacity(),
+                cache.free.capacity()
+            )
+        );
+        assert_zone_cache_slots(&cache);
+        assert_eq!(
+            cache.get("example.com", now + ZONE_CACHE_TTL),
+            Some(None),
+            "an earlier expiry must not discard the latest update"
+        );
+        assert_eq!(
+            cache.get(
+                "example.com",
+                now + Duration::from_millis(9999) + ZONE_CACHE_TTL
+            ),
+            None
+        );
+        assert_zone_cache_slots(&cache);
+    }
+
+    #[test]
+    fn zone_cache_sweeps_expired_slots_incrementally_and_keeps_refreshed_entries() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        for index in 0..ZONE_CACHE_CAPACITY {
+            cache.set(&format!("host-{index}.example.com"), None, now);
+        }
+        let update = now + ZONE_CACHE_TTL - Duration::from_secs(1);
+        cache.set("host-0.example.com", Some("example.com."), update);
+        for _ in 0..ZONE_CACHE_CAPACITY.div_ceil(ZONE_CACHE_SWEEP_BUDGET) {
+            assert_eq!(
+                cache.get("not-cached.example.com", now + ZONE_CACHE_TTL),
+                None
+            );
+        }
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(
+            cache.get("host-0.example.com", now + ZONE_CACHE_TTL),
+            Some(Some("example.com.".into()))
+        );
+        assert_zone_cache_slots(&cache);
+    }
+
+    #[test]
+    fn zone_cache_clear_resets_slots_and_expiry_bookkeeping() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        for index in 0..ZONE_CACHE_CAPACITY {
+            cache.set(&format!("host-{index}.example.com"), None, now);
+        }
+        cache.clear();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.hand, 0);
+        assert_zone_cache_slots(&cache);
+        cache.set(
+            "fresh.example.com",
+            Some("example.com."),
+            now + ZONE_CACHE_TTL,
+        );
+        assert_eq!(cache.get("host-0.example.com", now + ZONE_CACHE_TTL), None);
+        assert_eq!(
+            cache.get("fresh.example.com", now + ZONE_CACHE_TTL),
+            Some(Some("example.com.".into()))
+        );
+        assert_zone_cache_slots(&cache);
+    }
+
+    #[test]
+    fn zone_cache_normalizes_keys_and_skips_oversized_keys_and_values() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        cache.set("MiXeD.Example.Com.", Some("example.com."), now);
+        assert_eq!(
+            cache.get("MIXED.EXAMPLE.COM", now),
+            Some(Some("example.com.".into()))
+        );
+        cache.set("mixed.example.com", None, now);
+        assert_eq!(cache.get("mixed.example.com.", now), Some(None));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.entries.contains_key("mixed.example.com"));
+        let oversized = "A".repeat(1_000_000);
+        cache.set(&oversized, None, now);
+        assert!(cache.get(&oversized, now).is_none());
+        let expansion = format!("{}.example", "İ".repeat(83));
+        assert!(expansion.len() <= MAX_ZONE_CACHE_KEY_BYTES);
+        assert!(expansion.to_lowercase().len() > MAX_ZONE_CACHE_KEY_BYTES);
+        cache.set(&expansion, None, now);
+        cache.set(
+            "mixed.example.com",
+            Some(&"x".repeat(MAX_ZONE_CACHE_VALUE_BYTES + 1)),
+            now,
+        );
+        assert_eq!(cache.get("mixed.example.com", now), Some(None));
+        assert_eq!(cache.entries.len(), 1);
+        assert_zone_cache_slots(&cache);
+        let longest = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61),
+        ]
+        .join(".");
+        assert_eq!(longest.len(), MAX_ZONE_CACHE_KEY_BYTES);
+        let zone = format!("{longest}.");
+        assert_eq!(zone.len(), MAX_ZONE_CACHE_VALUE_BYTES);
+        cache.set(&longest, Some(&zone), now);
+        assert_eq!(cache.get(&format!("{longest}."), now), Some(Some(zone)));
+        assert_zone_cache_slots(&cache);
+        // Cache admission must not change the existing discovery result.
+        assert_eq!(
+            find_zone_by_fqdn(&format!("{oversized}.example.com")),
+            Some("example.com.".into())
+        );
+    }
+
+    #[test]
+    fn zone_cache_keeps_repeated_root_dots_separate_from_normal_keys() {
+        let now = StdInstant::now();
+        let mut cache = ZoneCache::new();
+        cache.set("example.com", Some("example.com."), now);
+        cache.set("example.com..", Some("com."), now);
+        assert_eq!(
+            cache.get("EXAMPLE.COM.", now),
+            Some(Some("example.com.".into()))
+        );
+        assert_eq!(cache.get("example.com..", now), Some(Some("com.".into())));
+        assert_eq!(cache.entries.len(), 2);
+        assert_zone_cache_slots(&cache);
+        // Preserve the discovery function's existing malformed-input result
+        // without letting that result poison an otherwise normal DNS name.
+        assert_eq!(
+            find_zone_by_fqdn("root-dot-cache.example.com.."),
+            Some("com.".into())
+        );
+        assert_eq!(
+            find_zone_by_fqdn("root-dot-cache.example.com."),
+            Some("example.com.".into())
+        );
+        assert_eq!(
+            find_zone_by_fqdn("root-dot-cache.example.com"),
+            Some("example.com.".into())
+        );
+    }
+
+    #[test]
+    fn zone_cache_concurrent_positive_and_negative_hits_preserve_slots() {
+        let now = StdInstant::now();
+        let cache = std::sync::Arc::new(Mutex::new(ZoneCache::new()));
+        for index in 0..128 {
+            cache.lock().unwrap().set(
+                &format!("host-{index}.example.com"),
+                (index % 7 != 0).then_some("example.com."),
+                now,
+            );
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..2000 {
+                        let index = (iteration + worker) % 128;
+                        let name = format!("HOST-{index}.EXAMPLE.COM.");
+                        let expected = (index % 7 != 0).then_some("example.com.");
+                        let mut cache = cache.lock().unwrap();
+                        assert_eq!(
+                            cache.get(&name, now + Duration::from_secs(1)),
+                            Some(expected.map(str::to_owned))
+                        );
+                        if iteration % 16 == 0 {
+                            cache.set(&name, expected, now + Duration::from_secs(1));
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 128);
+        assert_zone_cache_slots(&cache);
     }
 }
