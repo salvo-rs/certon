@@ -24,6 +24,16 @@ stores at most one record per scheduled certificate; unrelated imports do not
 wake maintenance. Deadline wakes inspect only due entries, while periodic
 polls retain the original cadence for certificates without OCSP support.
 
+Same-hash replacement preserves an OCSP update that arrived during asynchronous
+preparation, including its serving containers and retry deadline. Verified
+Revoked status stays sticky, and rejecting a stale response still advances a
+scheduled retry to avoid an immediate refresh loop.
+
+A leaf marked Revoked is excluded from both default and custom TLS selection;
+its metadata remains available for maintenance. A usable sibling can still
+serve the name. `replace_revoked` controls automatic replacement, not permission
+to serve a known revoked leaf.
+
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
 Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`

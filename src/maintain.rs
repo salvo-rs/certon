@@ -1315,7 +1315,7 @@ mod tests {
                     "revoke" => {
                         let actual = cache.get_by_hash(&hash).await.unwrap();
                         assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
-                        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+                        assert!(cache.resolve(&domain).is_none());
                     }
                     "retag" => {
                         let actual = cache.get_by_hash(&hash).await.unwrap();
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(current.tags, vec!["manual"]);
         assert_eq!(current.issuer_key, "manual-issuer");
         assert_eq!(current.ocsp_status, Some(ocsp::OcspStatus::Revoked));
-        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+        assert!(cache.resolve(&domain).is_none());
     }
 
     #[tokio::test]
@@ -1449,7 +1449,7 @@ mod tests {
             let actual = cache.get_by_hash(&hash).await.unwrap();
             assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
             assert!(actual.ocsp_response.is_none());
-            assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+            assert!(cache.resolve(&domain).is_none());
             assert_eq!(attempts.load(Ordering::SeqCst), step + 1);
         }
         let (replacement, _) = signed_certificate();
