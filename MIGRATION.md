@@ -104,3 +104,19 @@ an error. Replacing admission checks revocation and updates membership under
 one lock, so stale input cannot delete a valid replacement before rejection.
 The low-level `CertCache::add()` signature stays unchanged and silently ignores
 quarantined leaves.
+
+## Retry budgets and dynamic rate limits
+
+`do_with_retry` rejects an empty `RetryConfig::intervals` before running the
+operation. `max_duration` now covers both backoff and the in-flight async
+operation; reaching it drops that operation's future, so custom operations must
+be cancellation-safe. Like other Tokio timeouts it cannot preempt blocking code
+that does not yield. The historical `max_retries` setting still counts failed
+attempts, including the initial attempt; zero means unlimited.
+
+`RateLimiter::configure(max_events, window).await` updates both settings
+atomically and returns a configuration error without changing state for invalid
+pairs. Use `(0, Duration::ZERO)` to disable limiting. Existing individual setters
+retain their signatures and now reject invalid pairs with the same panic policy
+as `new`, rather than leaving a waiter spinning forever. All updates wake
+existing waiters to recheck the policy; recorded event history is retained.

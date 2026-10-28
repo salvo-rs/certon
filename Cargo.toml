@@ -100,6 +100,7 @@ hickory-resolver = { version = "0.26", optional = true }
 [dev-dependencies]
 tempfile = "3"
 tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["test-util"] }
 
 # An example that demonstrates a feature only builds when that feature is on.
 [[example]]
