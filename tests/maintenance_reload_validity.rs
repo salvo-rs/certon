@@ -153,7 +153,7 @@ impl Fixture {
             },
             renew,
             self.store.clone(),
-            1.0 / 3.0,
+            self.manager.policy.renewal_window_ratio,
         )
     }
     async fn handshake(&self) -> Vec<u8> {
@@ -318,4 +318,110 @@ async fn public_reload_rejects_future_and_expired_leaves_before_replacing_live_c
             );
         }
     }
+}
+
+#[tokio::test]
+async fn unmanaged_import_is_taken_over_and_renewed_by_real_maintenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let store: Arc<dyn CertStore> = Arc::new(KeyValueCertStore::new(storage.clone()));
+    let issuer = Arc::new(Issuer::new());
+    let year = chrono::Utc::now().year();
+    let resource = issuer.resource(year - 1, year + 4);
+    store.save(&issuer.issuer_key(), &resource).await.unwrap();
+    let manager = Arc::new(
+        CertManager::builder()
+            .storage(storage.clone())
+            .certificates(store.clone())
+            .issuers(vec![issuer.clone()])
+            .ocsp(OcspConfig {
+                disable_stapling: true,
+                ..Default::default()
+            })
+            .build(),
+    );
+    manager
+        .cache
+        .cache_unmanaged_pem(
+            &resource.certificate_pem,
+            &resource.private_key_pem,
+            vec!["operator".into()],
+        )
+        .await
+        .unwrap();
+    let old = manager.cache.get_by_name("example.com").await.unwrap();
+    assert!(!old.managed);
+    let mut fixture = Fixture {
+        _directory: directory,
+        storage,
+        store,
+        issuer,
+        manager,
+        old,
+    };
+    assert_eq!(
+        fixture.handshake().await,
+        fixture.old.cert_chain[0].as_ref()
+    );
+    fixture
+        .manager
+        .manage(&["example.com".into()])
+        .await
+        .unwrap();
+    let promoted = fixture
+        .manager
+        .cache
+        .get_by_hash(&fixture.old.hash)
+        .await
+        .unwrap();
+    assert!(
+        promoted.managed,
+        "manage returned success without enrolling the imported leaf in maintenance"
+    );
+    assert_eq!(promoted.issuer_key, fixture.issuer.issuer_key());
+    assert_eq!(
+        promoted.names.first().map(String::as_str),
+        Some("example.com")
+    );
+    assert_eq!(promoted.tags, vec!["operator"]);
+    assert_eq!(
+        fixture.manager.cache.get_managed_certificates().await.len(),
+        1
+    );
+    assert_eq!(
+        fixture.issuer.calls.load(Ordering::SeqCst),
+        0,
+        "takeover must not needlessly reissue a fresh import"
+    );
+    // Enter a wider renewal window after takeover. Both the scan and its real
+    // manager callback use that policy, exercising the managed sampling pool.
+    Arc::get_mut(&mut fixture.manager)
+        .unwrap()
+        .policy
+        .renewal_window_ratio = 0.95;
+    fixture.issuer.fail.store(false, Ordering::SeqCst);
+    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let maintenance = fixture.maintain(outcomes.clone());
+    wait_for(|| outcomes.lock().unwrap().contains(&true)).await;
+    fixture.manager.cache.stop_and_wait().await;
+    maintenance.await.unwrap();
+    assert!(fixture.issuer.calls.load(Ordering::SeqCst) > 0);
+    let renewed = fixture.handshake().await;
+    assert_ne!(renewed, fixture.old.cert_chain[0].as_ref());
+    let current = fixture
+        .manager
+        .cache
+        .get_by_name("example.com")
+        .await
+        .unwrap();
+    assert!(current.managed);
+    assert_eq!(renewed, current.cert_chain[0].as_ref());
+    assert!(
+        fixture
+            .manager
+            .cache
+            .get_by_hash(&fixture.old.hash)
+            .await
+            .is_none()
+    );
 }
