@@ -172,12 +172,14 @@ async fn fast_revoked_leaves_are_quarantined_before_a_slow_earlier_error_finishe
         let manager = manager.clone();
         async move { manager.refresh_revocations().await }
     });
+    // File reads can complete out of snapshot order, especially on Windows.
+    // Observe every fast quarantine and drained read before checking that only
+    // the explicitly gated first read remains. The gate still prevents refresh
+    // from finishing, so this proves progress despite the earlier slow error.
     until(|| async {
-        manager
-            .cache
-            .get_by_hash(&snapshot[11].hash)
-            .await
-            .is_none()
+        manager.cache.get_all().await.len() == 2
+            && storage.reads.load(Ordering::SeqCst) == 12
+            && storage.active.load(Ordering::SeqCst) == 1
     })
     .await;
     assert!(
