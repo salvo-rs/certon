@@ -439,6 +439,9 @@ fn normalize_host(host: &str) -> Result<String> {
             "IPv6 Host headers must use bracket notation".to_owned(),
         ));
     }
+    // A DNS root dot is optional. Remove at most one after stripping the port;
+    // repeated trailing dots must still fail the normal hostname validation.
+    let host = host.strip_suffix('.').unwrap_or(host);
     if host.is_empty()
         || host.starts_with('.')
         || host.ends_with('.')
@@ -689,25 +692,97 @@ mod tests {
         split: Option<usize>,
         header_cap: usize,
     ) -> String {
-        let input = match split {
-            Some(split) => [request[..split].to_vec(), request[split..].to_vec()]
-                .into_iter()
-                .collect(),
-            None => [request.to_vec()].into_iter().collect(),
-        };
         let handler = limited_handler(Duration::from_secs(1), 1)
             .with_limits(RedirectLimits {
                 max_header_bytes: header_cap,
                 ..RedirectLimits::default()
             })
             .unwrap();
+        fragmented_response_for_handler(request, split, &handler).await
+    }
+
+    async fn fragmented_response_for_handler(
+        request: &[u8],
+        split: Option<usize>,
+        handler: &HttpsRedirectHandler,
+    ) -> String {
+        let input = match split {
+            Some(split) => [request[..split].to_vec(), request[split..].to_vec()]
+                .into_iter()
+                .collect(),
+            None => [request.to_vec()].into_iter().collect(),
+        };
         let mut stream = FragmentedIo {
             input,
             offset: 0,
             output: Vec::new(),
         };
-        redirect_exchange(&mut stream, &handler).await;
+        redirect_exchange(&mut stream, handler).await;
         String::from_utf8(stream.output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn single_dns_root_dot_redirects_under_both_host_policies() {
+        let canonical = HttpsRedirectHandler::default()
+            .with_canonical_host("canonical.example.com")
+            .unwrap();
+        let allowlist = HttpsRedirectHandler::default()
+            .allow_host("example.com")
+            .unwrap();
+        for (handler, destination) in [
+            (&canonical, "canonical.example.com"),
+            (&allowlist, "example.com"),
+        ] {
+            for host in [
+                "example.com.",
+                "EXAMPLE.COM.",
+                "example.com.:8080",
+                "EXAMPLE.COM.:8080",
+            ] {
+                let request = format!("GET /path HTTP/1.1\r\nHost: {host}\r\n\r\n");
+                for split in [None, Some(request.len() / 2), Some(request.len() - 5)] {
+                    let response =
+                        fragmented_response_for_handler(request.as_bytes(), split, handler).await;
+                    assert!(
+                        response.starts_with("HTTP/1.1 301"),
+                        "host={host} split={split:?}: {response}"
+                    );
+                    assert!(
+                        response.contains(&format!("Location: https://{destination}/path\r\n"))
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn root_dot_normalization_still_rejects_invalid_hosts() {
+        let canonical = HttpsRedirectHandler::default()
+            .with_canonical_host("canonical.example.com")
+            .unwrap();
+        let allowlist = HttpsRedirectHandler::default()
+            .allow_host("example.com")
+            .unwrap();
+        for handler in [&canonical, &allowlist] {
+            for host in [
+                "example.com..",
+                "EXAMPLE.COM..:8080",
+                ".",
+                ".:8080",
+                "example.com.:65536",
+                "example.com.\0",
+            ] {
+                let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+                for split in [None, Some(request.len() / 2)] {
+                    let response =
+                        fragmented_response_for_handler(request.as_bytes(), split, handler).await;
+                    assert!(
+                        response.starts_with("HTTP/1.1 400"),
+                        "host={host:?} split={split:?}: {response}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
