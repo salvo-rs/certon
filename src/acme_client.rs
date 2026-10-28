@@ -717,6 +717,65 @@ fn build_jws_body(
 // AcmeClient
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
+struct AcmeTransportPolicy {
+    allow_local_http: bool,
+}
+
+impl AcmeTransportPolicy {
+    fn for_directory(directory_url: &str) -> Result<Self> {
+        let url = url::Url::parse(directory_url)
+            .map_err(|_| AcmeError::Directory("invalid ACME directory URL".into()))?;
+        let policy = Self {
+            allow_local_http: url.scheme() == "http",
+        };
+        policy
+            .validate_url(directory_url)
+            .map_err(|error| AcmeError::Directory(error.to_string()))?;
+        Ok(policy)
+    }
+
+    fn allows(&self, url: &url::Url) -> bool {
+        url.scheme() == "https"
+            || (self.allow_local_http
+                && url.scheme() == "http"
+                && url.host_str().is_some_and(|host| {
+                    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+                        || host.ends_with(".internal")
+                        || host.ends_with(".localhost")
+                }))
+    }
+
+    fn validate_url(&self, endpoint: &str) -> Result<()> {
+        let url = url::Url::parse(endpoint)
+            .map_err(|_| crate::Error::Config("invalid ACME endpoint URL".into()))?;
+        if !self.allows(&url) {
+            return Err(crate::Error::Config(
+                "ACME endpoints require HTTPS; HTTP is allowed only for a local HTTP directory"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn redirects(self) -> reqwest::redirect::Policy {
+        reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error("ACME redirect limit exceeded");
+            }
+            if attempt.url().scheme() == "http"
+                && attempt.previous().iter().any(|url| url.scheme() == "https")
+            {
+                return attempt.error("ACME HTTPS-to-HTTP redirect is forbidden");
+            }
+            if !self.allows(attempt.url()) {
+                return attempt.error("ACME redirect target requires HTTPS");
+            }
+            attempt.follow()
+        })
+    }
+}
+
 /// A low-level ACME protocol client.
 ///
 /// Manages the ACME directory, nonce caching, and provides async methods for
@@ -735,6 +794,7 @@ fn build_jws_body(
 pub struct AcmeClient {
     /// The HTTP client used for all requests.
     http: reqwest::Client,
+    transport: AcmeTransportPolicy,
     /// The ACME directory (cached after initial fetch).
     directory: AcmeDirectory,
     /// A cached replay nonce. The ACME server provides a new nonce with every
@@ -756,33 +816,34 @@ impl AcmeClient {
     /// given URL and obtaining an initial replay nonce.
     ///
     /// The CA URL must use HTTPS. HTTP is only allowed for localhost,
-    /// `127.0.0.1`, `[::1]`, and `.internal` hosts (for testing/development).
+    /// `127.0.0.1`, `[::1]`, `.localhost`, and `.internal` hosts (for testing/development).
     pub async fn new(directory_url: &str) -> Result<Self> {
-        Self::with_http_client(directory_url, crate::http::client()?.clone()).await
+        Self::with_http_client_builder(directory_url, crate::http::client_builder()).await
     }
 
-    /// Create a client using a caller-configured transport, including custom CA roots.
-    pub async fn with_http_client(directory_url: &str, http: reqwest::Client) -> Result<Self> {
-        // Validate that the directory URL uses HTTPS, unless it is a local
-        // or internal address.
-        if let Ok(parsed) = url::Url::parse(directory_url)
-            && parsed.scheme() == "http"
-        {
-            let host = parsed.host_str().unwrap_or("");
-            let is_local = host == "localhost"
-                || host == "127.0.0.1"
-                || host == "[::1]"
-                || host == "::1"
-                || host.ends_with(".internal")
-                || host.ends_with(".localhost");
-            if !is_local {
-                return Err(AcmeError::Directory(format!(
-                    "ACME directory URL must use HTTPS (got {directory_url}); \
-                         HTTP is only allowed for localhost/internal hosts"
+    /// Create a client using a caller-configured builder, including custom CA
+    /// roots, proxy settings and timeouts. Certon overrides the redirect policy
+    /// before building: every hop must obey the ACME transport policy.
+    ///
+    /// Already-built clients cannot be accepted because reqwest provides no
+    /// way to replace or inspect their automatic redirect policy. An HTTPS
+    /// directory requires HTTPS endpoints, including on localhost. A directory
+    /// explicitly served over local HTTP retains the development exception.
+    pub async fn with_http_client_builder(
+        directory_url: &str,
+        http: reqwest::ClientBuilder,
+    ) -> Result<Self> {
+        let mut transport = AcmeTransportPolicy::for_directory(directory_url)?;
+        crate::http::install_crypto_provider();
+        let http = http
+            .redirect(transport.redirects())
+            .build()
+            .map_err(|error| {
+                AcmeError::Directory(format!(
+                    "failed to build ACME transport: {}",
+                    error.without_url()
                 ))
-                .into());
-            }
-        }
+            })?;
 
         debug!(directory_url, "fetching ACME directory");
 
@@ -799,11 +860,32 @@ impl AcmeClient {
             );
         }
 
+        // A local HTTP directory may upgrade to HTTPS, but its authenticated
+        // directory contents must not send later operations back to HTTP.
+        if resp.url().scheme() == "https" {
+            transport.allow_local_http = false;
+        }
         let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME directory")
             .await
             .map_err(|e| AcmeError::Directory(e.to_string()))?;
         let directory: AcmeDirectory = serde_json::from_slice(&body)
             .map_err(|e| AcmeError::Directory(format!("failed to parse directory JSON: {e}")))?;
+
+        for endpoint in [
+            directory.new_nonce.as_str(),
+            directory.new_account.as_str(),
+            directory.new_order.as_str(),
+            directory.revoke_cert.as_str(),
+            directory.key_change.as_str(),
+        ]
+        .into_iter()
+        .chain(directory.new_authz.as_deref())
+        .chain(directory.renewal_info.as_deref())
+        {
+            transport
+                .validate_url(endpoint)
+                .map_err(|error| AcmeError::Directory(error.to_string()))?;
+        }
 
         debug!(
             new_nonce = %directory.new_nonce,
@@ -813,10 +895,11 @@ impl AcmeClient {
         );
 
         // Get initial nonce.
-        let nonce = Self::fetch_nonce_from(&http, &directory.new_nonce).await?;
+        let nonce = Self::fetch_nonce_from(&http, transport, &directory.new_nonce).await?;
 
         Ok(Self {
             http,
+            transport,
             directory,
             nonce: Mutex::new(Some(nonce)),
         })
@@ -841,11 +924,18 @@ impl AcmeClient {
                 return Ok(nonce);
             }
         }
-        Self::fetch_nonce_from(&self.http, &self.directory.new_nonce).await
+        Self::fetch_nonce_from(&self.http, self.transport, &self.directory.new_nonce).await
     }
 
     /// Fetch a nonce via HEAD request to the `new_nonce_url`.
-    async fn fetch_nonce_from(http: &reqwest::Client, new_nonce_url: &str) -> Result<String> {
+    async fn fetch_nonce_from(
+        http: &reqwest::Client,
+        transport: AcmeTransportPolicy,
+        new_nonce_url: &str,
+    ) -> Result<String> {
+        transport
+            .validate_url(new_nonce_url)
+            .map_err(|error| AcmeError::Nonce(error.to_string()))?;
         debug!("fetching new nonce via HEAD");
         let resp = http
             .head(new_nonce_url)
@@ -897,6 +987,9 @@ impl AcmeClient {
         payload: Option<&str>,
         accepted_problem: Option<&str>,
     ) -> Result<Option<reqwest::Response>> {
+        self.transport
+            .validate_url(url)
+            .map_err(|error| AcmeError::Order(error.to_string()))?;
         // We try once; on a badNonce error we retry with a fresh nonce.
         for attempt in 0..2 {
             let nonce = self.get_nonce().await?;
@@ -1079,6 +1172,9 @@ impl AcmeClient {
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Account(format!("failed to serialize find request: {e}")))?;
 
+        self.transport
+            .validate_url(&self.directory.new_account)
+            .map_err(|error| AcmeError::Account(error.to_string()))?;
         let nonce = self.get_nonce().await?;
         let body = build_jws_body(
             account_key,
@@ -1668,6 +1764,9 @@ impl AcmeClient {
         };
 
         let url = format!("{}/{}", renewal_info_base.trim_end_matches('/'), cert_id);
+        self.transport
+            .validate_url(&url)
+            .map_err(|error| AcmeError::Certificate(error.to_string()))?;
         debug!(url = %url, "fetching ACME Renewal Information (ARI)");
 
         let resp = self

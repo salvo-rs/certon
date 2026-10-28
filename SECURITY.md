@@ -75,9 +75,14 @@ chunk, so chunked or unknown-length responses use the same budget. Oversized
 bodies produce a bounded error message rather than including their contents.
 Transport read errors omit the request URL to protect query credentials.
 
-The shared HTTP client's existing 30-second request timeout includes body
-consumption. A caller-supplied HTTP client's timeout policy is preserved;
-the response size limits apply to that transport as well.
+The default HTTP transports' 30-second request timeout includes body
+consumption. A caller-supplied ACME client builder's timeout policy is preserved;
+the response size limits apply to that transport as well. ACME validates every
+operation URL and enforces its redirect policy when constructing the client,
+so HTTPS-to-HTTP downgrade is rejected before contacting the redirect target.
+The local HTTP directory exception is for development; it does not permit
+downgrading an HTTPS directory or redirect chain. OCSP HTTP responders remain
+supported by their separate shared transport.
 
 Windows CI places Cargo artifacts, Cargo data and temporary files under
 `D:/BuildCache/certon-ci`; its setup checks the target directory with Cargo
