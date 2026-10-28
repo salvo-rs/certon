@@ -2,9 +2,9 @@
 //!
 //! This module handles creating, loading, and saving ACME accounts to storage.
 //!
-//! Accounts are stored at:
-//! - Registration JSON: `acme/<ca_key>/users/<email>/<username>.json`
-//! - Private key PEM:   `acme/<ca_key>/users/<email>/<username>.key`
+//! Accounts are atomically stored as complete snapshots at
+//! `acme/<ca_key>/users/<email>/_certon/account.v1.key`. Legacy registration JSON
+//! and private-key files remain readable for upgrades.
 //!
 //! where `<username>` is the portion of the email address before `@`, or
 //! `"default"` if no email is provided.
@@ -40,9 +40,8 @@ const DEFAULT_KEY_FILENAME: &str = "private";
 /// Represents an ACME account, including its private key material and
 /// registration metadata.
 ///
-/// This struct is serialised to JSON for storage. The private key PEM is
-/// stored in a separate file (not embedded in the JSON), but is carried
-/// in-memory as part of this struct for convenience.
+/// Standalone serialization omits the private key. Persistence wraps this
+/// metadata together with the key in a private, versioned atomic snapshot.
 ///
 /// Accounts are uniquely identified by their CA URL and email address.
 /// A single application may have accounts on multiple CAs simultaneously
@@ -68,8 +67,8 @@ pub struct AcmeAccount {
 
     /// PEM-encoded private key for this account.
     ///
-    /// This field is **not** written into the registration JSON — it is stored
-    /// in a separate `.key` file.
+    /// Standalone registration JSON omits this field. The persistence snapshot
+    /// includes it separately and is stored with private-key permissions.
     #[serde(skip)]
     pub private_key_pem: String,
 
@@ -182,6 +181,28 @@ fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
     )
 }
 
+#[derive(Serialize, Deserialize)]
+struct AccountSnapshot {
+    version: u32,
+    registration: AcmeAccount,
+    private_key_pem: String,
+}
+
+fn storage_key_account_snapshot(issuer: &str, email: &str) -> String {
+    format!(
+        "{}/_certon/account.v1.key",
+        account_key_prefix(issuer, &normalise_email(email))
+    )
+}
+
+fn validate_account(mut account: AcmeAccount, key_pem: String) -> Result<AcmeAccount> {
+    let key = decode_private_key_pem(&key_pem)
+        .map_err(|e| AcmeError::Account(format!("could not decode account's private key: {e}")))?;
+    account.private_key_pem = key_pem;
+    account.key_type = key.key_type();
+    Ok(account)
+}
+
 // ---------------------------------------------------------------------------
 // Account operations
 // ---------------------------------------------------------------------------
@@ -199,35 +220,45 @@ pub async fn get_account(
     let reg_key = storage_key_user_reg(&issuer_key, email);
     let pk_key = storage_key_user_private_key(&issuer_key, email);
 
-    // Load registration JSON.
-    let reg_bytes = match storage.load(&reg_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => return Ok(None),
-        Err(e) => return Err(e),
+    match storage
+        .load(&storage_key_account_snapshot(&issuer_key, email))
+        .await
+    {
+        Ok(bytes) => {
+            let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
+                .map_err(|e| AcmeError::Account(format!("invalid account snapshot: {e}")))?;
+            if snapshot.version != 1 {
+                return Err(
+                    AcmeError::Account("unsupported account snapshot version".into()).into(),
+                );
+            }
+            return Ok(Some(validate_account(
+                snapshot.registration,
+                snapshot.private_key_pem,
+            )?));
+        }
+        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
+        Err(error) => return Err(error),
+    }
+    let mut legacy = Vec::new();
+    for key in [&reg_key, &pk_key] {
+        legacy.push(match storage.load(key).await {
+            Ok(bytes) => Some(bytes),
+            Err(crate::error::Error::Storage(StorageError::NotFound(_))) => None,
+            Err(error) => return Err(error),
+        });
+    }
+    let (reg_bytes, key_bytes) = match (legacy.remove(0), legacy.remove(0)) {
+        (None, None) => return Ok(None),
+        (Some(reg), Some(key)) => (reg, key),
+        _ => return Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
     };
-
-    // Load private key PEM.
-    let key_bytes = match storage.load(&pk_key).await {
-        Ok(bytes) => bytes,
-        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => return Ok(None),
-        Err(e) => return Err(e),
-    };
-
-    // Deserialise registration.
-    let mut account: AcmeAccount = serde_json::from_slice(&reg_bytes).map_err(|e| {
+    let registration = serde_json::from_slice(&reg_bytes).map_err(|e| {
         AcmeError::Account(format!("failed to deserialise account registration: {e}"))
     })?;
-
-    // Decode and attach the private key PEM.
-    let pem_str = String::from_utf8(key_bytes)
+    let key_pem = String::from_utf8(key_bytes)
         .map_err(|e| AcmeError::Account(format!("account private key is not valid UTF-8: {e}")))?;
-
-    // Validate that the PEM can actually be decoded.
-    let private_key = decode_private_key_pem(&pem_str)
-        .map_err(|e| AcmeError::Account(format!("could not decode account's private key: {e}")))?;
-
-    account.private_key_pem = pem_str;
-    account.key_type = private_key.key_type();
+    let account = validate_account(registration, key_pem)?;
 
     debug!(
         email = email,
@@ -240,10 +271,9 @@ pub async fn get_account(
 
 /// Save an ACME account to storage transactionally.
 ///
-/// Persists both the registration JSON and the private key PEM as separate
-/// storage entries. If either write fails, any already-written entry is
-/// rolled back (deleted) on a best-effort basis to keep the storage
-/// consistent.
+/// Publishes registration and private key together in a versioned, private
+/// snapshot. Failed or cancelled publication exposes a complete old or new
+/// account, never metadata paired with another generation's private key.
 pub async fn save_account(
     storage: &dyn Storage,
     ca_url: &str,
@@ -252,26 +282,16 @@ pub async fn save_account(
     let email = get_primary_contact(account);
     let issuer_key = crate::storage::issuer_key(ca_url);
 
-    // Serialise registration (without the private key, which is #[serde(skip)]).
-    let reg_bytes = serde_json::to_vec_pretty(account).map_err(|e| {
-        AcmeError::Account(format!("failed to serialise account registration: {e}"))
-    })?;
-
-    let reg_key = storage_key_user_reg(&issuer_key, &email);
-    let pk_key = storage_key_user_private_key(&issuer_key, &email);
-
-    // Store registration JSON.
-    storage.store(&reg_key, &reg_bytes).await?;
-
-    // Store private key PEM; roll back the registration JSON on failure.
-    if let Err(e) = storage
-        .store(&pk_key, account.private_key_pem.as_bytes())
-        .await
-    {
-        // Best-effort rollback of the registration JSON.
-        let _ = storage.delete(&reg_key).await;
-        return Err(e);
-    }
+    let snapshot = AccountSnapshot {
+        version: 1,
+        registration: account.clone(),
+        private_key_pem: account.private_key_pem.clone(),
+    };
+    let bytes = serde_json::to_vec(&snapshot)
+        .map_err(|e| AcmeError::Account(format!("failed to serialise account snapshot: {e}")))?;
+    storage
+        .store(&storage_key_account_snapshot(&issuer_key, &email), &bytes)
+        .await?;
 
     debug!(
         email = %email,
@@ -369,8 +389,18 @@ pub async fn delete_account_locally(
     let reg_key = storage_key_user_reg(&issuer_key, &email);
     let pk_key = storage_key_user_private_key(&issuer_key, &email);
 
-    storage.delete(&reg_key).await?;
-    storage.delete(&pk_key).await?;
+    // Remove legacy resources first to prevent resurrection after a partial
+    // deletion. The current snapshot remains usable until the final delete.
+    for key in [
+        reg_key,
+        pk_key,
+        storage_key_account_snapshot(&issuer_key, &email),
+    ] {
+        match storage.delete(&key).await {
+            Ok(()) | Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
+        }
+    }
 
     debug!(
         email = %email,

@@ -34,7 +34,8 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result, StorageError};
 use crate::storage::{
-    CertificateResource, Storage, site_cert_key, site_meta_key, site_private_key, store_certificate,
+    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
+    site_snapshot_key, store_certificate,
 };
 
 /// Somewhere certificates are kept.
@@ -59,17 +60,17 @@ pub trait CertStore: Send + Sync + std::fmt::Debug {
 
     /// Save a certificate, its key and its metadata.
     ///
-    /// Atomicity depends on the backend. The key-value adapter writes three
-    /// separate entries; callers must coordinate writers with shared locks.
+    /// The key-value adapter atomically publishes one complete snapshot;
+    /// callers must still coordinate issuance with shared locks.
     ///
-    /// The storage name is `resource.names_key()` (the first SAN). Callers
+    /// The storage name is `resource.names_key()` (the sorted SAN set). Callers
     /// must supply names consistent with the certificate.
     async fn save(&self, issuer: &str, resource: &CertificateResource) -> Result<()>;
 
     /// Whether a complete set is held.
     ///
-    /// Separate from [`load`](Self::load) because answering it need not read a
-    /// private key off a disk, out of a vault, or across a network.
+    /// Backends may answer this without loading the full resource. The
+    /// key-value adapter validates the snapshot just as [`load`](Self::load) does.
     async fn has(&self, issuer: &str, domain: &str) -> Result<bool>;
 
     /// Forget everything held for `domain` under `issuer`.
@@ -106,28 +107,26 @@ impl KeyValueCertStore {
 #[async_trait]
 impl CertStore for KeyValueCertStore {
     async fn load(&self, issuer: &str, domain: &str) -> Result<Option<CertificateResource>> {
-        let key = self.read(&site_private_key(issuer, domain)).await?;
-        let certificate = self.read(&site_cert_key(issuer, domain)).await?;
-        let metadata = self.read(&site_meta_key(issuer, domain)).await?;
-        let (key, certificate, metadata) = match (key, certificate, metadata) {
-            (None, None, None) => return Ok(None),
-            (Some(key), Some(certificate), Some(metadata)) => (key, certificate, metadata),
-            _ => {
-                return Err(Error::Storage(StorageError::Deserialize(format!(
-                    "incomplete certificate resources for {domain} under {issuer}"
-                ))));
+        match load_certificate(self.storage.as_ref(), issuer, domain).await {
+            Ok(resource) => Ok(Some(resource)),
+            Err(Error::Storage(StorageError::NotFound(_))) => {
+                for key in [
+                    site_snapshot_key(issuer, domain),
+                    site_cert_key(issuer, domain),
+                    site_private_key(issuer, domain),
+                    site_meta_key(issuer, domain),
+                ] {
+                    if self.storage.exists(&key).await? {
+                        return Err(StorageError::Deserialize(format!(
+                            "incomplete certificate resources for {domain} under {issuer}"
+                        ))
+                        .into());
+                    }
+                }
+                Ok(None)
             }
-        };
-
-        let mut resource: CertificateResource = serde_json::from_slice(&metadata).map_err(|e| {
-            Error::Storage(StorageError::Deserialize(format!(
-                "decoding certificate metadata: {e}"
-            )))
-        })?;
-        resource.private_key_pem = key;
-        resource.certificate_pem = certificate;
-        resource.issuer_key = issuer.to_owned();
-        Ok(Some(resource))
+            Err(error) => Err(error),
+        }
     }
 
     async fn save(&self, issuer: &str, resource: &CertificateResource) -> Result<()> {
@@ -135,30 +134,17 @@ impl CertStore for KeyValueCertStore {
     }
 
     async fn has(&self, issuer: &str, domain: &str) -> Result<bool> {
-        let mut present = 0;
-        for key in [
-            site_cert_key(issuer, domain),
-            site_private_key(issuer, domain),
-            site_meta_key(issuer, domain),
-        ] {
-            if self.storage.exists(&key).await? {
-                present += 1;
-            }
-        }
-        match present {
-            0 => Ok(false),
-            3 => Ok(true),
-            _ => Err(Error::Storage(StorageError::Deserialize(format!(
-                "incomplete certificate resources for {domain} under {issuer}"
-            )))),
-        }
+        Ok(self.load(issuer, domain).await?.is_some())
     }
 
     async fn remove(&self, issuer: &str, domain: &str) -> Result<()> {
+        // Delete legacy entries first so a failed removal cannot resurrect an
+        // older resource when the current snapshot disappears.
         for key in [
             site_cert_key(issuer, domain),
             site_private_key(issuer, domain),
             site_meta_key(issuer, domain),
+            site_snapshot_key(issuer, domain),
         ] {
             match self.storage.delete(&key).await {
                 Ok(()) | Err(Error::Storage(StorageError::NotFound(_))) => {}
@@ -166,18 +152,6 @@ impl CertStore for KeyValueCertStore {
             }
         }
         Ok(())
-    }
-}
-
-impl KeyValueCertStore {
-    /// Read a key, turning "not found" into `None` and leaving every other
-    /// failure as a failure.
-    async fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        match self.storage.load(key).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
-            Err(other) => Err(other),
-        }
     }
 }
 
@@ -347,7 +321,23 @@ pub(crate) mod tests {
     async fn a_half_written_certificate_is_not_a_certificate() {
         // Partial writes are corruption, not absence that permits reissuance.
         let (_directory, store) = store();
-        store.save("ca", &resource("example.com")).await.unwrap();
+        let resource = resource("example.com");
+        store
+            .storage()
+            .store(
+                &site_cert_key("ca", "example.com"),
+                &resource.certificate_pem,
+            )
+            .await
+            .unwrap();
+        store
+            .storage()
+            .store(
+                &site_meta_key("ca", "example.com"),
+                &serde_json::to_vec(&resource).unwrap(),
+            )
+            .await
+            .unwrap();
         store
             .storage()
             .delete(&site_private_key("ca", "example.com"))
