@@ -27,6 +27,7 @@ struct TestIssuer {
     mode: AtomicU8,
     entered: Notify,
     requests: std::sync::Mutex<Vec<Vec<String>>>,
+    csr_public_keys: std::sync::Mutex<Vec<Vec<u8>>>,
     name: &'static str,
     not_before_year: i32,
     not_after_year: i32,
@@ -44,6 +45,7 @@ impl TestIssuer {
             mode: AtomicU8::new(0),
             entered: Notify::new(),
             requests: std::sync::Mutex::new(Vec::new()),
+            csr_public_keys: std::sync::Mutex::new(Vec::new()),
             name: "test-ca",
             not_before_year: chrono::Utc::now().year() - 2,
             not_after_year: chrono::Utc::now().year() + 4,
@@ -72,6 +74,7 @@ impl CertIssuer for TestIssuer {
                 .data
                 .to_vec(),
         );
+        self.csr_public_keys.lock().unwrap().push(public.0.clone());
         let names = if mode == 2 {
             vec!["wrong.example.com".into()]
         } else if mode == 5 {
@@ -761,4 +764,113 @@ async fn renewal_preserves_wildcard_sans_and_their_storage_identity() {
     restarted.manage(&["*.example.com".into()]).await.unwrap();
     handshake_for_domain(&restarted, &issuer, "tenant.example.com").await;
     handshake_for_domain(&restarted, &issuer, "example.net").await;
+}
+
+fn leaf_public_key(resource: &CertificateResource) -> Vec<u8> {
+    let cert = certon::Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+        .unwrap();
+    let (_, leaf) =
+        x509_parser::certificate::X509Certificate::from_der(cert.cert_chain[0].as_ref()).unwrap();
+    leaf.public_key().subject_public_key.data.to_vec()
+}
+
+async fn renewal_key_for_newest_fallback(reuse: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let certificates = Arc::new(KeyValueCertStore::new(storage.clone()));
+    let preferred = Arc::new(TestIssuer::new());
+    let old = certificate_resource(&preferred).await;
+    let old_public = leaf_public_key(&old);
+    certificates
+        .save(&preferred.issuer_key(), &old)
+        .await
+        .unwrap();
+    let mut fallback = TestIssuer::new();
+    fallback.name = "fallback-ca";
+    fallback.not_before_year += 1;
+    let fallback = Arc::new(fallback);
+    let selected = certificate_resource(&fallback).await;
+    let selected_public = leaf_public_key(&selected);
+    assert_ne!(old_public, selected_public);
+    certificates
+        .save(&fallback.issuer_key(), &selected)
+        .await
+        .unwrap();
+    let manager = CertManager::builder()
+        .storage(storage)
+        .certificates(certificates.clone())
+        .issuers(vec![preferred.clone(), fallback.clone()])
+        .reuse_private_keys(reuse)
+        .ocsp(OcspConfig {
+            disable_stapling: true,
+            ..Default::default()
+        })
+        .build();
+    let cached = manager.cache_certificate("example.com").await.unwrap();
+    assert_eq!(cached.issuer_key, fallback.issuer_key());
+    // Keep the older preferred issuer's key in storage while it is unavailable.
+    preferred.mode.store(4, Ordering::SeqCst);
+    fallback.csr_public_keys.lock().unwrap().clear();
+    manager.renew("example.com", true).await.unwrap();
+    let recorded = fallback.csr_public_keys.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1);
+    if reuse {
+        assert_eq!(
+            recorded[0], selected_public,
+            "renewal must reuse the selected fallback resource's key"
+        );
+    } else {
+        assert_ne!(
+            recorded[0], selected_public,
+            "disabled reuse must rotate the selected key"
+        );
+    }
+    assert_ne!(
+        recorded[0], old_public,
+        "older preferred-CA key must not be resurrected"
+    );
+    let renewed = certificates
+        .load(&fallback.issuer_key(), "example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(leaf_public_key(&renewed), recorded[0]);
+    assert_eq!(
+        certificates
+            .load(&preferred.issuer_key(), "example.com")
+            .await
+            .unwrap()
+            .unwrap()
+            .private_key_pem,
+        old.private_key_pem
+    );
+    handshake(&manager, &fallback).await;
+}
+
+#[tokio::test]
+async fn renewal_reuses_the_selected_fallback_resource_private_key() {
+    renewal_key_for_newest_fallback(true).await;
+}
+
+#[tokio::test]
+async fn renewal_rotates_the_key_when_reuse_is_disabled() {
+    renewal_key_for_newest_fallback(false).await;
+}
+
+#[tokio::test]
+async fn first_obtain_generates_a_key_when_reuse_is_enabled_without_a_resource() {
+    let directory = tempfile::tempdir().unwrap();
+    let issuer = Arc::new(TestIssuer::new());
+    let manager = CertManager::builder()
+        .storage(Arc::new(FileStorage::new(directory.path())))
+        .issuers(vec![issuer.clone()])
+        .reuse_private_keys(true)
+        .ocsp(OcspConfig {
+            disable_stapling: true,
+            ..Default::default()
+        })
+        .build();
+    manager.obtain("example.com").await.unwrap();
+    assert_eq!(issuer.csr_public_keys.lock().unwrap().len(), 1);
+    handshake(&manager, &issuer).await;
 }
