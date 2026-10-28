@@ -66,6 +66,28 @@ cargo deny --locked --all-features check licenses bans sources
 
 Use the pinned `cargo-deny` 0.20.2 version from the workflow.
 
+## Local file storage trust boundary
+
+`FileStorage` requires a storage root and parent directories controlled by
+trusted operators. The tree contains certificate private keys and ACME account
+credentials. Prevent other accounts from reading those secrets or replacing
+files and directories: configure Unix ownership and permissions or Windows
+ACLs before use, and verify inherited permissions on the deployment host.
+
+Storage-key validation rejects lexical traversal such as `..` and absolute
+paths. Filesystem operations can still follow symbolic links, Windows
+junctions and other reparse points. An account able to replace the root, an
+ancestor or a path within the tree can redirect operations; this backend is
+not a sandbox against that local account. Keep untrusted uploads and other
+attacker-writable content outside the storage tree. A startup path check alone
+does not prevent later link-replacement races.
+
+Unix writes use restricted file permissions and attempt to restrict the
+immediate destination directory; this does not establish the ownership or
+permissions of every ancestor. The backend does not configure Windows ACLs.
+For shared storage, review access permissions and cross-host locking support
+together; advisory locking is coordination, not access control.
+
 ## Outbound response budgets
 
 ACME and ZeroSSL JSON responses are limited to 1 MiB. Error response bodies
