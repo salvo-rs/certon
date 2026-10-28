@@ -10,8 +10,10 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -294,6 +296,51 @@ impl Drop for JobCompletion {
     }
 }
 
+// Before first poll and while awaiting execution, the user's factory remains
+// captured here. Its destructor must finish before acknowledging completion.
+struct QueuedWork<F> {
+    create: Option<F>,
+    execution: Option<OwnedSemaphorePermit>,
+    completion: Option<JobCompletion>,
+}
+
+impl<F> Drop for QueuedWork<F> {
+    fn drop(&mut self) {
+        drop(self.create.take());
+        drop(self.execution.take());
+        drop(self.completion.take());
+    }
+}
+
+// The running future needs the same explicit drop order. Generator capture
+// order alone is not a cleanup guarantee, especially before its first poll.
+struct RunningWork<Fut: Future> {
+    future: Option<Pin<Box<Fut>>>,
+    execution: Option<OwnedSemaphorePermit>,
+    completion: Option<JobCompletion>,
+}
+
+impl<Fut: Future> Future for RunningWork<Fut> {
+    type Output = Fut::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut()
+            .future
+            .as_mut()
+            .expect("running future missing")
+            .as_mut()
+            .poll(cx)
+    }
+}
+
+impl<Fut: Future> Drop for RunningWork<Fut> {
+    fn drop(&mut self) {
+        drop(self.future.take());
+        drop(self.execution.take());
+        drop(self.completion.take());
+    }
+}
+
 impl JobQueue {
     /// An unbounded-concurrency queue, deduplicated by name.
     pub fn new(name: impl Into<String>) -> Self {
@@ -397,19 +444,32 @@ impl JobQueue {
             changed: self.changed.clone(),
             admission,
         };
+        let queued = QueuedWork {
+            create: Some(f),
+            execution: None,
+            completion: Some(cleanup),
+        };
         self.changed.send_replace(());
         let semaphore = self.semaphore.clone();
         tracing::debug!(queue = %self.name, job = %name, "submitting background job");
         let handle = runtime.spawn(async move {
-            let _cleanup = cleanup;
-            let _permit = match &semaphore {
-                Some(sem) => match sem.acquire().await {
+            let mut queued = queued;
+            queued.execution = match semaphore {
+                Some(sem) => match sem.acquire_owned().await {
                     Ok(permit) => Some(permit),
                     Err(_) => return,
                 },
                 None => None,
             };
-            f().await;
+            // The execution permit already belongs to queued while invoking
+            // the factory, including a synchronous factory panic.
+            let future = queued.create.take().expect("job factory missing")();
+            RunningWork {
+                future: Some(Box::pin(future)),
+                execution: queued.execution.take(),
+                completion: queued.completion.take(),
+            }
+            .await;
         });
         let abort = handle.abort_handle();
         let cancelled = {
@@ -1064,5 +1124,132 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_waits_for_user_work_destructors_in_every_task_state() {
+        struct DropBarrier {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for DropBarrier {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(3))
+                    .expect("Drop barrier was not released");
+            }
+        }
+        for state in ["unpolled", "queued", "running", "factory-panic"] {
+            let queue = Arc::new(JobQueue::with_limits(
+                "drop-order",
+                1,
+                usize::from(state == "queued"),
+            ));
+            if state == "queued" {
+                queue.submit("blocker".into(), std::future::pending).await;
+                tokio::task::yield_now().await;
+            }
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let resource = DropBarrier {
+                entered,
+                release: released,
+            };
+            let started = Arc::new(tokio::sync::Notify::new());
+            if state == "factory-panic" {
+                queue
+                    .submit("probe".into(), move || -> std::future::Ready<()> {
+                        let _resource = resource;
+                        panic!("expected synchronous factory panic");
+                    })
+                    .await;
+            } else {
+                queue
+                    .submit("probe".into(), {
+                        let started = started.clone();
+                        move || async move {
+                            let _resource = resource;
+                            started.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                    })
+                    .await;
+            }
+            if state == "running" {
+                started.notified().await;
+            } else if state == "queued" {
+                tokio::task::yield_now().await;
+                assert_eq!(queue.semaphore.as_ref().unwrap().available_permits(), 0);
+            }
+            let (completion, abort) = {
+                let jobs = queue.jobs.lock().unwrap();
+                let job = &jobs["probe"];
+                (job.completion.clone(), job.abort.clone().unwrap())
+            };
+            // On this current-thread runtime no child is polled between submit
+            // and abort, making the first state deterministic.
+            if state != "factory-panic" {
+                abort.abort();
+            }
+            let (finished, result) = tokio::sync::oneshot::channel();
+            let observer_queue = queue.clone();
+            let runtime = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let waiter_queue = observer_queue.clone();
+                let waiter = std::thread::spawn(move || {
+                    runtime.block_on(async {
+                        if state == "factory-panic" {
+                            waiter_queue.wait("probe").await;
+                        } else if state == "queued" {
+                            waiter_queue.shutdown().await;
+                        } else {
+                            waiter_queue.cancel("probe").await;
+                        }
+                    });
+                });
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("user Drop never started");
+                // The resource is still alive and blocked here. Its generation
+                // must neither acknowledge cleanup nor return its capacity yet.
+                let acknowledged = *completion.borrow();
+                let capacity = observer_queue
+                    .admission
+                    .as_ref()
+                    .unwrap()
+                    .available_permits();
+                let execution = observer_queue
+                    .semaphore
+                    .as_ref()
+                    .unwrap()
+                    .available_permits();
+                release.send(()).unwrap();
+                waiter.join().unwrap();
+                let _ = finished.send((acknowledged, capacity, execution));
+            });
+            let (acknowledged, capacity, execution) =
+                tokio::time::timeout(Duration::from_secs(4), result)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                !acknowledged,
+                "{state} acknowledged while user Drop was blocked"
+            );
+            if state != "queued" {
+                assert_eq!(
+                    capacity, 0,
+                    "{state} returned capacity before dropping work"
+                );
+            }
+            if matches!(state, "running" | "factory-panic") {
+                assert_eq!(
+                    execution, 0,
+                    "{state} returned execution permit before dropping work"
+                );
+            }
+            queue.shutdown().await;
+        }
     }
 }
