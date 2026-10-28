@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use x509_parser::prelude::FromDer;
 
@@ -49,6 +50,44 @@ use crate::storage::{Storage, acquire, issuer_key};
 
 /// Callback invoked on newly created accounts before CA registration.
 type NewAccountFunc = Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>;
+
+/// Challenge cleanup must also run when the obtain timeout cancels this future.
+struct PresentedChallenge {
+    solver: Arc<dyn Solver>,
+    domain: String,
+    token: String,
+    key_auth: String,
+    armed: bool,
+}
+
+impl PresentedChallenge {
+    async fn cleanup(mut self) -> Result<()> {
+        let result = self
+            .solver
+            .cleanup(&self.domain, &self.token, &self.key_auth)
+            .await;
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for PresentedChallenge {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let solver = Arc::clone(&self.solver);
+            let domain = self.domain.clone();
+            let token = self.token.clone();
+            let key_auth = self.key_auth.clone();
+            runtime.spawn(async move {
+                if let Err(error) = solver.cleanup(&domain, &token, &key_auth).await {
+                    warn!(%domain, %error, "failed to clean up cancelled challenge");
+                }
+            });
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Well-known CA constants (re-exported for convenience)
@@ -231,8 +270,9 @@ impl std::fmt::Debug for IssuedCertificate {
 /// Preferences for selecting an alternate certificate chain when the CA
 /// offers more than one.
 ///
-/// The first matching criterion wins. If no chain matches, the first
-/// (default) chain is used.
+/// Root Common Names are tried in preference order, then any issuer Common
+/// Names, then the size preference. If no criterion matches, the default chain
+/// is used. Certificate order within the selected chain is preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChainPreference {
     /// When `true`, prefer chains with the fewest bytes.
@@ -241,7 +281,8 @@ pub struct ChainPreference {
     pub smallest: Option<bool>,
 
     /// Select the first chain whose root certificate has one of these
-    /// Common Names.
+    /// Common Names (the issuer CN of the final certificate, since ACME
+    /// servers usually omit the self-signed root).
     #[serde(default)]
     pub root_common_name: Vec<String>,
 
@@ -332,9 +373,9 @@ pub struct AcmeIssuer {
     pub storage: Arc<dyn Storage>,
 
     /// Lazily-initialised ACME client (for the production CA).
-    client: Mutex<Option<AcmeClient>>,
+    client: Mutex<Option<Arc<AcmeClient>>>,
     /// Lazily-initialised ACME client (for the test CA, if different).
-    test_client: Mutex<Option<AcmeClient>>,
+    test_client: Mutex<Option<Arc<AcmeClient>>>,
     /// Lazily-initialised ACME account (for the production CA).
     account: Mutex<Option<AcmeAccount>>,
     /// Lazily-initialised ACME account (for the test CA).
@@ -507,7 +548,10 @@ impl AcmeIssuerBuilder {
         self
     }
 
-    /// Set a custom DNS resolver address (e.g. "8.8.8.8:53").
+    /// This setting cannot configure an arbitrary custom solver. Set
+    /// `Dns01Solver::resolvers` on the DNS solver instead.
+    /// A nonempty value is rejected before issuance rather than silently ignored.
+    #[deprecated(note = "configure Dns01Solver.resolvers directly")]
     pub fn resolver(mut self, resolver: impl Into<String>) -> Self {
         self.resolver = Some(resolver.into());
         self
@@ -639,7 +683,7 @@ impl AcmeIssuer {
     // -----------------------------------------------------------------------
 
     /// Get or lazily initialise the ACME client for the given CA URL.
-    async fn get_client(&self, use_test: bool) -> Result<AcmeClient> {
+    async fn get_client(&self, use_test: bool) -> Result<Arc<AcmeClient>> {
         let ca_url = if use_test { &self.test_ca } else { &self.ca };
         let mutex = if use_test {
             &self.test_client
@@ -647,33 +691,26 @@ impl AcmeIssuer {
             &self.client
         };
 
-        {
-            let guard = mutex.lock().await;
-            if let Some(ref client) = *guard {
-                // AcmeClient is not Clone, but we can re-create from same URL
-                // since directory is cached. For simplicity, we re-create on
-                // each call. A production implementation would Arc-wrap the
-                // client. Here we just create a new one if not cached.
-                let _ = client;
-            }
-        }
-
-        // Always check the cache first.
-        {
-            let guard = mutex.lock().await;
-            if guard.is_some() {
-                // Client exists — drop guard and re-create from same URL.
-                // Since AcmeClient is not Clone, we create a fresh one. This
-                // is a simplification; the real overhead is negligible because
-                // the directory and nonce are cached server-side.
-                drop(guard);
-            }
-        }
-
-        info!(ca = %ca_url, "initialising ACME client");
-        let client = AcmeClient::new(ca_url).await?;
         let mut guard = mutex.lock().await;
-        *guard = Some(AcmeClient::new(ca_url).await?);
+        if let Some(client) = guard.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        info!(ca = %ca_url, "initialising ACME client");
+        let http = if let Some(roots) = &self.trusted_roots {
+            crate::http::install_crypto_provider();
+            let root = reqwest::Certificate::from_der(roots)
+                .map_err(|e| Error::Config(format!("invalid custom CA root certificate: {e}")))?;
+            reqwest::Client::builder()
+                .user_agent(crate::http::user_agent())
+                .timeout(crate::http::REQUEST_TIMEOUT)
+                .add_root_certificate(root)
+                .build()
+                .map_err(|e| Error::Config(format!("failed to build custom CA transport: {e}")))?
+        } else {
+            crate::http::client()?.clone()
+        };
+        let client = Arc::new(AcmeClient::with_http_client(ca_url, http).await?);
+        *guard = Some(Arc::clone(&client));
         Ok(client)
     }
 
@@ -729,6 +766,16 @@ impl AcmeIssuer {
         .await?;
 
         if is_new {
+            if let Some(key) = &self.account_key_pem {
+                let private_key = crate::crypto::decode_private_key_pem(key)?;
+                if private_key.key_type() != KeyType::EcdsaP256 {
+                    return Err(Error::Config(
+                        "ACME account keys must use ECDSA P-256".into(),
+                    ));
+                }
+                acct.private_key_pem = key.clone();
+                acct.key_type = private_key.key_type();
+            }
             // Invoke the new-account callback (if configured) before
             // registering with the CA, allowing the caller to modify
             // the account (e.g. set EAB, change contacts).
@@ -865,6 +912,7 @@ impl AcmeIssuer {
         domains: &[String],
         use_test_ca: bool,
         attempt: usize,
+        deadline: Instant,
     ) -> Result<(IssuedCertificate, bool)> {
         let ca_url = if use_test_ca { &self.test_ca } else { &self.ca };
         let is_test = self.using_test_ca(ca_url);
@@ -891,9 +939,9 @@ impl AcmeIssuer {
         let client = self.get_client(use_test_ca).await?;
 
         // Step 2: get ACME account.
-        let acct = self.get_account(&client, use_test_ca).await?;
+        let mut acct = self.get_account(&client, use_test_ca).await?;
 
-        let account_key = crate::crypto::decode_private_key_pem(&acct.private_key_pem)
+        let mut account_key = crate::crypto::decode_private_key_pem(&acct.private_key_pem)
             .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
         info!(
@@ -904,8 +952,21 @@ impl AcmeIssuer {
         );
 
         // Step 3: create order (with account-does-not-exist recovery).
+        let now = chrono::Utc::now();
+        let offset = |duration: Duration| -> Result<String> {
+            chrono::Duration::from_std(duration)
+                .ok()
+                .and_then(|delta| now.checked_add_signed(delta))
+                .map(|date| date.to_rfc3339())
+                .ok_or_else(|| Error::Config("certificate validity offset is out of range".into()))
+        };
+        let options = crate::acme_client::OrderOptions {
+            profile: self.profile.clone(),
+            not_before: self.not_before.map(offset).transpose()?,
+            not_after: self.not_after.map(offset).transpose()?,
+        };
         let order_result = client
-            .new_order(&account_key, &acct.location, domains)
+            .new_order_with_options(&account_key, &acct.location, domains, &options)
             .await;
 
         let (order, order_url) = match order_result {
@@ -926,9 +987,12 @@ impl AcmeIssuer {
                 .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
                 // Retry order creation with the new account.
-                client
-                    .new_order(&new_account_key, &new_acct.location, domains)
-                    .await?
+                let order = client
+                    .new_order_with_options(&new_account_key, &new_acct.location, domains, &options)
+                    .await?;
+                acct = new_acct;
+                account_key = new_account_key;
+                order
             }
             Err(e) => return Err(e),
         };
@@ -980,6 +1044,14 @@ impl AcmeIssuer {
                 solver
             };
 
+            let presented = PresentedChallenge {
+                solver: Arc::clone(&solver),
+                domain: authz.identifier.value.clone(),
+                token: challenge.token.clone(),
+                key_auth: key_auth.clone(),
+                armed: true,
+            };
+
             // Present the challenge.
             solver
                 .present(&authz.identifier.value, &challenge.token, &key_auth)
@@ -995,9 +1067,7 @@ impl AcmeIssuer {
                 .await
             {
                 // Cleanup on wait failure.
-                let _ = solver
-                    .cleanup(&authz.identifier.value, &challenge.token, &key_auth)
-                    .await;
+                let _ = presented.cleanup().await;
                 return Err(AcmeError::Challenge {
                     challenge_type: challenge.challenge_type.clone(),
                     message: format!("solver wait failed: {e}"),
@@ -1006,25 +1076,23 @@ impl AcmeIssuer {
             }
 
             // Tell the CA we are ready.
-            client
-                .accept_challenge(&account_key, &acct.location, &challenge.url)
-                .await?;
-
-            // Poll authorization until valid.
-            let poll_result = client
-                .poll_authorization(
-                    &account_key,
-                    &acct.location,
-                    authz_url,
-                    DEFAULT_AUTHZ_POLL_TIMEOUT,
-                )
-                .await;
+            let poll_result = async {
+                client
+                    .accept_challenge(&account_key, &acct.location, &challenge.url)
+                    .await?;
+                client
+                    .poll_authorization(
+                        &account_key,
+                        &acct.location,
+                        authz_url,
+                        DEFAULT_AUTHZ_POLL_TIMEOUT,
+                    )
+                    .await
+            }
+            .await;
 
             // Cleanup the challenge regardless of poll result.
-            if let Err(cleanup_err) = solver
-                .cleanup(&authz.identifier.value, &challenge.token, &key_auth)
-                .await
-            {
+            if let Err(cleanup_err) = presented.cleanup().await {
                 warn!(
                     identifier = %authz.identifier.value,
                     error = %cleanup_err,
@@ -1071,27 +1139,24 @@ impl AcmeIssuer {
             AcmeError::Certificate("order is valid but has no certificate URL".into())
         })?;
 
-        let cert_pem = client
-            .download_certificate(&account_key, &acct.location, &cert_url)
-            .await?;
-
-        info!(
-            domains = ?domains,
-            ca = %ca_url,
-            cert_url = %cert_url,
-            "certificate issued successfully"
-        );
-
-        // Step 8: select preferred chain if applicable.
-        // The ACME protocol can offer alternate chains via Link headers, but
-        // most Rust ACME clients return a single chain. For now we apply
-        // chain preference filtering if we detect multiple certificates in
-        // the PEM bundle.
-        let final_pem = if let Some(ref pref) = self.preferred_chains {
-            self.select_preferred_chain(&cert_pem, pref)
+        let final_pem = if let Some(ref preference) = self.preferred_chains {
+            let chains = client
+                .download_certificate_chains_with_deadline(
+                    &account_key,
+                    &acct.location,
+                    &cert_url,
+                    crate::acme_client::MAX_ALTERNATE_CHAINS,
+                    Some(deadline),
+                )
+                .await?;
+            self.select_preferred_chain(&chains, preference)
         } else {
-            cert_pem.clone()
+            client
+                .download_certificate(&account_key, &acct.location, &cert_url)
+                .await?
         };
+
+        info!(domains = ?domains, ca = %ca_url, cert_url = %cert_url, "certificate issued successfully");
 
         let metadata = serde_json::json!({
             "ca": ca_url,
@@ -1113,114 +1178,57 @@ impl AcmeIssuer {
     // Chain preference selection
     // -----------------------------------------------------------------------
 
-    /// Given a PEM certificate chain, apply the chain preference rules.
-    ///
-    /// In typical ACME usage there is only one chain. This method is a
-    /// simplified version that parses the PEM bundle and checks CN matching
-    /// when preferences are specified.
-    fn select_preferred_chain(&self, cert_pem: &str, pref: &ChainPreference) -> String {
-        // Parse certs from the bundle for inspection.
-        let cert_ders = match parse_certs_from_pem_bundle(cert_pem) {
-            Ok(ders) => ders,
-            Err(e) => {
-                warn!(error = %e, "failed to parse certificate chain for preference selection");
-                return cert_pem.to_owned();
-            }
-        };
-
-        if cert_ders.is_empty() {
-            return cert_pem.to_owned();
-        }
-
-        // Parse each certificate with x509-parser to check Common Names.
-        // We store the owned DER bytes alongside the parsed certificate
-        // reference via indices, since x509-parser borrows from the DER slice.
-        //
-        // Helper: extract the issuer CN from a DER-encoded certificate.
-        fn issuer_cn_from_der(der: &[u8]) -> Option<String> {
-            let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-
-            cert.issuer()
-                .iter_common_name()
-                .next()
-                .and_then(|attr| attr.as_str().ok())
-                .map(|s| s.to_owned())
-        }
-
-        // Check any_common_name: match any certificate's issuer CN.
-        if !pref.any_common_name.is_empty() {
-            for pref_cn in &pref.any_common_name {
-                for der in &cert_ders {
-                    if let Some(cn) = issuer_cn_from_der(der)
-                        && cn == *pref_cn
-                    {
-                        debug!(
-                            preferred_cn = %pref_cn,
-                            "found certificate matching any_common_name preference"
-                        );
-                        return cert_pem.to_owned();
-                    }
-                }
-            }
-        }
-
-        // Check root_common_name: match the last certificate's issuer CN.
-        if !pref.root_common_name.is_empty()
-            && let Some(root_der) = cert_ders.last()
-            && let Some(cn) = issuer_cn_from_der(root_der)
-        {
-            for pref_cn in &pref.root_common_name {
-                if cn == *pref_cn {
-                    debug!(
-                        preferred_cn = %pref_cn,
-                        "found certificate matching root_common_name preference"
+    /// Select a complete independent chain; never reorder its certificates.
+    /// Root CN preferences take priority, followed by any issuer CN, then size.
+    fn select_preferred_chain(&self, chains: &[String], preference: &ChainPreference) -> String {
+        let inspected: Vec<_> = chains
+            .iter()
+            .filter_map(|pem| {
+                let certificates = parse_certs_from_pem_bundle(pem).ok()?;
+                let mut names = Vec::new();
+                for der in &certificates {
+                    let (_, certificate) =
+                        x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+                    names.push(
+                        certificate
+                            .issuer()
+                            .iter_common_name()
+                            .filter_map(|attribute| attribute.as_str().ok().map(str::to_owned))
+                            .collect::<Vec<_>>(),
                     );
-                    return cert_pem.to_owned();
                 }
+                Some((pem, names))
+            })
+            .collect();
+        for wanted in &preference.root_common_name {
+            if let Some((pem, _)) = inspected
+                .iter()
+                .find(|(_, names)| names.last().is_some_and(|root| root.contains(wanted)))
+            {
+                return (*pem).clone();
             }
         }
-
-        // Check smallest preference: sort by PEM size.
-        if let Some(want_smallest) = pref.smallest {
-            // We only have a single chain here (the PEM bundle). In a
-            // scenario with multiple alternate chains from the CA, we
-            // would sort across all of them. For now, this is a no-op
-            // since there is only one chain, but we implement the sorting
-            // logic for future multi-chain support. We split the PEM
-            // bundle by certificate boundaries and re-assemble sorted.
-            let _pem_items = match pem::parse_many(cert_pem) {
-                Ok(items) if items.len() > 1 => items,
-                _ => return cert_pem.to_owned(),
-            };
-
-            // Treat the whole PEM as a single "chain" — sorting a single
-            // chain is a no-op. The sorting becomes meaningful when
-            // multiple alternate chains are available. We return the
-            // original PEM unchanged.
-            let mut chains: Vec<String> = vec![cert_pem.to_owned()];
-
-            chains.sort_by(|a, b| {
-                if want_smallest {
+        for wanted in &preference.any_common_name {
+            if let Some((pem, _)) = inspected
+                .iter()
+                .find(|(_, names)| names.iter().flatten().any(|name| name == wanted))
+            {
+                return (*pem).clone();
+            }
+        }
+        if let Some(smallest) = preference.smallest {
+            let selected = inspected.iter().min_by(|(a, _), (b, _)| {
+                if smallest {
                     a.len().cmp(&b.len())
                 } else {
                     b.len().cmp(&a.len())
                 }
             });
-
-            debug!(
-                smallest = want_smallest,
-                chain_count = chains.len(),
-                "applied chain size sorting preference"
-            );
-
-            return chains
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| cert_pem.to_owned());
+            if let Some((pem, _)) = selected {
+                return (*pem).clone();
+            }
         }
-
-        // No preference matched — return the original chain.
-        cert_pem.to_owned()
+        chains.first().cloned().unwrap_or_default()
     }
 
     // -----------------------------------------------------------------------
@@ -1257,18 +1265,27 @@ impl AcmeIssuer {
 // CertIssuer trait implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl CertIssuer for AcmeIssuer {
-    async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+impl AcmeIssuer {
+    async fn issue_inner(
+        &self,
+        csr_der: &[u8],
+        domains: &[String],
+        deadline: Instant,
+    ) -> Result<IssuedCertificate> {
+        if self.resolver.is_some() {
+            return Err(Error::Config("AcmeIssuer.resolver is not supported by arbitrary solvers; configure DNS resolution on Dns01Solver instead".into()));
+        }
         let mut attempt: usize = 0;
 
         // First attempt: production CA.
         attempt += 1;
         info!(attempt = attempt, domains = ?domains, "starting certificate issuance");
-        let result = self.do_issue(csr_der, domains, false, attempt).await;
+        let result = self
+            .do_issue(csr_der, domains, false, attempt, deadline)
+            .await;
 
         match result {
-            Ok((cert, _used_test)) => return Ok(cert),
+            Ok((cert, _used_test)) => Ok(cert),
             Err(first_err) => {
                 // If a test CA is configured and different from production,
                 // try the test CA as a fallback to verify our setup is
@@ -1281,14 +1298,19 @@ impl CertIssuer for AcmeIssuer {
 
                     attempt += 1;
                     info!(attempt = attempt, "retrying with test CA");
-                    match self.do_issue(csr_der, domains, true, attempt).await {
+                    match self
+                        .do_issue(csr_der, domains, true, attempt, deadline)
+                        .await
+                    {
                         Ok((_test_cert, _)) => {
                             info!("test CA issuance succeeded; retrying production CA once more");
                             // Test CA worked, so our setup is valid.
                             // Retry production CA once more.
                             attempt += 1;
                             info!(attempt = attempt, "retrying production CA");
-                            let (cert, _) = self.do_issue(csr_der, domains, false, attempt).await?;
+                            let (cert, _) = self
+                                .do_issue(csr_der, domains, false, attempt, deadline)
+                                .await?;
                             return Ok(cert);
                         }
                         Err(test_err) => {
@@ -1302,9 +1324,24 @@ impl CertIssuer for AcmeIssuer {
                     }
                 }
 
-                return Err(first_err);
+                Err(first_err)
             }
         }
+    }
+}
+
+#[async_trait]
+impl CertIssuer for AcmeIssuer {
+    async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+        let deadline = Instant::now() + self.cert_obtain_timeout;
+        tokio::time::timeout_at(deadline, self.issue_inner(csr_der, domains, deadline))
+            .await
+            .map_err(|_| {
+                Error::Timeout(format!(
+                    "certificate issuance exceeded {:?}",
+                    self.cert_obtain_timeout
+                ))
+            })?
     }
 
     fn issuer_key(&self) -> String {

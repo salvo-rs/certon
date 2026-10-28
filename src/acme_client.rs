@@ -8,6 +8,7 @@
 //! All requests use the JWS (JSON Web Signature) POST-as-GET convention
 //! required by RFC 8555. ECDSA P-256 (ES256) is used for signing.
 
+use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
 #[cfg(feature = "aws-lc-rs")]
@@ -23,6 +24,7 @@ use ring as crypto_provider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::crypto::PrivateKey;
@@ -51,6 +53,156 @@ pub const GOOGLE_TRUST_STAGING: &str = "https://dv.acme-v02.test-api.pki.goog/di
 
 /// Google Trust Services production ACME directory.
 pub const GOOGLE_TRUST_PRODUCTION: &str = "https://dv.acme-v02.api.pki.goog/directory";
+
+/// Maximum alternate-chain requests made by one download operation.
+pub const MAX_ALTERNATE_CHAINS: usize = 8;
+const MAX_CERTIFICATE_CHAIN_BYTES: usize = 1024 * 1024;
+const MAX_ALTERNATE_DISCOVERY_TIME: Duration = Duration::from_secs(5);
+
+fn certificate_chain_leaf(pem: &str) -> Result<Vec<u8>> {
+    let certificates = crate::crypto::parse_certs_from_pem_bundle(pem)?;
+    for der in &certificates {
+        let (remainder, _) = x509_parser::parse_x509_certificate(der).map_err(|error| {
+            AcmeError::Certificate(format!("invalid certificate in downloaded chain: {error}"))
+        })?;
+        if !remainder.is_empty() {
+            return Err(
+                AcmeError::Certificate("trailing data in downloaded certificate".into()).into(),
+            );
+        }
+    }
+    Ok(certificates
+        .into_iter()
+        .next()
+        .expect("PEM parser requires a certificate"))
+}
+
+fn enqueue_alternate_chains(
+    links: Vec<String>,
+    seen: &mut HashSet<String>,
+    pending: &mut VecDeque<String>,
+    limit: usize,
+) {
+    for link in links {
+        if seen.len() > limit {
+            break;
+        }
+        if seen.insert(link.clone()) {
+            pending.push_back(link);
+        }
+    }
+}
+
+// Split RFC 8288 lists/parameters only outside URI references and quoted
+// strings. In particular commas inside <URI> or title="a,b" are not separators.
+fn split_link_parts(value: &str, separator: char) -> Vec<&str> {
+    let (mut quoted, mut escaped, mut target, mut start) = (false, false, false, 0);
+    let mut parts = Vec::new();
+    for (index, character) in value.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = false;
+            }
+        } else if target {
+            if character == '>' {
+                target = false;
+            }
+        } else {
+            match character {
+                '"' => quoted = true,
+                '<' => target = true,
+                c if c == separator => {
+                    parts.push(value[start..index].trim());
+                    start = index + c.len_utf8();
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.push(value[start..].trim());
+    parts
+}
+
+fn link_parameter(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !value.starts_with('"') {
+        return Some(value.to_owned());
+    }
+    let quoted = value.strip_prefix('"')?.strip_suffix('"')?;
+    let mut decoded = String::new();
+    let mut characters = quoted.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            decoded.push(characters.next()?);
+        } else if character == '"' {
+            return None;
+        } else {
+            decoded.push(character);
+        }
+    }
+    Some(decoded)
+}
+
+fn alternate_certificate_links(
+    headers: &reqwest::header::HeaderMap,
+    base: &url::Url,
+) -> Vec<String> {
+    let mut links = Vec::new();
+    for header in headers.get_all(reqwest::header::LINK) {
+        let Ok(value) = header.to_str() else {
+            continue;
+        };
+        for link in split_link_parts(value, ',') {
+            let parts = split_link_parts(link, ';');
+            let Some(target) = parts
+                .first()
+                .and_then(|part| part.strip_prefix('<'))
+                .and_then(|part| part.strip_suffix('>'))
+            else {
+                continue;
+            };
+            let mut alternate = false;
+            let mut anchored = false;
+            for parameter in parts.iter().skip(1) {
+                let Some((name, value)) = parameter.split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("anchor") {
+                    anchored = true;
+                }
+                if name.trim().eq_ignore_ascii_case("rel") {
+                    alternate = link_parameter(value).is_some_and(|relations| {
+                        relations
+                            .split_ascii_whitespace()
+                            .any(|relation| relation.eq_ignore_ascii_case("alternate"))
+                    });
+                }
+            }
+            if !alternate || anchored {
+                continue;
+            }
+            let Ok(mut target) = base.join(target) else {
+                continue;
+            };
+            if !matches!(target.scheme(), "http" | "https")
+                || !target.username().is_empty()
+                || target.password().is_some()
+            {
+                continue;
+            }
+            target.set_fragment(None);
+            links.push(target.to_string());
+            if links.len() == MAX_ALTERNATE_CHAINS {
+                return links;
+            }
+        }
+    }
+    links
+}
 
 // ---------------------------------------------------------------------------
 // ACME Directory
@@ -347,12 +499,32 @@ pub struct AccountResponse {
 /// ACME account registration. The binding ties the ACME account to an
 /// existing account on the CA's system using a key identifier and an
 /// HMAC key provided out-of-band by the CA.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExternalAccountBinding {
     /// The key ID provided by the CA.
     pub kid: String,
     /// The HMAC key (raw bytes) provided by the CA.
     pub hmac_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExternalAccountBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalAccountBinding")
+            .field("kid", &self.kid)
+            .field("hmac_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Optional parameters sent to the CA when creating an order.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OrderOptions {
+    #[serde(rename = "notBefore", skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    #[serde(rename = "notAfter", skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +757,11 @@ impl AcmeClient {
     /// The CA URL must use HTTPS. HTTP is only allowed for localhost,
     /// `127.0.0.1`, `[::1]`, and `.internal` hosts (for testing/development).
     pub async fn new(directory_url: &str) -> Result<Self> {
+        Self::with_http_client(directory_url, crate::http::client()?.clone()).await
+    }
+
+    /// Create a client using a caller-configured transport, including custom CA roots.
+    pub async fn with_http_client(directory_url: &str, http: reqwest::Client) -> Result<Self> {
         // Validate that the directory URL uses HTTPS, unless it is a local
         // or internal address.
         if let Ok(parsed) = url::Url::parse(directory_url)
@@ -607,8 +784,6 @@ impl AcmeClient {
         }
 
         debug!(directory_url, "fetching ACME directory");
-
-        let http = crate::http::client()?.clone();
 
         // Fetch directory.
         let resp = http
@@ -963,11 +1138,25 @@ impl AcmeClient {
         account_url: &str,
         domains: &[String],
     ) -> Result<(AcmeOrder, String)> {
+        self.new_order_with_options(account_key, account_url, domains, &OrderOptions::default())
+            .await
+    }
+
+    /// Create an order including a profile and requested validity bounds.
+    pub async fn new_order_with_options(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        domains: &[String],
+        options: &OrderOptions,
+    ) -> Result<(AcmeOrder, String)> {
         debug!(?domains, "creating new ACME order");
 
         #[derive(Serialize)]
         struct NewOrderRequest {
             identifiers: Vec<AcmeIdentifier>,
+            #[serde(flatten)]
+            options: OrderOptions,
         }
 
         let identifiers: Vec<AcmeIdentifier> = domains
@@ -978,7 +1167,10 @@ impl AcmeClient {
             })
             .collect();
 
-        let req = NewOrderRequest { identifiers };
+        let req = NewOrderRequest {
+            identifiers,
+            options: options.clone(),
+        };
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Order(format!("failed to serialize order request: {e}")))?;
 
@@ -1210,35 +1402,155 @@ impl AcmeClient {
     // Certificate download
     // -----------------------------------------------------------------------
 
-    /// Download the certificate chain (PEM) from the given certificate URL.
+    /// Download only the CA's default certificate chain (PEM).
+    /// The response body is limited to 1 MiB. Alternate links are not followed.
     pub async fn download_certificate(
         &self,
         account_key: &PrivateKey,
         account_url: &str,
         cert_url: &str,
     ) -> Result<String> {
-        debug!(cert_url, "downloading certificate");
+        self.download_certificate_response(account_key, account_url, cert_url)
+            .await
+            .map(|(pem, _)| pem)
+    }
 
-        let resp = self
+    /// Download the default PEM chain and up to `max_alternates` alternatives
+    /// advertised with `Link: ...; rel="alternate"`. The request count is capped
+    /// at eight alternates even if a larger limit is supplied. Each response is
+    /// limited to 1 MiB, duplicate/cyclic URLs are fetched at most once, and
+    /// failed or malformed alternatives are ignored. Alternatives must contain
+    /// the same leaf certificate as the default chain. Chain order is preserved.
+    /// All alternate requests share a five-second budget after the default has
+    /// arrived; expiration returns the chains already downloaded.
+    pub async fn download_certificate_chains(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+        max_alternates: usize,
+    ) -> Result<Vec<String>> {
+        self.download_certificate_chains_with_deadline(
+            account_key,
+            account_url,
+            cert_url,
+            max_alternates,
+            None,
+        )
+        .await
+    }
+
+    /// Reserve time to return an already-issued certificate before the caller's
+    /// overall issuance deadline. The deadline spans all prior work and retries.
+    pub(crate) async fn download_certificate_chains_with_deadline(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+        max_alternates: usize,
+        issuance_deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
+        let limit = max_alternates.min(MAX_ALTERNATE_CHAINS);
+        let (default, links) = self
+            .download_certificate_response(account_key, account_url, cert_url)
+            .await?;
+        let now = Instant::now();
+        // Discovery is optional: spend at most half of the caller's remaining
+        // time, leaving the other half for chain selection and returning the
+        // valid default. This also handles time already spent before download.
+        let discovery_budget = issuance_deadline.map_or(MAX_ALTERNATE_DISCOVERY_TIME, |deadline| {
+            MAX_ALTERNATE_DISCOVERY_TIME.min(deadline.saturating_duration_since(now) / 2)
+        });
+        let discovery_deadline = now + discovery_budget;
+        let leaf = certificate_chain_leaf(&default)?;
+        let mut chains = vec![default];
+        let mut seen = HashSet::new();
+        if let Ok(mut primary) = url::Url::parse(cert_url) {
+            primary.set_fragment(None);
+            seen.insert(primary.to_string());
+        }
+        let mut pending = VecDeque::new();
+        enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
+        while let Some(url) = pending.pop_front() {
+            if Instant::now() >= discovery_deadline {
+                break;
+            }
+            let download = tokio::time::timeout_at(
+                discovery_deadline,
+                self.download_certificate_response(account_key, account_url, &url),
+            )
+            .await;
+            match download {
+                Ok(Ok((pem, links))) => match certificate_chain_leaf(&pem) {
+                    Ok(alternate_leaf) if alternate_leaf == leaf => {
+                        if !chains.contains(&pem) {
+                            chains.push(pem);
+                        }
+                        enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
+                    }
+                    _ => warn!(
+                        url,
+                        "ignoring alternate chain with an invalid or different leaf certificate"
+                    ),
+                },
+                Ok(Err(error)) => {
+                    warn!(url, %error, "ignoring unavailable alternate certificate chain")
+                }
+                Err(_) => {
+                    debug!(
+                        chain_count = chains.len(),
+                        "alternate discovery budget exhausted; keeping downloaded chains"
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(chains)
+    }
+
+    async fn download_certificate_response(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+    ) -> Result<(String, Vec<String>)> {
+        debug!(cert_url, "downloading certificate");
+        let mut response = self
             .acme_post(account_key, Some(account_url), cert_url, None)
             .await?;
-
-        if !resp.status().is_success() {
+        if !response.status().is_success() {
             return Err(AcmeError::Certificate(format!(
                 "certificate download returned HTTP {}",
-                resp.status()
+                response.status()
             ))
             .into());
         }
-
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| AcmeError::Certificate(format!("failed to read certificate body: {e}")))?;
-
-        debug!(cert_url, len = body.len(), "certificate downloaded");
-
-        Ok(body)
+        let links = alternate_certificate_links(response.headers(), response.url());
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_CERTIFICATE_CHAIN_BYTES as u64)
+        {
+            return Err(
+                AcmeError::Certificate("certificate response exceeds 1 MiB limit".into()).into(),
+            );
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            AcmeError::Certificate(format!("failed to read certificate body: {error}"))
+        })? {
+            if chunk.len() > MAX_CERTIFICATE_CHAIN_BYTES - body.len() {
+                return Err(AcmeError::Certificate(
+                    "certificate response exceeds 1 MiB limit".into(),
+                )
+                .into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let pem = String::from_utf8(body).map_err(|error| {
+            AcmeError::Certificate(format!("certificate response is not UTF-8 PEM: {error}"))
+        })?;
+        debug!(cert_url, len = pem.len(), "certificate downloaded");
+        Ok((pem, links))
     }
 
     // -----------------------------------------------------------------------
@@ -1309,13 +1621,13 @@ impl AcmeClient {
     /// as a base64url-encoded string: `base64url(AKI).base64url(serial)`.
     /// See [`ari_cert_id`] for computing this value.
     ///
-    /// Performs a POST-as-GET to `{directory.renewalInfo}/{cert_id}`. If the
+    /// Performs an unauthenticated GET to `{directory.renewalInfo}/{cert_id}`. If the
     /// directory does not advertise a `renewalInfo` endpoint, returns a
     /// default (empty) [`RenewalInfo`].
     pub async fn get_renewal_info(
         &self,
-        account_key: &PrivateKey,
-        account_url: &str,
+        _account_key: &PrivateKey,
+        _account_url: &str,
         cert_id: &str,
     ) -> Result<RenewalInfo> {
         let renewal_info_base = match &self.directory.renewal_info {
@@ -1330,8 +1642,11 @@ impl AcmeClient {
         debug!(url = %url, "fetching ACME Renewal Information (ARI)");
 
         let resp = self
-            .acme_post(account_key, Some(account_url), &url, None)
-            .await?;
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AcmeError::Certificate(format!("ARI request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1345,13 +1660,34 @@ impl AcmeClient {
             return Ok(RenewalInfo::default());
         }
 
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|value| {
+                value.parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| {
+                            (date.with_timezone(&Utc) - Utc::now()).num_seconds().max(0) as u64
+                        })
+                })
+            });
         let body = resp.bytes().await.map_err(|e| {
             AcmeError::Certificate(format!("failed to read ARI response body: {e}"))
         })?;
 
-        let info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
+        let mut info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
             AcmeError::Certificate(format!("failed to parse ARI response JSON: {e}"))
         })?;
+        info.retry_after = retry_after;
+        if let Some(window) = &info.suggested_window {
+            let start = DateTime::parse_from_rfc3339(&window.start).ok();
+            let end = DateTime::parse_from_rfc3339(&window.end).ok();
+            if !matches!((start, end), (Some(start), Some(end)) if start < end) {
+                return Err(AcmeError::Certificate("ARI renewal window is invalid".into()).into());
+            }
+        }
 
         debug!(?info, "ACME Renewal Information fetched");
 
@@ -1373,9 +1709,8 @@ impl AcmeClient {
 /// ```
 ///
 /// where AKI is the Authority Key Identifier extension's `keyIdentifier`
-/// value and serial is the certificate's serial number (DER integer bytes,
-/// with leading zero-padding stripped per the spec — the raw big-endian
-/// unsigned representation).
+/// value and serial is the certificate's DER INTEGER content, including any
+/// leading zero byte required to keep the integer positive.
 ///
 /// # Errors
 ///
@@ -1407,28 +1742,13 @@ pub fn ari_cert_id(cert_der: &[u8]) -> Result<String> {
         )
     })?;
 
-    // Extract serial number bytes. `x509_parser` gives us the serial as a
-    // BigUint; we want the raw unsigned big-endian bytes.
+    // RFC 9773 encodes the DER INTEGER content, including its sign padding.
     let serial_bytes = cert.raw_serial();
-
-    // Strip leading zero byte(s) that serve as sign padding in the DER
-    // INTEGER encoding. RFC 9773 requires the unsigned representation.
-    let serial_bytes = strip_leading_zeros(serial_bytes);
 
     let aki_b64 = URL_SAFE_NO_PAD.encode(&aki_bytes);
     let serial_b64 = URL_SAFE_NO_PAD.encode(serial_bytes);
 
     Ok(format!("{aki_b64}.{serial_b64}"))
-}
-
-/// Strip leading zero bytes from a byte slice (used for DER INTEGER
-/// sign-padding removal).
-fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
-    let mut b = bytes;
-    while b.len() > 1 && b[0] == 0 {
-        b = &b[1..];
-    }
-    b
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,6 +1820,21 @@ fn extract_nonce(resp: &reqwest::Response) -> Option<String> {
 mod tests {
     use super::*;
     use crate::crypto::{KeyType, generate_private_key};
+
+    #[test]
+    fn ari_identifier_keeps_der_serial_sign_padding() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let issuer = rcgen::Issuer::new(params, key);
+        let mut leaf = rcgen::CertificateParams::new(vec!["ari.example.com".into()]).unwrap();
+        leaf.use_authority_key_identifier_extension = true;
+        leaf.serial_number = Some(rcgen::SerialNumber::from_slice(&[0x87, 0x65, 0x43, 0x21]));
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let cert = leaf.signed_by(&leaf_key, &issuer).unwrap();
+        let id = ari_cert_id(cert.der()).unwrap();
+        assert_eq!(id.split_once('.').unwrap().1, "AIdlQyE");
+    }
 
     #[test]
     fn test_jwk_from_key() {

@@ -241,6 +241,18 @@ pub async fn check_dns_propagation(
     timeout: Duration,
     interval: Duration,
 ) -> Result<bool> {
+    check_dns_propagation_with_resolvers(fqdn, expected_value, timeout, interval, None).await
+}
+
+/// Check propagation using explicitly selected IP address and port pairs.
+pub async fn check_dns_propagation_with_resolvers(
+    fqdn: &str,
+    expected_value: &str,
+    timeout: Duration,
+    interval: Duration,
+    resolvers: Option<&[String]>,
+) -> Result<bool> {
+    let resolver = propagation_resolver(resolvers)?;
     let fqdn_normalized = to_fqdn(fqdn);
     let lookup_name = from_fqdn(&fqdn_normalized);
     let deadline = Instant::now() + timeout;
@@ -252,28 +264,54 @@ pub async fn check_dns_propagation(
     );
 
     loop {
+        // Propagation checks must observe new authoritative data rather than
+        // retaining the previous TXT value or NXDOMAIN for its full TTL.
+        resolver.clear_cache();
         // Perform a real DNS TXT record lookup via hickory-resolver.
-        match try_lookup_txt(&lookup_name, expected_value).await {
-            Ok(true) => {
-                debug!(
-                    fqdn = %fqdn_normalized,
-                    "DNS propagation confirmed"
-                );
-                return Ok(true);
+        let lookup = async {
+            let response = resolver
+                .txt_lookup(&lookup_name)
+                .await
+                .map_err(|e| Error::Other(format!("DNS TXT lookup failed: {e}")))?;
+            Ok::<_, Error>(response.answers().iter().any(|record| {
+                match &record.data {
+                    hickory_resolver::proto::rr::RData::TXT(txt) => txt
+                        .txt_data
+                        .iter()
+                        .flat_map(|part| part.iter().copied())
+                        .eq(expected_value.bytes()),
+                    _ => false,
+                }
+            }))
+        };
+        match tokio::time::timeout_at(deadline, lookup).await {
+            Err(_) => {
+                return Err(Error::Timeout(format!(
+                    "DNS propagation check for {fqdn_normalized} timed out"
+                )));
             }
-            Ok(false) => {
-                debug!(
-                    fqdn = %fqdn_normalized,
-                    "TXT record not yet propagated, will retry"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    fqdn = %fqdn_normalized,
-                    error = %e,
-                    "DNS lookup error during propagation check"
-                );
-            }
+            Ok(result) => match result {
+                Ok(true) => {
+                    debug!(
+                        fqdn = %fqdn_normalized,
+                        "DNS propagation confirmed"
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    debug!(
+                        fqdn = %fqdn_normalized,
+                        "TXT record not yet propagated, will retry"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        fqdn = %fqdn_normalized,
+                        error = %e,
+                        "DNS lookup error during propagation check"
+                    );
+                }
+            },
         }
 
         if Instant::now() >= deadline {
@@ -282,44 +320,42 @@ pub async fn check_dns_propagation(
             )));
         }
 
-        tokio::time::sleep(interval).await;
+        tokio::time::sleep_until(std::cmp::min(Instant::now() + interval, deadline)).await;
     }
 }
 
 /// Perform a real DNS TXT record lookup for `name` using hickory-resolver
 /// and check if any record matches `expected_value`.
-async fn try_lookup_txt(name: &str, expected_value: &str) -> std::result::Result<bool, String> {
-    let txt_records = lookup_txt(name).await.map_err(|e| format!("{e}"))?;
-    for record in &txt_records {
-        // TXT records may be returned with surrounding quotes; strip them.
-        let cleaned = record.trim_matches('"');
-        if cleaned == expected_value {
-            return Ok(true);
+fn propagation_resolver(resolvers: Option<&[String]>) -> Result<TokioResolver> {
+    if let Some(addresses) = resolvers {
+        use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig};
+        if addresses.is_empty() {
+            return Err(Error::Config("DNS resolver list cannot be empty".into()));
         }
+        let servers = addresses
+            .iter()
+            .map(|address| {
+                let address: std::net::SocketAddr = address
+                    .parse()
+                    .map_err(|e| Error::Config(format!("invalid DNS resolver {address:?}: {e}")))?;
+                let mut udp = ConnectionConfig::udp();
+                udp.port = address.port();
+                let mut tcp = ConnectionConfig::tcp();
+                tcp.port = address.port();
+                Ok(NameServerConfig::new(address.ip(), true, vec![udp, tcp]))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return TokioResolver::builder_with_config(
+            ResolverConfig::from_parts(None, Vec::new(), servers),
+            hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+        )
+        .build()
+        .map_err(|e| Error::Config(format!("failed to build DNS resolver: {e}")));
     }
-    Ok(false)
-}
-
-/// Look up TXT records for the given FQDN using hickory-resolver.
-///
-/// Returns a list of TXT record string values.
-async fn lookup_txt(fqdn: &str) -> Result<Vec<String>> {
-    let resolver = TokioResolver::builder_tokio()
+    TokioResolver::builder_tokio()
         .map_err(|e| Error::Other(format!("failed to create DNS resolver: {e}")))?
         .build()
-        .map_err(|e| Error::Other(format!("failed to build DNS resolver: {e}")))?;
-    let response = resolver
-        .txt_lookup(fqdn)
-        .await
-        .map_err(|e| Error::Other(format!("DNS TXT lookup failed for {fqdn}: {e}")))?;
-    Ok(response
-        .answers()
-        .iter()
-        .filter_map(|record| match &record.data {
-            hickory_resolver::proto::rr::RData::TXT(txt) => Some(txt.to_string()),
-            _ => None,
-        })
-        .collect())
+        .map_err(|e| Error::Other(format!("failed to build DNS resolver: {e}")))
 }
 
 // ---------------------------------------------------------------------------
