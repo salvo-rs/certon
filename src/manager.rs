@@ -345,13 +345,23 @@ impl CertManagerBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if no `storage` has been provided.
+    /// Panics if storage is missing or policy settings are invalid. Use
+    /// [`Self::try_build`] for settings obtained from external configuration.
     pub fn build(self) -> CertManager {
+        self.try_build().expect("invalid CertManager configuration")
+    }
+
+    /// Build a manager, returning configuration errors before any work starts.
+    pub fn try_build(self) -> Result<CertManager> {
         use crate::cache::CacheOptions;
 
-        let storage = self.storage.expect(
-            "CertManager requires a Storage implementation -- call .storage() on the builder",
-        );
+        self.policy.validate()?;
+        let storage = self.storage.ok_or_else(|| {
+            Error::Config(
+                "CertManager requires a Storage implementation -- call .storage() on the builder"
+                    .into(),
+            )
+        })?;
 
         let cache = self
             .cache
@@ -363,7 +373,7 @@ impl CertManagerBuilder {
             .certificates
             .unwrap_or_else(|| Arc::new(KeyValueCertStore::new(Arc::clone(&storage))));
 
-        CertManager {
+        Ok(CertManager {
             policy: self.policy,
             certificates,
             issuers,
@@ -375,7 +385,7 @@ impl CertManagerBuilder {
             cert_selection: self.cert_selection,
             job_queue: Arc::new(JobQueue::certificate_jobs("cert_management")),
             background_retry: self.background_retry,
-        }
+        })
     }
 }
 
