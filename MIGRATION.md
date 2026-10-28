@@ -366,3 +366,30 @@ with alternate chains sharing one lookup and quarantine operation.
 Cancelling a refresh or stopping maintenance drops all in-flight read futures;
 the scanner spawns no detached work. Renewal and OCSP refresh intervals are
 unchanged.
+
+## Certificate revocation target selection
+
+`CertManager::revoke(domain, reason)` now selects the stored resource by time
+validity, then latest `notBefore` and `notAfter`, instead of taking the first
+configured issuer with a resource. After renewal falls back from CA A to CA B,
+the newer B resource is selected even when A's older snapshot remains stored.
+The selected issuer/leaf is rechecked after acquiring the shared leaf lock.
+
+Pending and confirmed revocation markers do not affect this ranking: writing
+intent alone cannot redirect a retry to an older backup. A confirmed marker
+continues to skip the provider call during cleanup retries. Every invocation
+selects from current storage and validity state; if another operation replaces
+resources or their validity changes, a later call can target a different leaf.
+
+For an explicit issuer, use
+`manager.revoke_from_issuer(domain, &issuer.issuer_key(), reason).await`.
+This retains the old ability to revoke an issuer's certificate even when its
+private key is damaged or its SAN/time validity is unsuitable for serving.
+Other issuers are neither consulted nor used as fallbacks for this operation.
+Unknown issuers, unsupported selected providers and backend failures return
+errors. This binds the issuer, not an overwritten historical leaf.
+
+Both methods revoke one selected stored resource. They do not revoke every
+issuer resource or an independently imported cache sibling, close existing TLS
+sessions, or invalidate exported keys. Applications that require a domain-wide
+shutdown must also stop issuance and explicitly handle all their credentials.

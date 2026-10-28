@@ -1554,7 +1554,17 @@ impl CertManager {
 impl CertManager {
     /// Revoke the certificate for `domain`.
     ///
-    /// Revoke the first stored resource found in issuer order. Before calling
+    /// Select the stored resource using the same validity/latest-issuance
+    /// preference as certificate loading, independent of issuer order. Pending
+    /// or confirmed markers do not lower its rank: recording intent alone cannot
+    /// redirect a retry to an older backup. This revokes one stored resource, not every
+    /// certificate that can serve this domain. Use [`Self::revoke_from_issuer`]
+    /// to target a particular issuer's resource.
+    ///
+    /// Every invocation selects from current storage under the lifecycle lock;
+    /// if resources or their validity state have changed, a new call may select
+    /// a different leaf.
+    /// Before calling
     /// the provider, persist revocation intent in the shared [`Storage`] and
     /// quarantine this leaf in the local cache. Provider errors do not undo
     /// that intent. After confirmation, delete the matching stored resource;
@@ -1571,12 +1581,45 @@ impl CertManager {
     /// does not close existing TLS sessions or invalidate separately cloned
     /// signing keys. A provider without [`crate::Revoker`] support is an error.
     pub async fn revoke(&self, domain: &str, reason: Option<u8>) -> Result<()> {
+        self.revoke_selected(domain, None, reason).await
+    }
+
+    /// Revoke the resource currently stored for `domain` under an exact
+    /// configured `issuer_key`. Other issuers are not consulted or used as
+    /// fallbacks, including when the selected provider is unavailable or does
+    /// not support revocation.
+    ///
+    /// Unlike default target selection, this recovery/cleanup path needs only a
+    /// parseable leaf certificate: an expired certificate, incorrect SAN or
+    /// damaged private key does not prevent provider-side revocation.
+    /// Ownership, locking, persisted intent and cleanup semantics are the same
+    /// as [`Self::revoke`]. This selects an issuer, not an immutable historical
+    /// leaf: if that issuer's resource was replaced, a new call targets its
+    /// current resource.
+    pub async fn revoke_from_issuer(
+        &self,
+        domain: &str,
+        issuer_key: &str,
+        reason: Option<u8>,
+    ) -> Result<()> {
+        self.revoke_selected(domain, Some(issuer_key.to_owned()), reason)
+            .await
+    }
+
+    async fn revoke_selected(
+        &self,
+        domain: &str,
+        issuer_key: Option<String>,
+        reason: Option<u8>,
+    ) -> Result<()> {
         let worker = self.detached("revocation");
         let domain = domain.to_lowercase();
         // Dropping the caller's future must not interrupt an irreversible CA
         // operation between acknowledgement and local invalidation/cleanup.
         tokio::spawn(async move {
-            let result = worker.revoke_locked(&domain, reason).await;
+            let result = worker
+                .revoke_locked(&domain, issuer_key.as_deref(), reason)
+                .await;
             if let Err(error) = &result {
                 error!(%domain, %error, "certificate revocation failed");
             }
@@ -1586,26 +1629,86 @@ impl CertManager {
         .map_err(|error| Error::Other(format!("revocation task failed: {error}")))?
     }
 
-    async fn revoke_locked(&self, domain: &str, reason: Option<u8>) -> Result<()> {
+    async fn select_revocation_resource(
+        &self,
+        domain: &str,
+        issuer_key: Option<&str>,
+    ) -> Result<(Arc<dyn CertIssuer>, CertificateResource)> {
+        let now = chrono::Utc::now();
+        let mut selected = None;
+        let mut validation_errors = Vec::new();
+        let mut found_issuer = false;
+        for issuer in &self.issuers {
+            let key = issuer.issuer_key();
+            if issuer_key.is_some_and(|wanted| wanted != key) {
+                continue;
+            }
+            found_issuer = true;
+            // Default selection checks all configured stores: backend errors
+            // must not quietly redirect a destructive operation to another CA.
+            let Some(resource) = self.certificates.load(&key, domain).await? else {
+                continue;
+            };
+            if issuer_key.is_some() {
+                crate::storage::resource_leaf_hash(&resource)?;
+                return Ok((Arc::clone(issuer), resource));
+            }
+            let cert = match Self::parse_managed_certificate(&resource, domain) {
+                Ok(cert) => cert,
+                Err(error) => {
+                    validation_errors.push(format!("{key}: {error}"));
+                    continue;
+                }
+            };
+            // Do not use the normal loader's !has_intent rank component:
+            // writing our pending marker must not select an older backup on
+            // retry, and confirmed cleanup retries must skip a second CA call.
+            let rank = (
+                cert.not_before <= now && !cert.expired(),
+                cert.not_before,
+                cert.not_after,
+            );
+            if selected.as_ref().is_none_or(|(best, _)| rank > *best) {
+                selected = Some((rank, (Arc::clone(issuer), resource)));
+            }
+        }
+        if let Some((_, (issuer, resource))) = selected {
+            Ok((issuer, resource))
+        } else if let Some(issuer_key) = issuer_key {
+            Err(Error::Config(if found_issuer {
+                format!(
+                    "no certificate found in storage for '{domain}' under issuer '{issuer_key}'"
+                )
+            } else {
+                format!("issuer '{issuer_key}' is not configured")
+            }))
+        } else if !validation_errors.is_empty() {
+            Err(Error::Config(format!(
+                "no valid revocation target for '{domain}': {}",
+                validation_errors.join("; ")
+            )))
+        } else {
+            Err(Error::Config(format!(
+                "no certificate found in storage for '{domain}' from any configured issuer"
+            )))
+        }
+    }
+
+    async fn revoke_locked(
+        &self,
+        domain: &str,
+        selected_issuer: Option<&str>,
+        reason: Option<u8>,
+    ) -> Result<()> {
         let _lock = acquire(
             self.storage.clone(),
             &Self::lock_key(CERT_ISSUE_LOCK_OP, domain),
         )
         .await?;
         loop {
-            let mut selected = None;
-            for issuer in &self.issuers {
-                if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await?
-                {
-                    selected = Some((issuer, resource));
-                    break;
-                }
-            }
-            let Some((issuer, resource)) = selected else {
-                return Err(Error::Config(format!(
-                    "no certificate found in storage for '{domain}' from any configured issuer"
-                )));
-            };
+            let (issuer, resource) = self
+                .select_revocation_resource(domain, selected_issuer)
+                .await?;
             let issuer_key = issuer.issuer_key();
             let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
             let leaf_lock = acquire(
@@ -1613,12 +1716,12 @@ impl CertManager {
                 &format!("certificate_leaf_{leaf_hash}"),
             )
             .await?;
-            let current = self.certificates.load(&issuer_key, domain).await?;
-            let Some(resource) = current else {
-                drop(leaf_lock);
-                continue;
-            };
-            if crate::storage::resource_leaf_hash(&resource)? != leaf_hash {
+            let (current_issuer, resource) = self
+                .select_revocation_resource(domain, selected_issuer)
+                .await?;
+            if current_issuer.issuer_key() != issuer_key
+                || crate::storage::resource_leaf_hash(&resource)? != leaf_hash
+            {
                 drop(leaf_lock);
                 continue;
             }
@@ -1628,6 +1731,7 @@ impl CertManager {
                 ))
             })?;
             let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
+            info!(domain, issuer = %issuer_key, %leaf_hash, "selected stored certificate for revocation");
             let marker = crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash).await?;
             if marker.is_none() {
                 crate::storage::store_revocation(self.storage.as_ref(), &leaf_hash, false).await?;
