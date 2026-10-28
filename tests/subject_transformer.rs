@@ -88,7 +88,7 @@ struct Issuer {
     calls: AtomicUsize,
     entered: tokio::sync::Notify,
     release: tokio::sync::Semaphore,
-    failures: AtomicUsize,
+    failures: Mutex<usize>,
     subjects: Mutex<Vec<Vec<String>>>,
 }
 
@@ -99,12 +99,12 @@ impl CertIssuer for Issuer {
         self.subjects.lock().unwrap().push(domains.to_vec());
         self.entered.notify_one();
         self.release.acquire().await.unwrap().forget();
-        if self
-            .failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
         {
-            return Err(certon::Error::Other("temporary CA failure".into()));
+            let mut failures = self.failures.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(certon::Error::Other("temporary CA failure".into()));
+            }
         }
         let (_, csr) =
             x509_parser::certification_request::X509CertificationRequest::from_der(csr).unwrap();
@@ -158,7 +158,7 @@ impl Fixture {
             calls: AtomicUsize::new(0),
             entered: tokio::sync::Notify::new(),
             release: tokio::sync::Semaphore::new(0),
-            failures: AtomicUsize::new(0),
+            failures: Mutex::new(0),
             subjects: Mutex::new(Vec::new()),
         });
         let transforms = Arc::new(AtomicUsize::new(0));
@@ -354,7 +354,7 @@ async fn queued_retries_keep_one_canonical_identity_but_resubmission_transforms_
             Ok("*.CHANGED.EXAMPLE.NET".into())
         }
     }));
-    fixture.issuer.failures.store(1, Ordering::SeqCst);
+    *fixture.issuer.failures.lock().unwrap() = 1;
     fixture.issuer.release.add_permits(3);
     fixture
         .manager
@@ -424,7 +424,7 @@ async fn queued_aliases_are_deduplicated_before_taking_lifecycle_locks() {
 #[tokio::test(start_paused = true)]
 async fn direct_background_obtain_retries_without_transforming_again() {
     let fixture = Fixture::new();
-    fixture.issuer.failures.store(1, Ordering::SeqCst);
+    *fixture.issuer.failures.lock().unwrap() = 1;
     fixture.issuer.release.add_permits(2);
     // File I/O and key generation use the blocking pool. Prevent auto-advance
     // from consuming their virtual deadline while waiting for real work.
