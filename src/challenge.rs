@@ -124,7 +124,9 @@ pub(crate) fn key(prefix: &str, domain: &str, token: &str) -> String {
 }
 
 pub(crate) fn legacy_compatible(domain: &str) -> bool {
-    safe_key(domain) == domain
+    // Canonical domains are ASCII. The old "<domain>.json" basename must
+    // also fit the portable 255-byte filesystem component limit.
+    domain.len() <= 250 && safe_key(domain) == domain
 }
 
 pub(crate) fn legacy_key(prefix: &str, domain: &str) -> String {
@@ -177,7 +179,8 @@ pub(crate) async fn load(
             Ok(Some(entry.key_auth))
         }
         Err(Error::Storage(StorageError::NotFound(_))) => {
-            // Legacy sanitization is ambiguous for IPv6: do not accept aliases.
+            // Skip ambiguous aliases and legacy filenames beyond the portable
+            // component limit; neither case may be used by v2 cleanup either.
             if !legacy_compatible(domain) {
                 return Ok(None);
             }

@@ -134,7 +134,10 @@ Distributed HTTP-01 challenge storage:
   with `.with_domain("example.com")` to serve Host-aware requests. The legacy
   path-only API still supports local maps; bind a domain to enable storage.
 - Readers also accept the previous `<safe-domain>.json` token map for canonical
-  DNS names and IPv4 addresses. Ambiguous legacy IPv6 keys are not accepted.
+  DNS names and IPv4 addresses up to 250 ASCII bytes, leaving five bytes for
+  `.json` within a portable 255-byte filename component. Longer domains use v2
+  only; impossible legacy filenames are skipped during both reads and cleanup.
+  Ambiguous legacy IPv6 keys are not accepted.
   Legacy cleanup preserves sibling tokens under a storage lock and reports
   backend or corrupt-JSON errors instead of treating them as empty data.
   Stop old distributed writers before upgrading the cluster: old writers do

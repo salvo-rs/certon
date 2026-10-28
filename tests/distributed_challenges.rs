@@ -534,33 +534,115 @@ async fn long_domain_and_issuer_prefix_can_present_and_cleanup() {
         "c".repeat(63)
     );
     assert_eq!(domain.len(), 197);
-    for prefix in [
-        "acme/acme-v02.api.letsencrypt.org-directory".to_string(),
-        format!("issuer-{}", "p".repeat(220)),
-    ] {
-        let solver =
-            DistributedSolver::with_prefix(Box::new(Noop), storage.clone(), prefix.clone());
-        let handler =
-            HttpChallengeHandler::with_prefix(Arc::default(), Some(storage.clone()), prefix);
-        solver
-            .present(&domain, "Token", "Token.auth")
-            .await
-            .unwrap();
-        assert_eq!(
-            handler
-                .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
-                .await,
-            Some((200, "Token.auth".into()))
-        );
-        solver
-            .cleanup(&domain, "Token", "Token.auth")
-            .await
-            .unwrap();
-        assert_eq!(
-            handler
-                .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
-                .await,
-            Some((404, String::new()))
-        );
+    let maximum_domain = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(maximum_domain.len(), 253);
+    for domain in [domain, maximum_domain] {
+        for prefix in [
+            "acme/acme-v02.api.letsencrypt.org-directory".to_string(),
+            format!("issuer-{}", "p".repeat(220)),
+        ] {
+            let solver =
+                DistributedSolver::with_prefix(Box::new(Noop), storage.clone(), prefix.clone());
+            let handler =
+                HttpChallengeHandler::with_prefix(Arc::default(), Some(storage.clone()), prefix);
+            solver
+                .present(&domain, "Token", "Token.auth")
+                .await
+                .unwrap();
+            assert_eq!(
+                handler
+                    .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+                    .await,
+                Some((200, "Token.auth".into()))
+            );
+            solver
+                .cleanup(&domain, "Token", "Token.auth")
+                .await
+                .unwrap();
+            assert_eq!(
+                handler
+                    .handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+                    .await,
+                Some((404, String::new()))
+            );
+        }
     }
+}
+
+#[tokio::test]
+async fn maximum_domain_without_v2_is_not_an_invalid_legacy_filename_error() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let domain = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61)
+    );
+    assert_eq!(domain.len(), 253);
+    DistributedSolver::new(Box::new(Noop), storage.clone())
+        .present("other.example.com", "Other", "Other.auth")
+        .await
+        .unwrap();
+    let handler = HttpChallengeHandler::new(Arc::default(), Some(storage));
+    assert_eq!(
+        handler
+            .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+            .await
+            .unwrap(),
+        Some((404, String::new()))
+    );
+}
+
+#[tokio::test]
+async fn legacy_domain_at_portable_filename_boundary_remains_supported() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let domain = format!(
+        "{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(58)
+    );
+    assert_eq!(domain.len(), 250);
+    // Seed an existing legacy file directly: this exercises the reader's
+    // 255-byte basename boundary independently of atomic-writer temp names.
+    tokio::fs::create_dir(directory.path().join("challenge_tokens"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        directory
+            .path()
+            .join(format!("challenge_tokens/{domain}.json")),
+        br#"{"Token":"Token.legacy"}"#,
+    )
+    .await
+    .unwrap();
+    let handler = HttpChallengeHandler::new(Arc::default(), Some(storage.clone()));
+    assert_eq!(
+        handler
+            .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+            .await
+            .unwrap(),
+        Some((200, "Token.legacy".into()))
+    );
+    DistributedSolver::new(Box::new(Noop), storage)
+        .cleanup(&domain, "Token", "Token.legacy")
+        .await
+        .unwrap();
+    assert_eq!(
+        handler
+            .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
+            .await
+            .unwrap(),
+        Some((404, String::new()))
+    );
 }
