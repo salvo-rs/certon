@@ -1,0 +1,50 @@
+name: Dependency policy
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**.rs'
+      - 'deny*.toml'
+      - 'SECURITY.md'
+      - '.github/workflows/security.yml'
+      - '.github/scripts/check-rsa-exception.py'
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**.rs'
+      - 'deny*.toml'
+      - 'SECURITY.md'
+      - '.github/workflows/security.yml'
+      - '.github/scripts/check-rsa-exception.py'
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+      - name: Resolve the library dependency graph once
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+      - name: Install the policy checker
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit minimal ECDSA graph without exceptions
+        run: cargo deny --locked --no-default-features --features ring check advisories
+      - name: Audit full compatibility graph with the reviewed RSA exception
+        run: |
+          cargo metadata --locked --all-features --format-version 1 | python .github/scripts/check-rsa-exception.py
+          cargo deny --locked --all-features --config deny-rsa.toml check advisories
+      - name: Check licenses, sources and duplicate dependencies
+        run: cargo deny --locked --all-features check licenses bans sources

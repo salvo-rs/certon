@@ -1,0 +1,22 @@
+# No advisory exceptions: this is also the policy for the minimal ECDSA graph.
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+yanked = "deny"
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+# Mozilla trust-store data uses a data license, not a general code license.
+exceptions = [
+    { crate = "webpki-root-certs@1", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+# RustCrypto's old/new APIs and the two TLS providers require incompatible
+# transitive major versions. Report duplicates for review, rather than hide
+# whole subtrees or forbid otherwise valid feature combinations.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
