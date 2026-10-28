@@ -429,7 +429,10 @@ async fn try_reload_from_storage(
 
     // If the stored cert has a different hash AND does not need renewal,
     // it was renewed by another instance — reload it into the cache.
-    if stored_cert.hash != cached_cert.hash && !stored_cert.needs_renewal(renewal_ratio) {
+    if stored_cert.hash != cached_cert.hash
+        && !stored_cert.needs_renewal(renewal_ratio)
+        && crate::manager::CertManager::covers_certificate(&stored_cert, cached_cert)
+    {
         info!(
             domain = %domain,
             old_hash = %cached_cert.hash,
@@ -1100,8 +1103,10 @@ mod tests {
         use crate::cert_store::CertStore;
         use crate::cert_store::tests::InMemory;
         let cache = CertCache::new(CacheOptions::default());
-        let mut old = make_managed_cert(&["example.com"], "old", 1);
-        old.issuer_key = "ca".into();
+        let old_resource = cleanup_resource(true);
+        let old =
+            crate::manager::CertManager::parse_managed_certificate(&old_resource, "example.com")
+                .unwrap();
         cache.add(old.clone()).await;
         let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
         let resource = crate::CertificateResource {

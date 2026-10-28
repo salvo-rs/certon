@@ -26,6 +26,7 @@ struct TestIssuer {
     calls: AtomicUsize,
     mode: AtomicU8,
     entered: Notify,
+    requests: std::sync::Mutex<Vec<Vec<String>>>,
     name: &'static str,
     not_before_year: i32,
     not_after_year: i32,
@@ -42,6 +43,7 @@ impl TestIssuer {
             calls: AtomicUsize::new(0),
             mode: AtomicU8::new(0),
             entered: Notify::new(),
+            requests: std::sync::Mutex::new(Vec::new()),
             name: "test-ca",
             not_before_year: chrono::Utc::now().year() - 2,
             not_after_year: chrono::Utc::now().year() + 4,
@@ -51,6 +53,7 @@ impl TestIssuer {
 #[async_trait::async_trait]
 impl CertIssuer for TestIssuer {
     async fn issue(&self, csr: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+        self.requests.lock().unwrap().push(domains.to_vec());
         let serial = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let mode = self.mode.load(Ordering::SeqCst);
         if mode == 4 {
@@ -71,6 +74,8 @@ impl CertIssuer for TestIssuer {
         );
         let names = if mode == 2 {
             vec!["wrong.example.com".into()]
+        } else if mode == 5 {
+            domains[..1].to_vec()
         } else {
             domains.to_vec()
         };
@@ -109,6 +114,10 @@ fn manager(storage: Arc<dyn Storage>, issuer: Arc<TestIssuer>) -> Arc<CertManage
 }
 
 async fn handshake(manager: &CertManager, issuer: &TestIssuer) -> Vec<u8> {
+    handshake_for_domain(manager, issuer, "example.com").await
+}
+
+async fn handshake_for_domain(manager: &CertManager, issuer: &TestIssuer, domain: &str) -> Vec<u8> {
     certon::install_default_crypto_provider();
     let config = manager.server_config();
     let mut roots = rustls::RootCertStore::empty();
@@ -121,7 +130,7 @@ async fn handshake(manager: &CertManager, issuer: &TestIssuer) -> Vec<u8> {
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
     let (server, client) = tokio::join!(
         acceptor.accept(server_io),
-        connector.connect("example.com".try_into().unwrap(), client_io)
+        connector.connect(domain.to_owned().try_into().unwrap(), client_io)
     );
     server.unwrap();
     client.unwrap().get_ref().1.peer_certificates().unwrap()[0].to_vec()
@@ -272,12 +281,20 @@ async fn non_forced_renewal_keeps_an_already_cached_new_certificate() {
 }
 
 async fn certificate_resource(issuer: &TestIssuer) -> CertificateResource {
+    resource_with_names(issuer, &["example.com"], "example.com").await
+}
+
+async fn resource_with_names(
+    issuer: &TestIssuer,
+    names: &[&str],
+    lookup: &str,
+) -> CertificateResource {
     let key = certon::crypto::generate_private_key(certon::KeyType::EcdsaP256).unwrap();
-    let sans = vec!["example.com".to_owned()];
-    let csr = certon::crypto::generate_csr(&key, &sans, false).unwrap();
-    let issued = issuer.issue(&csr, &sans).await.unwrap();
+    let domains: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    let csr = certon::crypto::generate_csr(&key, &domains, false).unwrap();
+    let issued = issuer.issue(&csr, &domains).await.unwrap();
     CertificateResource {
-        sans,
+        sans: vec![lookup.to_owned()],
         certificate_pem: issued.certificate_pem,
         private_key_pem: certon::crypto::encode_private_key_pem(&key)
             .unwrap()
@@ -457,4 +474,288 @@ async fn candidate_backend_errors_propagate_after_valid_or_invalid_resources() {
             );
         }
     }
+}
+
+fn managed_resource(resource: &CertificateResource) -> certon::Certificate {
+    let mut cert =
+        certon::Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+            .unwrap();
+    cert.managed = true;
+    cert.issuer_key = resource.issuer_key.clone();
+    cert
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_publication_keeps_all_uncovered_overlap_names_serving() {
+    for multi_san_first in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+        let mut issuer = TestIssuer::new();
+        issuer.not_after_year = chrono::Utc::now().year() + 2;
+        let ab = resource_with_names(
+            &issuer,
+            &["a.example.com", "b.example.com"],
+            "b.example.com",
+        )
+        .await;
+        let ac = resource_with_names(
+            &issuer,
+            &["a.example.com", "c.example.com"],
+            "c.example.com",
+        )
+        .await;
+        let only_a = resource_with_names(&issuer, &["a.example.com"], "a.example.com").await;
+        issuer.not_after_year += 2;
+        let issuer = Arc::new(issuer);
+        let manager = manager(storage, issuer.clone());
+        manager
+            .certificates
+            .save(&issuer.issuer_key(), &ab)
+            .await
+            .unwrap();
+        manager
+            .certificates
+            .save(&issuer.issuer_key(), &ac)
+            .await
+            .unwrap();
+        let ab = managed_resource(&ab);
+        let ac = managed_resource(&ac);
+        let only_a = managed_resource(&only_a);
+        // Cover both the primary replacement and stale cleanup paths without
+        // depending on HashMap order.
+        let initial = if multi_san_first {
+            vec![ab.clone(), only_a.clone(), ac.clone()]
+        } else {
+            vec![only_a.clone(), ab.clone(), ac.clone()]
+        };
+        for cert in initial {
+            manager.cache.add(cert).await;
+        }
+        manager.obtain("a.example.com").await.unwrap();
+        let fresh = manager
+            .load_certificate("a.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(fresh.hash, only_a.hash);
+        assert!(manager.cache.get_by_hash(&only_a.hash).await.is_none());
+        assert!(manager.cache.get_by_hash(&ab.hash).await.is_some());
+        assert!(manager.cache.get_by_hash(&ac.hash).await.is_some());
+        assert_eq!(
+            handshake_for_domain(&manager, &issuer, "a.example.com").await,
+            fresh.cert_chain[0].as_ref()
+        );
+        assert_eq!(
+            handshake_for_domain(&manager, &issuer, "b.example.com").await,
+            ab.cert_chain[0].as_ref()
+        );
+        assert_eq!(
+            handshake_for_domain(&manager, &issuer, "c.example.com").await,
+            ac.cert_chain[0].as_ref()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_repairs_fresh_partial_storage_and_keeps_the_lookup_key_on_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let mut issuer = TestIssuer::new();
+    issuer.not_after_year = chrono::Utc::now().year() + 2;
+    let ab = resource_with_names(
+        &issuer,
+        &["a.example.com", "b.example.com"],
+        "a.example.com",
+    )
+    .await;
+    issuer.not_after_year += 2;
+    let ac = resource_with_names(
+        &issuer,
+        &["a.example.com", "c.example.com"],
+        "c.example.com",
+    )
+    .await;
+    let fresh_a = resource_with_names(&issuer, &["a.example.com"], "a.example.com").await;
+    let issuer = Arc::new(issuer);
+    issuer.requests.lock().unwrap().clear();
+    let renewed = Arc::new(Notify::new());
+    let event = renewed.clone();
+    let manager = Arc::new(
+        CertManager::builder()
+            .storage(storage.clone())
+            .issuers(vec![issuer.clone()])
+            .ocsp(OcspConfig {
+                disable_stapling: true,
+                ..Default::default()
+            })
+            .on_event(Arc::new(move |name, _| {
+                if name == certon::manager::EVENT_CERT_RENEWED {
+                    event.notify_one();
+                }
+                Ok(())
+            }))
+            .build(),
+    );
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &ab)
+        .await
+        .unwrap();
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &ac)
+        .await
+        .unwrap();
+    let old_ab = manager.cache_certificate("a.example.com").await.unwrap();
+    let old_ac = manager.cache_certificate("c.example.com").await.unwrap();
+    assert!(old_ab.needs_renewal(manager.policy.renewal_window_ratio));
+    assert!(!old_ac.needs_renewal(manager.policy.renewal_window_ratio));
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &fresh_a)
+        .await
+        .unwrap();
+    let current = manager
+        .load_certificate("a.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!current.needs_renewal(manager.policy.renewal_window_ratio));
+    let worker = manager.clone();
+    let renew: Arc<certon::maintain::ReasonedRenewFn> = Arc::new(move |domain, reason| {
+        let manager = worker.clone();
+        Box::pin(async move {
+            manager
+                .renew(&domain, reason == certon::maintain::RenewalReason::Revoked)
+                .await
+        })
+    });
+    let maintenance = certon::maintain::start_maintenance_with_policy(
+        manager.cache.clone(),
+        certon::MaintenanceConfig {
+            renew_check_interval: std::time::Duration::from_millis(10),
+            ocsp_check_interval: std::time::Duration::from_secs(3600),
+            ocsp: manager.policy.ocsp.clone(),
+            storage: storage.clone(),
+        },
+        renew,
+        manager.certificates.clone(),
+        manager.policy.renewal_window_ratio,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(3), renewed.notified())
+        .await
+        .expect("partial publication was not repaired");
+    manager.cache.stop_and_wait().await;
+    maintenance.await.unwrap();
+    let requests = issuer.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests,
+        [vec![
+            "a.example.com".to_owned(),
+            "b.example.com".to_owned(),
+            "c.example.com".to_owned()
+        ]]
+    );
+    let persisted = manager
+        .certificates
+        .load(&issuer.issuer_key(), "a.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.sans, ["a.example.com"]);
+    assert_eq!(manager.cache.count().await, 1);
+    let fresh = manager.cache.get_by_name("a.example.com").await.unwrap();
+    for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+        assert_eq!(
+            handshake_for_domain(&manager, &issuer, domain).await,
+            fresh.cert_chain[0].as_ref()
+        );
+    }
+    let restarted = self::manager(storage, issuer.clone());
+    restarted.manage(&["a.example.com".into()]).await.unwrap();
+    for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+        assert_eq!(
+            handshake_for_domain(&restarted, &issuer, domain).await,
+            fresh.cert_chain[0].as_ref()
+        );
+    }
+}
+
+#[tokio::test]
+async fn renewal_rejects_a_ca_that_drops_a_requested_san_before_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let issuer = Arc::new(TestIssuer::new());
+    let resource = resource_with_names(
+        &issuer,
+        &["a.example.com", "b.example.com"],
+        "a.example.com",
+    )
+    .await;
+    let manager = manager(storage, issuer.clone());
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &resource)
+        .await
+        .unwrap();
+    let old = manager.cache_certificate("a.example.com").await.unwrap();
+    issuer.mode.store(5, Ordering::SeqCst);
+    let error = manager.renew("a.example.com", true).await.unwrap_err();
+    assert!(error.to_string().contains("b.example.com"), "{error}");
+    let persisted = manager
+        .certificates
+        .load(&issuer.issuer_key(), "a.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.certificate_pem, resource.certificate_pem);
+    assert_eq!(
+        manager
+            .cache
+            .get_by_name("b.example.com")
+            .await
+            .unwrap()
+            .hash,
+        old.hash
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewal_preserves_wildcard_sans_and_their_storage_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let issuer = Arc::new(TestIssuer::new());
+    let resource =
+        resource_with_names(&issuer, &["*.example.com", "example.net"], "*.example.com").await;
+    let manager = manager(storage.clone(), issuer.clone());
+    manager
+        .certificates
+        .save(&issuer.issuer_key(), &resource)
+        .await
+        .unwrap();
+    manager.cache_certificate("*.example.com").await.unwrap();
+    issuer.requests.lock().unwrap().clear();
+    manager.renew("*.example.com", true).await.unwrap();
+    assert_eq!(
+        *issuer.requests.lock().unwrap(),
+        [vec!["*.example.com".to_owned(), "example.net".to_owned()]]
+    );
+    assert!(
+        manager
+            .cache
+            .get_by_name("nested.tenant.example.com")
+            .await
+            .is_none()
+    );
+    let persisted = manager
+        .certificates
+        .load(&issuer.issuer_key(), "*.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.sans, ["*.example.com"]);
+    let restarted = self::manager(storage, issuer.clone());
+    restarted.manage(&["*.example.com".into()]).await.unwrap();
+    handshake_for_domain(&restarted, &issuer, "tenant.example.com").await;
+    handshake_for_domain(&restarted, &issuer, "example.net").await;
 }

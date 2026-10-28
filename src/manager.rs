@@ -516,8 +516,11 @@ impl CertManager {
         &self,
         cert_res: &CertificateResource,
     ) -> Result<Certificate> {
-        let mut cert = Certificate::from_pem(&cert_res.certificate_pem, &cert_res.private_key_pem)?;
+        let cert = Certificate::from_pem(&cert_res.certificate_pem, &cert_res.private_key_pem)?;
+        Ok(self.staple_certificate(cert).await)
+    }
 
+    async fn staple_certificate(&self, mut cert: Certificate) -> Certificate {
         // Apply OCSP stapling unless disabled.
         if !self.policy.ocsp.disable_stapling {
             match staple_ocsp(self.storage.as_ref(), &mut cert, &self.policy.ocsp).await {
@@ -538,7 +541,7 @@ impl CertManager {
             }
         }
 
-        Ok(cert)
+        cert
     }
 }
 
@@ -707,11 +710,8 @@ impl CertManager {
         resource: &CertificateResource,
         domain: &str,
     ) -> Result<Certificate> {
-        Self::parse_managed_certificate(resource, domain)?;
-        let mut cert = self.make_certificate_with_ocsp(resource).await?;
-        cert.managed = true;
-        cert.issuer_key = resource.issuer_key.clone();
-        Ok(cert)
+        let cert = Self::parse_managed_certificate(resource, domain)?;
+        Ok(self.staple_certificate(cert).await)
     }
 
     pub(crate) fn parse_managed_certificate(
@@ -722,6 +722,17 @@ impl CertManager {
         crate::handshake::cert_to_certified_key(&cert)?
             .keys_match()
             .map_err(|error| Error::Config(format!("certificate/private key mismatch: {error}")))?;
+        Self::validate_certificate_name(&cert, domain)?;
+        // Keep the lookup alias first so maintenance renews through the same
+        // CertStore address even if the CA orders SANs differently.
+        cert.names.retain(|name| !name.eq_ignore_ascii_case(domain));
+        cert.names.insert(0, domain.to_ascii_lowercase());
+        cert.managed = true;
+        cert.issuer_key = resource.issuer_key.clone();
+        Ok(cert)
+    }
+
+    fn validate_certificate_name(cert: &Certificate, domain: &str) -> Result<()> {
         let domain = domain.to_ascii_lowercase();
         if domain.starts_with("*.") {
             use x509_parser::prelude::FromDer;
@@ -750,36 +761,63 @@ impl CertManager {
                 ))
             })?;
         }
-        cert.managed = true;
-        cert.issuer_key = resource.issuer_key.clone();
-        Ok(cert)
+        Ok(())
+    }
+
+    fn tls_names(cert: &Certificate) -> Vec<String> {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::FromDer;
+        let Some(leaf_der) = cert.cert_chain.first() else {
+            return Vec::new();
+        };
+        let Ok((_, leaf)) = x509_parser::certificate::X509Certificate::from_der(leaf_der.as_ref())
+        else {
+            return Vec::new();
+        };
+        let Ok(Some(sans)) = leaf.subject_alternative_name() else {
+            return Vec::new();
+        };
+        sans.value
+            .general_names
+            .iter()
+            .filter_map(|name| match name {
+                GeneralName::DNSName(name) => Some(name.to_ascii_lowercase()),
+                GeneralName::IPAddress(raw) => match *raw {
+                    [a, b, c, d] => Some(std::net::Ipv4Addr::new(*a, *b, *c, *d).to_string()),
+                    raw if raw.len() == 16 => <[u8; 16]>::try_from(raw)
+                        .ok()
+                        .map(|ip| std::net::Ipv6Addr::from(ip).to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn covers_certificate(replacement: &Certificate, previous: &Certificate) -> bool {
+        let names = Self::tls_names(previous);
+        !names.is_empty()
+            && names
+                .iter()
+                .all(|name| Self::validate_certificate_name(replacement, name).is_ok())
     }
 
     async fn publish_certificate(&self, cert: Certificate, domain: &str) {
         let incoming_hash = cert.hash.clone();
         let previous = self.cache.all_matching_certificates(domain).await;
-        let old = previous.iter().find(|old| {
-            old.managed
-                && old
-                    .names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(domain))
-        });
-        if let Some(old) = old {
-            self.cache.replace(&old.hash, cert).await;
-            for other in previous.iter().filter(|other| {
-                other.managed
-                    && other.hash != old.hash
-                    && other.hash != incoming_hash
-                    && other
-                        .names
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(domain))
-            }) {
-                self.cache.remove(&other.hash).await;
-            }
-        } else {
-            self.cache.add(cert).await;
+        let superseded: Vec<_> = previous
+            .iter()
+            .filter(|old| {
+                old.managed && old.hash != incoming_hash && Self::covers_certificate(&cert, old)
+            })
+            .map(|old| old.hash.as_str())
+            .collect();
+        // A partial replacement must keep the old certificate serving every
+        // name that it still covers. This applies to cleanup entries too.
+        let old_hash = superseded.first().copied().unwrap_or(&incoming_hash);
+        self.cache.replace(old_hash, cert).await;
+        for hash in superseded.into_iter().skip(1) {
+            self.cache.remove(hash).await;
         }
     }
 
@@ -1086,8 +1124,33 @@ impl CertManager {
         let cert = self.validated_certificate(&cert_res, domain).await?;
         let needs_renewal = cert.needs_renewal(self.policy.renewal_window_ratio);
 
+        // Renew all actual DNS/IP SANs, including managed overlaps that would
+        // otherwise lose coverage. CNs, URIs and email SANs are not TLS names.
+        // Keep the lookup name first, and never expand a wildcard into a host.
+        let mut domains = vec![domain.to_ascii_lowercase()];
+        let mut coverage_gap = false;
+        for name in Self::tls_names(&cert) {
+            if !domains.contains(&name) {
+                domains.push(name);
+            }
+        }
+        for previous in self
+            .cache
+            .all_matching_certificates(domain)
+            .await
+            .into_iter()
+            .filter(|cert| cert.managed)
+        {
+            coverage_gap |= !Self::covers_certificate(&cert, &previous);
+            for name in Self::tls_names(&previous) {
+                if !domains.contains(&name) {
+                    domains.push(name);
+                }
+            }
+        }
+
         let force = force || matches!(cert.ocsp_status, Some(OcspStatus::Revoked));
-        if !needs_renewal && !force {
+        if !needs_renewal && !force && !coverage_gap {
             info!(
                 domain = %domain,
                 "certificate does not need renewal (may have been renewed by another instance); reloading into cache"
@@ -1129,7 +1192,6 @@ impl CertManager {
         };
 
         // Generate CSR.
-        let domains = vec![domain.to_string()];
         let csr_der = generate_csr(&private_key, &domains, self.policy.must_staple)?;
 
         // Build issuer list, applying IssuerPolicy.
@@ -1153,7 +1215,9 @@ impl CertManager {
             match issuer.issue(&csr_der, &domains).await {
                 Ok(issued) => {
                     let new_cert_res = CertificateResource {
-                        sans: domains.clone(),
+                        // Preserve the existing names_key / lookup alias. The
+                        // renewed certificate may carry more SANs than this key.
+                        sans: cert_res.sans.clone(),
                         certificate_pem: issued.certificate_pem,
                         private_key_pem: private_key_pem.as_bytes().to_vec(),
                         issuer_data: Some(issued.metadata),
@@ -1161,6 +1225,9 @@ impl CertManager {
                     };
 
                     let cert = self.validated_certificate(&new_cert_res, domain).await?;
+                    for name in &domains {
+                        Self::validate_certificate_name(&cert, name)?;
+                    }
                     if cert.expired() || cert.not_before > chrono::Utc::now() {
                         return Err(Error::Config(
                             "issuer returned a certificate outside its validity period".into(),
