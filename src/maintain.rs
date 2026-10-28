@@ -719,11 +719,31 @@ pub async fn clean_storage(
         if domain.contains('/') {
             continue;
         }
-        let resource = match crate::storage::load_certificate(storage, issuer, domain).await {
-            Ok(resource) => resource,
-            Err(_) => continue,
+        let snapshot = format!("{site}/_certon/resource.v1.key");
+        let cert_pem = match crate::storage::load_certificate(storage, issuer, domain).await {
+            Ok(resource) => resource.certificate_pem,
+            Err(_) => {
+                // A prior cleanup may have removed the legacy sidecars before
+                // .crt deletion failed. Retry from that cert only after proving
+                // no canonical snapshot exists. Present, malformed or unreadable
+                // snapshots must never fall back to an older expired .crt.
+                if !matches!(
+                    storage.load(&snapshot).await,
+                    Err(crate::Error::Storage(crate::error::StorageError::NotFound(
+                        _
+                    )))
+                ) {
+                    continue;
+                }
+                match storage
+                    .load(&crate::storage::site_cert_key(issuer, domain))
+                    .await
+                {
+                    Ok(bytes) => bytes,
+                    Err(_) => continue,
+                }
+            }
         };
-        let cert_pem = resource.certificate_pem;
         let cert_pem_str = match std::str::from_utf8(&cert_pem) {
             Ok(s) => s,
             Err(_) => continue,
@@ -776,7 +796,6 @@ pub async fn clean_storage(
         if !legacy_deleted {
             continue;
         }
-        let snapshot = format!("{site}/_certon/resource.v1.key");
         match storage.delete(&snapshot).await {
             Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {
                 info!(site, not_after = %not_after, "clean_storage: deleted expired certificate");
@@ -1220,6 +1239,130 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.certificate_pem, fresh.certificate_pem);
         assert_eq!(loaded.private_key_pem, fresh.private_key_pem);
+    }
+
+    struct CleanupFaultStorage {
+        files: crate::FileStorage,
+        fail_crt_delete: std::sync::atomic::AtomicBool,
+        deny_snapshot_load: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for CleanupFaultStorage {
+        async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.files.store(key, value).await
+        }
+        async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            if self.deny_snapshot_load && key.ends_with("/_certon/resource.v1.key") {
+                return Err(crate::error::StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "snapshot unavailable",
+                ))
+                .into());
+            }
+            self.files.load(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            if key.ends_with(".crt") && self.fail_crt_delete.swap(false, Ordering::SeqCst) {
+                return Err(crate::Error::Other(
+                    "transient certificate deletion failure".into(),
+                ));
+            }
+            self.files.delete(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.files.exists(key).await
+        }
+        async fn list(&self, path: &str, recursive: bool) -> Result<Vec<String>> {
+            self.files.list(path, recursive).await
+        }
+        async fn stat(&self, key: &str) -> Result<crate::storage::KeyInfo> {
+            self.files.stat(key).await
+        }
+        async fn lock(&self, name: &str) -> Result<()> {
+            self.files.lock(name).await
+        }
+        async fn unlock(&self, name: &str) -> Result<()> {
+            self.files.unlock(name).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_an_expired_legacy_certificate_after_sidecars_were_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = CleanupFaultStorage {
+            files: crate::FileStorage::new(directory.path()),
+            fail_crt_delete: std::sync::atomic::AtomicBool::new(true),
+            deny_snapshot_load: false,
+        };
+        write_legacy_resource(&storage, &cleanup_resource(true)).await;
+        let cert = crate::storage::site_cert_key("ca", "example.com");
+        let key = crate::storage::site_private_key("ca", "example.com");
+        let meta = crate::storage::site_meta_key("ca", "example.com");
+        let first = clean_storage(&storage, &CleanStorageOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(first.deleted_certs, 0);
+        assert!(storage.exists(&cert).await.unwrap());
+        assert!(!storage.exists(&key).await.unwrap());
+        assert!(!storage.exists(&meta).await.unwrap());
+        let second = clean_storage(&storage, &CleanStorageOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(second.deleted_certs, 1);
+        assert!(!storage.exists(&cert).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_cert_only_fallback_never_bypasses_a_snapshot() {
+        let snapshot = "certificates/ca/example.com/_certon/resource.v1.key";
+        for authority in ["fresh", "malformed", "unavailable"] {
+            let directory = tempfile::tempdir().unwrap();
+            let storage = CleanupFaultStorage {
+                files: crate::FileStorage::new(directory.path()),
+                fail_crt_delete: std::sync::atomic::AtomicBool::new(false),
+                deny_snapshot_load: authority == "unavailable",
+            };
+            write_legacy_resource(&storage, &cleanup_resource(true)).await;
+            storage
+                .delete(&crate::storage::site_private_key("ca", "example.com"))
+                .await
+                .unwrap();
+            let fresh = cleanup_resource(false);
+            let bytes = if authority == "malformed" {
+                b"invalid snapshot JSON".to_vec()
+            } else {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1, "metadata": &fresh,
+                    "certificate_pem": &fresh.certificate_pem,
+                    "private_key_pem": &fresh.private_key_pem,
+                }))
+                .unwrap()
+            };
+            storage.store(snapshot, &bytes).await.unwrap();
+            let result = clean_storage(&storage, &CleanStorageOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(result.deleted_certs, 0, "authority: {authority}");
+            assert!(
+                storage.exists(snapshot).await.unwrap(),
+                "authority: {authority}"
+            );
+            assert!(
+                storage
+                    .exists(&crate::storage::site_cert_key("ca", "example.com"))
+                    .await
+                    .unwrap(),
+                "authority: {authority}"
+            );
+            assert!(
+                storage
+                    .exists(&crate::storage::site_meta_key("ca", "example.com"))
+                    .await
+                    .unwrap(),
+                "authority: {authority}"
+            );
+        }
     }
 
     /// Minimal dummy storage for testing.
