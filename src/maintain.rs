@@ -51,6 +51,8 @@ pub const DEFAULT_RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// (1 hour).
 pub const DEFAULT_OCSP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+const REVOCATION_READ_CONCURRENCY: usize = 8;
+
 // ---------------------------------------------------------------------------
 // MaintenanceConfig
 // ---------------------------------------------------------------------------
@@ -346,28 +348,66 @@ async fn maintenance_loop(
 
 pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
     let mut invalidated = 0;
-    let mut first_error = None;
-    for cert in cache.maintenance_snapshot(true) {
-        let Some(hash) = crate::storage::certificate_leaf_hash(&cert) else {
-            continue;
-        };
-        match crate::storage::load_revocation(storage, &hash).await {
-            Ok(Some(_)) => {
+    let mut first_error: Option<(usize, crate::error::Error)> = None;
+    let mut seen = std::collections::HashSet::new();
+    let mut hashes = cache
+        .maintenance_snapshot(true)
+        .into_iter()
+        .filter_map(|cert| crate::storage::certificate_leaf_hash(&cert))
+        .filter(|hash| seen.insert(hash.clone()))
+        .enumerate();
+    let mut reads = Vec::with_capacity(REVOCATION_READ_CONCURRENCY);
+    for (index, hash) in hashes.by_ref().take(REVOCATION_READ_CONCURRENCY) {
+        reads.push(Box::pin(read_revocation(storage, index, hash)));
+    }
+    while !reads.is_empty() {
+        // Borrowed futures need no task or runtime ownership. A slow earlier
+        // read cannot block quarantine of ready later leaves; cancelling the
+        // scan drops every in-flight backend read before its caller exits.
+        let (index, hash, result) = std::future::poll_fn(|cx| {
+            for position in 0..reads.len() {
+                if let std::task::Poll::Ready(result) = reads[position].as_mut().poll(cx) {
+                    drop(reads.swap_remove(position));
+                    return std::task::Poll::Ready(result);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await;
+        match result {
+            Ok(true) => {
                 cache.deny_revoked_certificate(&hash).await;
                 invalidated += 1;
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 // One damaged or unavailable marker must not permanently
-                // shield every later revoked leaf from quarantine.
-                first_error.get_or_insert(error);
+                // shield other leaves. Keep the first snapshot-order error,
+                // irrespective of backend completion order.
+                if first_error.as_ref().is_none_or(|(first, _)| index < *first) {
+                    first_error = Some((index, error));
+                }
             }
+        }
+        if let Some((index, hash)) = hashes.next() {
+            reads.push(Box::pin(read_revocation(storage, index, hash)));
         }
     }
     match first_error {
-        Some(error) => Err(error),
+        Some((_, error)) => Err(error),
         None => Ok(invalidated),
     }
+}
+
+async fn read_revocation(
+    storage: &dyn Storage,
+    index: usize,
+    hash: String,
+) -> (usize, String, Result<bool>) {
+    let result = crate::storage::load_revocation(storage, &hash)
+        .await
+        .map(|marker| marker.is_some());
+    (index, hash, result)
 }
 
 // ---------------------------------------------------------------------------

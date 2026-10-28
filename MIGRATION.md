@@ -347,3 +347,15 @@ events now also include `issuer_errors` with every attempted issuer's error.
 Revocation checks and certificate-store writes remain outside this fallback:
 their errors abort the operation, including errors from custom backends. A
 failed operation preserves any existing working cached certificate.
+
+## Bounded revocation refresh reads
+
+Explicit and periodic revocation refreshes read up to eight unique leaf markers
+concurrently. A slow marker no longer delays quarantine of other ready leaves;
+the refresh still waits for every read and returns the first snapshot-order
+error on partial failure. The success count is the number of revoked leaves,
+with alternate chains sharing one lookup and quarantine operation.
+
+Cancelling a refresh or stopping maintenance drops all in-flight read futures;
+the scanner spawns no detached work. Renewal and OCSP refresh intervals are
+unchanged.
