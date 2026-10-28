@@ -1,5 +1,21 @@
 # Migrating to CertManager and Policy
 
+Live OCSP staples now have a verified serving deadline. New certificate
+lookups omit responses after `nextUpdate` (or 24 hours after `thisUpdate` when
+`nextUpdate` is absent), and configured handshake refresh callbacks become
+eligible at the response's refresh time. Cache publication validates supplied
+raw staples outside its lock; arbitrary unverified response bytes are no longer
+attached to TLS keys. No fields were added to the public `Certificate` struct.
+
+Maintenance must still be started separately. Once running, it wakes for
+individual staple deadlines and newly published staples even when its periodic
+interval is one hour. It proactively fetches replacements, keeps an existing
+Good response only while fresh during responder outages, and backs off repeated
+failures or unchanged responses. Both serving containers share the signing-key
+`Arc`; handshakes perform no OCSP parsing or verification. A key already captured
+by an in-flight handshake remains an immutable snapshot, as across certificate
+replacement or removal.
+
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
 Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`

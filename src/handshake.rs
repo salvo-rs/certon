@@ -962,12 +962,44 @@ mod tests {
         cache.replace(&cert.hash.clone(), cert).await;
         let updated = resolver.resolve_name(Some("a.example.com")).unwrap();
         assert!(!Arc::ptr_eq(&first, &updated));
-        assert_eq!(updated.ocsp, Some(vec![1, 2, 3]));
+        assert_eq!(
+            updated.ocsp, None,
+            "unverified raw bytes must not be served"
+        );
         assert!(Arc::ptr_eq(
             &updated,
             &resolver.resolve_name(Some("b.example.com")).unwrap()
         ));
         assert_eq!(first.ocsp, None);
+    }
+
+    #[tokio::test]
+    async fn expired_signed_staple_triggers_the_configured_handshake_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut cert, issuer) = crate::cache::tests::signed_certificate();
+        cert.ocsp_status = Some(crate::ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(crate::cache::tests::signed_staple(&cert, &issuer, 4));
+        let name = cert.names[0].clone();
+        let cache = CertCache::new(crate::cache::CacheOptions::default());
+        cache.add(cert).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = CertResolver::new(cache);
+        resolver.ocsp_refresh_func = Some(Arc::new({
+            let calls = calls.clone();
+            move |_| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }));
+        assert!(resolver.resolve_name(Some(&name)).unwrap().ocsp.is_some());
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(resolver.resolve_name(Some(&name)).unwrap().ocsp.is_none());
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
