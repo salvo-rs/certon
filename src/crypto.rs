@@ -24,6 +24,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "aws-lc-rs")]
 use aws_lc_rs as crypto_provider;
@@ -42,6 +43,7 @@ use ring as crypto_provider;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 // ---------------------------------------------------------------------------
 // Crypto-provider compatibility wrappers
@@ -219,7 +221,9 @@ mod base64_serde {
 
 /// Generates a new random private key of the specified [`KeyType`].
 ///
-/// The returned [`PrivateKey`] holds PKCS#8 DER-encoded key material.
+/// The returned [`PrivateKey`] holds PKCS#8 DER-encoded key material. This
+/// synchronous function performs CPU work on its caller's thread; Tokio async
+/// callers should use [`generate_private_key_async`] instead.
 ///
 /// # Errors
 ///
@@ -257,6 +261,57 @@ pub fn generate_private_key(key_type: KeyType) -> Result<PrivateKey> {
         key_type,
         pkcs8_der,
     })
+}
+
+/// Generate a key without blocking a Tokio async worker thread.
+///
+/// All algorithms share a process-wide budget of two blocking key-generation
+/// jobs. Admission happens before submitting a job to Tokio's blocking pool.
+/// Cancelling the caller does not stop a submitted computation: its permit
+/// remains in the blocking closure until that computation finishes, even if
+/// the closure is still waiting for a blocking thread. Requires a Tokio runtime.
+/// The synchronous [`generate_private_key`] API does not use this budget.
+pub async fn generate_private_key_async(key_type: KeyType) -> Result<PrivateKey> {
+    run_key_generation(move || generate_private_key(key_type)).await
+}
+
+static ASYNC_KEY_GENERATION_BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+pub(crate) async fn run_key_generation<T, F>(job: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let budget = ASYNC_KEY_GENERATION_BUDGET
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone();
+    bounded_key_generation(budget, job).await
+}
+
+async fn bounded_key_generation<T, F>(budget: Arc<Semaphore>, job: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+        CryptoError::KeyGeneration("async key generation requires a Tokio runtime".into())
+    })?;
+    let permit = budget
+        .acquire_owned()
+        .await
+        .map_err(|_| CryptoError::KeyGeneration("key generation budget is unavailable".into()))?;
+    runtime
+        .spawn_blocking(move || {
+            let result = job();
+            // The worker owns admission through completion, not the caller's
+            // cancellable await or just the blocking-pool submission.
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|error| {
+            CryptoError::KeyGeneration(format!("blocking key generation task failed: {error}"))
+        })?
 }
 
 /// Helper: generate an RSA private key as PKCS#8 DER.
@@ -1055,5 +1110,331 @@ AAAA
         let result =
             parse_certs_from_pem_bundle("-----BEGIN SOMETHING-----\n-----END SOMETHING-----\n");
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod async_key_generation_tests {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Gate {
+        open: Mutex<bool>,
+        changed: Condvar,
+    }
+    impl Gate {
+        fn with_watchdog() -> Arc<Self> {
+            let gate = Arc::new(Self::default());
+            let rescue = gate.clone();
+            // A scheduling regression must fail rather than leave a blocking
+            // worker preventing the test runtime from shutting down forever.
+            std::thread::spawn(move || {
+                let open = rescue.open.lock().unwrap();
+                let (mut open, _) = rescue
+                    .changed
+                    .wait_timeout_while(open, Duration::from_secs(30), |open| !*open)
+                    .unwrap();
+                if !*open {
+                    *open = true;
+                    rescue.changed.notify_all();
+                }
+            });
+            gate
+        }
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.changed.notify_all();
+        }
+    }
+    // Always release controlled workers during an assertion failure too.
+    struct ReleaseOnDrop(Arc<Gate>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_key_work_allows_a_single_thread_runtime_heartbeat() {
+        let budget = Arc::new(Semaphore::new(1));
+        let gate = Gate::with_watchdog();
+        let _release = ReleaseOnDrop(gate.clone());
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (pulse, heartbeat) = std::sync::mpsc::channel();
+        let observed = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let progressed = heartbeat.recv_timeout(Duration::from_secs(30)).is_ok();
+                gate.release();
+                progressed
+            })
+        };
+        let worker_thread = std::thread::current().id();
+        let work = tokio::spawn(bounded_key_generation(budget, move || {
+            assert_ne!(std::thread::current().id(), worker_thread);
+            entered.send(()).unwrap();
+            gate.wait();
+            Ok(())
+        }));
+        started.await.unwrap();
+        // The controlled CPU job cannot finish until this async timer fires.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        pulse.send(()).unwrap();
+        work.await.unwrap().unwrap();
+        assert!(
+            observed.join().unwrap(),
+            "key work blocked the async heartbeat"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_work_never_exceeds_the_admitted_concurrency() {
+        let budget = Arc::new(Semaphore::new(2));
+        let gate = Gate::with_watchdog();
+        let _release = ReleaseOnDrop(gate.clone());
+        let running = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..6 {
+            let budget = budget.clone();
+            let gate = gate.clone();
+            let running = running.clone();
+            let maximum = maximum.clone();
+            let entered = entered.clone();
+            tasks.spawn(bounded_key_generation(budget, move || {
+                let count = running.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                gate.wait();
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            }));
+        }
+        for _ in 0..2 {
+            started.recv().await.unwrap();
+        }
+        assert_eq!(budget.available_permits(), 0);
+        assert!(started.try_recv().is_err());
+        assert_eq!(running.load(Ordering::SeqCst), 2);
+        gate.release();
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(budget.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_caller_keeps_its_running_worker_admitted() {
+        let budget = Arc::new(Semaphore::new(1));
+        let gate = Gate::with_watchdog();
+        let _release = ReleaseOnDrop(gate.clone());
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let worker_gate = gate.clone();
+        let first = tokio::spawn(bounded_key_generation(budget.clone(), move || {
+            entered.send(()).unwrap();
+            worker_gate.wait();
+            Ok(())
+        }));
+        started.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(budget.clone().try_acquire_owned().is_err());
+        let second_started = Arc::new(AtomicBool::new(false));
+        let observed = second_started.clone();
+        let mut second = Box::pin(bounded_key_generation(budget.clone(), move || {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        poll_fn(|context| {
+            assert!(second.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!second_started.load(Ordering::SeqCst));
+        gate.release();
+        second.await.unwrap();
+        assert!(second_started.load(Ordering::SeqCst));
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[test]
+    fn cancelling_a_queued_job_retains_its_budget_until_the_worker_runs() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let gate = Gate::with_watchdog();
+            let _release = ReleaseOnDrop(gate.clone());
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let worker_gate = gate.clone();
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                worker_gate.wait();
+            });
+            started.await.unwrap();
+            let budget = Arc::new(Semaphore::new(1));
+            let completed = Arc::new(AtomicBool::new(false));
+            let observed = completed.clone();
+            let mut caller = Box::pin(bounded_key_generation(budget.clone(), move || {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+            poll_fn(|context| {
+                assert!(caller.as_mut().poll(context).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(
+                !completed.load(Ordering::SeqCst),
+                "the only blocking thread must still be occupied"
+            );
+            drop(caller);
+            assert_eq!(
+                budget.available_permits(),
+                0,
+                "dropping the caller must not release its queued worker's admission"
+            );
+            gate.release();
+            blocker.await.unwrap();
+            let permit = budget.acquire().await.unwrap();
+            assert!(completed.load(Ordering::SeqCst));
+            drop(permit);
+        });
+    }
+
+    #[tokio::test]
+    async fn returned_errors_and_panics_release_the_worker_budget() {
+        let budget = Arc::new(Semaphore::new(1));
+        let error = bounded_key_generation::<(), _>(budget.clone(), || {
+            Err(crate::Error::Other("controlled generation error".into()))
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, crate::Error::Other(_)));
+        assert_eq!(budget.available_permits(), 1);
+        let error = bounded_key_generation::<(), _>(budget.clone(), || {
+            panic!("controlled generation panic")
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::Crypto(CryptoError::KeyGeneration(_))
+        ));
+        assert_eq!(budget.available_permits(), 1);
+        assert_eq!(bounded_key_generation(budget, || Ok(42)).await.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn different_job_result_types_share_the_process_budget() {
+        let gate = Gate::with_watchdog();
+        let _release = ReleaseOnDrop(gate.clone());
+        let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let first_gate = gate.clone();
+        let first_entered = entered.clone();
+        let first = tokio::spawn(run_key_generation(move || {
+            first_entered.send(()).unwrap();
+            first_gate.wait();
+            Ok(7usize)
+        }));
+        let second_gate = gate.clone();
+        let second = tokio::spawn(run_key_generation(move || {
+            entered.send(()).unwrap();
+            second_gate.wait();
+            Ok(String::from("generated"))
+        }));
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(30), started.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            ASYNC_KEY_GENERATION_BUDGET
+                .get()
+                .unwrap()
+                .available_permits(),
+            0
+        );
+        let executed = Arc::new(AtomicBool::new(false));
+        let observed = executed.clone();
+        let mut third = Box::pin(run_key_generation(move || {
+            observed.store(true, Ordering::SeqCst);
+            Ok(false)
+        }));
+        poll_fn(|context| {
+            assert!(third.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!executed.load(Ordering::SeqCst));
+        gate.release();
+        assert_eq!(first.await.unwrap().unwrap(), 7);
+        assert_eq!(second.await.unwrap().unwrap(), "generated");
+        assert!(!third.await.unwrap());
+        assert!(executed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn async_keys_roundtrip_and_produce_valid_signed_csrs() {
+        use x509_parser::prelude::FromDer;
+        for key_type in [
+            KeyType::EcdsaP256,
+            KeyType::EcdsaP384,
+            KeyType::EcdsaP521,
+            KeyType::Ed25519,
+            #[cfg(feature = "rsa-keys")]
+            KeyType::Rsa2048,
+        ] {
+            let key = generate_private_key_async(key_type).await.unwrap();
+            assert_eq!(key.key_type(), key_type);
+            let pem = encode_private_key_pem(&key).unwrap();
+            let decoded = decode_private_key_pem(&pem).unwrap();
+            assert_eq!(decoded.pkcs8_der(), key.pkcs8_der());
+            // ring's rcgen backend does not support P-521 signing; generation
+            // and PEM decoding still exercise that algorithm above.
+            if key_type == KeyType::EcdsaP521 && !cfg!(feature = "aws-lc-rs") {
+                continue;
+            }
+            let csr = generate_csr(&decoded, &["example.com".into()], false).unwrap();
+            let (_, parsed) =
+                x509_parser::certification_request::X509CertificationRequest::from_der(&csr)
+                    .unwrap();
+            if key_type == KeyType::EcdsaP521 {
+                // x509-parser's verification helper does not support P-521.
+                use signature::Verifier;
+                let public = p521::ecdsa::VerifyingKey::from_sec1_bytes(
+                    &parsed
+                        .certification_request_info
+                        .subject_pki
+                        .subject_public_key
+                        .data,
+                )
+                .unwrap();
+                let signature =
+                    p521::ecdsa::Signature::from_der(&parsed.signature_value.data).unwrap();
+                public
+                    .verify(parsed.certification_request_info.raw, &signature)
+                    .unwrap();
+            } else {
+                parsed.verify_signature().unwrap();
+            }
+        }
     }
 }

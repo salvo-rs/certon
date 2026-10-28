@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::acme_client::{ExternalAccountBinding, ZEROSSL_PRODUCTION};
 use crate::acme_issuer::{AcmeIssuer, CertIssuer, ChainPreference, IssuedCertificate, Revoker};
-use crate::crypto::{KeyType, encode_private_key_pem, generate_csr, generate_private_key};
+use crate::crypto::{KeyType, encode_private_key_pem, generate_csr, generate_private_key_async};
 use crate::error::{Error, Result};
 use crate::solvers::Solver;
 use crate::storage::Storage;
@@ -1129,7 +1129,7 @@ impl CertIssuer for ZeroSslApiIssuer {
 
         // Generate a key + CSR if none was provided.
         let (private_key_pem, csr_der_owned) = if csr_der.is_empty() {
-            let key = generate_private_key(self.key_type)?;
+            let key = generate_private_key_async(self.key_type).await?;
             let pem = encode_private_key_pem(&key)?;
             let csr = generate_csr(&key, domains, false)?;
             (pem.into_bytes(), csr)

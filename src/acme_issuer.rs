@@ -41,7 +41,7 @@ use crate::acme_client::{
     AcmeClient, ExternalAccountBinding, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
 };
 use crate::crypto::{
-    KeyType, encode_private_key_pem, generate_csr, generate_private_key,
+    KeyType, encode_private_key_pem, generate_csr, generate_private_key_async,
     parse_certs_from_pem_bundle,
 };
 use crate::error::{AcmeError, Error, Result};
@@ -1411,7 +1411,7 @@ impl AcmeIssuer {
         }
 
         // Generate a private key for the certificate.
-        let private_key = generate_private_key(self.cert_key_type)?;
+        let private_key = generate_private_key_async(self.cert_key_type).await?;
         let private_key_pem = encode_private_key_pem(&private_key)?;
 
         // Generate CSR.

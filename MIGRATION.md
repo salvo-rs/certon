@@ -193,3 +193,16 @@ hops. Custom CA roots configured on `AcmeIssuer` continue to work.
 ACME uses its own cached issuer transport with the common HTTP defaults.
 OCSP's shared transport still supports HTTP responders; no global HTTPS-only
 restriction is applied to it.
+
+## Async key generation
+
+Async certificate issuance/renewal and account creation now offload new-key
+computation to Tokio's blocking pool. All configurable key algorithms share a
+process-wide budget of two admitted jobs, including jobs waiting for a blocking
+thread. Cancelling a caller does not interrupt submitted CPU work or release
+its admission early; the actual worker holds it until completion.
+
+Use `crypto::generate_private_key_async` in Tokio async applications. The
+existing synchronous `generate_private_key`, `StandardKeyGenerator::generate_key`
+and `account::new_account` remain synchronous and outside that budget. The
+fixed P-256 TLS-ALPN challenge-key generation path is unchanged.
