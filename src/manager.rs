@@ -144,8 +144,11 @@ pub struct CertManager {
     /// quickly as they are invoked synchronously.
     pub on_event: Option<EventCallback>,
 
-    /// Optional transform applied to domain names before obtaining
-    /// certificates. Can be used for normalization, aliasing, etc.
+    /// Optional transform applied once per obtain or management operation,
+    /// before validating, reading storage or taking lifecycle locks. The
+    /// transformed subject is the managed identifier, normalized to lowercase.
+    /// A queued job keeps that identity across retries; resubmission resolves it
+    /// again. Explicit renewal and revocation take managed identifiers directly.
     pub subject_transformer: Option<SubjectTransformer>,
 
     /// Optional custom certificate selector for TLS handshakes.
@@ -631,7 +634,7 @@ impl CertManager {
     pub async fn manage_in_background(&self, domains: &[String]) -> Result<()> {
         self.background_retry.validate()?;
         for domain in domains {
-            let domain = domain.to_lowercase();
+            let domain = self.canonical_subject(&domain.to_lowercase())?;
 
             // A rejected retry may have left the old leaf managed in cache.
             // Explicit resubmission must still be able to renew that due leaf.
@@ -697,7 +700,7 @@ impl CertManager {
     /// Internal implementation for both sync and async management.
     async fn manage_all(&self, domains: &[String], r#async: bool) -> Result<()> {
         for domain in domains {
-            let domain = domain.to_lowercase();
+            let domain = self.canonical_subject(&domain.to_lowercase())?;
             self.manage_one(&domain, r#async).await?;
         }
         Ok(())
@@ -722,8 +725,9 @@ impl CertManager {
         self.manage_from_storage(domain, r#async).await
     }
 
-    // Unlike manage_one's initial cache shortcut, a retry must re-read storage
-    // even when an earlier failed renewal already cached the old managed leaf.
+    // This entry takes an already canonical identity. Unlike manage_one's initial
+    // cache shortcut, a retry must re-read storage even when an earlier failed
+    // renewal already cached the old managed leaf. Never transform a retry again.
     async fn manage_from_storage(&self, domain: &str, r#async: bool) -> Result<()> {
         // Planning may read an expired/future resource for its SANs and issuer,
         // but those credentials must not be published before renewal succeeds.
@@ -755,11 +759,7 @@ impl CertManager {
                     // already carries this domain as context.
                     return Err(e);
                 }
-                if r#async {
-                    self.obtain_in_background(domain).await
-                } else {
-                    self.obtain(domain).await
-                }
+                self.obtain_canonical(domain, !r#async).await
             }
         }
     }
@@ -999,7 +999,7 @@ impl CertManager {
 
     /// Core certificate obtain logic.
     ///
-    /// 1. Validate the domain qualifies for a certificate.
+    /// 1. Transform and normalize the domain, then validate the actual subject.
     /// 2. Check if storage already has the certificate (no-op if so).
     /// 3. Acquire a distributed lock for the domain.
     /// 4. Re-check storage (another instance may have obtained it).
@@ -1014,10 +1014,34 @@ impl CertManager {
             ));
         }
 
-        if !subject_qualifies_for_cert(domain) {
+        let canonical = self.canonical_subject(domain)?;
+        self.obtain_canonical(&canonical, interactive).await
+    }
+
+    // Resolve before cache/storage/queue admission/locks, once per logical
+    // operation. All subsequent work, including retries, uses this identity.
+    fn canonical_subject(&self, domain: &str) -> Result<String> {
+        let canonical = if let Some(transformer) = &self.subject_transformer {
+            transformer(domain)?
+        } else {
+            domain.to_owned()
+        };
+        let canonical = canonical.to_lowercase();
+        if !subject_qualifies_for_cert(&canonical) {
             return Err(Error::Config(format!(
-                "domain '{domain}' does not qualify for a certificate"
+                "domain '{canonical}' does not qualify for a certificate"
             )));
+        }
+        Ok(canonical)
+    }
+
+    // Private canonical entry also serves management, which resolves identity
+    // before planning from storage and must not invoke the transformer again.
+    async fn obtain_canonical(&self, domain: &str, interactive: bool) -> Result<()> {
+        if self.issuers.is_empty() {
+            return Err(Error::Config(
+                "no issuers configured; cannot obtain certificate".into(),
+            ));
         }
 
         // Existing valid storage is a no-op; invalid-time credentials need
@@ -1051,20 +1075,6 @@ impl CertManager {
     /// The inner obtain logic, called once per attempt (with or without
     /// retries).
     async fn do_obtain(&self, domain: &str) -> Result<()> {
-        // Apply subject transformer if configured (Task 5).
-        let domain = if let Some(ref transformer) = self.subject_transformer {
-            let transformed = transformer(domain)?;
-            debug!(
-                original = %domain,
-                transformed = %transformed,
-                "subject transformer applied"
-            );
-            transformed
-        } else {
-            domain.to_string()
-        };
-        let domain = domain.as_str();
-
         // Re-check storage: another instance may have obtained the cert
         // while we were waiting for the lock.
         if self.storage_has_cert_resources_any_issuer(domain).await? {

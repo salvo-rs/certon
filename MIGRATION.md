@@ -84,6 +84,14 @@ Immediate operations are still async Rust functions and must be awaited.
 Import `IssuerPolicy` and `CertificateSelector` from the crate root or
 `certon::policy` instead of `certon::config`.
 
+Subject transformers now run once at the start of each obtain or management
+operation, before validating the actual subject, checking storage or acquiring
+locks. The result is normalized to lowercase and is the certificate's
+managed/storage identifier.
+Different aliases for one subject therefore share its lifecycle lock and stored
+resource and background queue entry. Retries keep their resolved identity;
+explicit resubmission resolves it again. Explicit renew/revoke calls continue
+to take managed identifiers.
 
 Certificate lifecycle corrections:
 
