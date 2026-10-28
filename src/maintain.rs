@@ -154,6 +154,9 @@ pub fn start_maintenance(
 }
 
 /// Start maintenance using the manager's certificate store and renewal policy.
+/// Each loop has an independent four-execution, 68-admitted expiration-renewal
+/// budget. Sequential OCSP force-renewals are independent. Stopping cancels
+/// admission waits and awaits its admitted jobs' cleanup.
 pub fn start_maintenance_with_policy(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
@@ -264,7 +267,9 @@ async fn maintenance_loop(
     if *stop_rx.borrow() {
         return;
     }
-    let job_queue = JobQueue::new("renewal");
+    // Renewals have their own bounded budget; foreground manager families do
+    // not consume these slots. The budget is per maintenance loop, not global.
+    let job_queue = JobQueue::certificate_jobs("renewal");
 
     let mut renew_ticker = tokio::time::interval(renew_interval);
     let mut ocsp_ticker = tokio::time::interval(ocsp_interval);
@@ -274,44 +279,45 @@ async fn maintenance_loop(
     renew_ticker.tick().await;
     ocsp_ticker.tick().await;
 
-    loop {
-        tokio::select! {
-            _ = renew_ticker.tick() => {
-                debug!("maintenance: running renewal check");
-                if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
-                    warn!(%error, "maintenance: failed to refresh revocation intent");
-                }
-                check_renewals_with_policy(&cache, &policy, &job_queue).await;
+    // These futures persist independently. A saturated renewal scan may wait
+    // for admission for a long time without starving the OCSP ticker.
+    let renewals = async {
+        loop {
+            renew_ticker.tick().await;
+            debug!("maintenance: running renewal check");
+            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+                warn!(%error, "maintenance: failed to refresh revocation intent");
             }
-            _ = ocsp_ticker.tick() => {
-                debug!("maintenance: running OCSP staple check");
-                if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
-                    warn!(%error, "maintenance: failed to refresh revocation intent");
-                }
-                update_ocsp_staples(
-                    &cache,
-                    config.storage.as_ref(),
-                    &config.ocsp,
-                    policy.renew.as_ref(),
-                ).await;
-            }
-            result = stop_rx.changed() => {
-                match result {
-                    Ok(()) => {
-                        if *stop_rx.borrow() {
-                            info!("maintenance: received stop signal, exiting");
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        // Sender dropped -- cache is gone, exit.
-                        info!("maintenance: cache dropped, exiting");
-                        break;
-                    }
-                }
-            }
+            check_renewals_with_policy(&cache, &policy, &job_queue).await;
         }
+    };
+    let ocsp = async {
+        loop {
+            ocsp_ticker.tick().await;
+            debug!("maintenance: running OCSP staple check");
+            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
+                warn!(%error, "maintenance: failed to refresh revocation intent");
+            }
+            update_ocsp_staples(
+                &cache,
+                config.storage.as_ref(),
+                &config.ocsp,
+                policy.renew.as_ref(),
+            )
+            .await;
+        }
+    };
+    // Stop remains selectable throughout storage work, callback awaits, and
+    // admission backpressure. Cancelling an unadmitted submit is harmless.
+    tokio::select! {
+        biased;
+        _ = stop_rx.wait_for(|stop| *stop) => {
+            info!("maintenance: received stop signal, exiting");
+        }
+        _ = renewals => {}
+        _ = ocsp => {}
     }
+    job_queue.shutdown().await;
 }
 
 pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
@@ -418,11 +424,11 @@ async fn check_renewals_with_policy(
         // submission is silently ignored.
         let job_name = format!("renew_{}", domain);
         let domain_clone = domain.clone();
-        let renew_result = (policy.renew)(domain_clone.clone(), RenewalReason::Expiring);
+        let renew = Arc::clone(&policy.renew);
 
         job_queue
             .submit(job_name, move || async move {
-                match renew_result.await {
+                match renew(domain_clone.clone(), RenewalReason::Expiring).await {
                     Ok(()) => {
                         info!(
                             domain = %domain_clone,
@@ -1525,6 +1531,7 @@ mod tests {
         };
         let jobs = JobQueue::new("custom-ratio");
         check_renewals_with_policy(&cache, &policy, &jobs).await;
+        jobs.wait("renew_example.com").await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1855,6 +1862,145 @@ mod tests {
                 .unwrap();
             handle.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_maintenance_can_stop_and_drops_never_completing_renewals() {
+        use crate::async_jobs::{CERTIFICATE_JOB_CONCURRENCY, CERTIFICATE_JOB_PENDING};
+
+        #[derive(Debug)]
+        struct AbsentStore(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl CertStore for AbsentStore {
+            async fn load(&self, _: &str, _: &str) -> Result<Option<crate::CertificateResource>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+            async fn save(&self, _: &str, _: &crate::CertificateResource) -> Result<()> {
+                unreachable!()
+            }
+            async fn has(&self, _: &str, _: &str) -> Result<bool> {
+                Ok(false)
+            }
+            async fn remove(&self, _: &str, _: &str) -> Result<()> {
+                unreachable!()
+            }
+        }
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let cache = CertCache::new(CacheOptions::default());
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(GatedOcspStorage::new(directory.path()));
+        for index in 0..1000 {
+            cache
+                .add(make_managed_cert(
+                    &[&format!("host-{index}.example.com")],
+                    &index.to_string(),
+                    0,
+                ))
+                .await;
+        }
+        let loads = Arc::new(AtomicUsize::new(0));
+        let constructed = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let handle = start_maintenance_with_policy(
+            cache.clone(),
+            MaintenanceConfig {
+                renew_check_interval: Duration::from_millis(1),
+                ocsp_check_interval: Duration::from_millis(5),
+                ocsp: OcspConfig::default(),
+                storage: storage.clone(),
+            },
+            Arc::new({
+                let constructed = constructed.clone();
+                let active = active.clone();
+                move |_, _| {
+                    // Callback construction itself must wait for execution.
+                    constructed.fetch_add(1, Ordering::SeqCst);
+                    let active = active.clone();
+                    Box::pin(async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _active = Active(active);
+                        std::future::pending().await
+                    })
+                }
+            }),
+            Arc::new(AbsentStore(loads.clone())),
+            DEFAULT_RENEWAL_WINDOW_RATIO,
+        );
+        let capacity = CERTIFICATE_JOB_CONCURRENCY + CERTIFICATE_JOB_PENDING;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while loads.load(Ordering::SeqCst) < capacity + 1
+                || active.load(Ordering::SeqCst) < CERTIFICATE_JOB_CONCURRENCY
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            capacity + 1,
+            "scan must backpressure at the first unadmitted renewal"
+        );
+        assert_eq!(
+            constructed.load(Ordering::SeqCst),
+            CERTIFICATE_JOB_CONCURRENCY
+        );
+        // Add a real OCSP candidate only after renewal admission is saturated.
+        // Its authenticated disk-cached response must still reach the TLS key
+        // while the renewal scan remains blocked on its 69th submission.
+        let (mut probe, issuer) = signed_certificate();
+        probe.managed = false;
+        let response = signed_status(&probe, &issuer, 0);
+        storage
+            .store(
+                &crate::storage::ocsp_key(&probe.names[0], &probe.hash),
+                &response,
+            )
+            .await
+            .unwrap();
+        let domain = probe.names[0].clone();
+        let hash = probe.hash.clone();
+        cache.add(probe).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if cache
+                    .get_by_hash(&hash)
+                    .await
+                    .unwrap()
+                    .ocsp_response
+                    .as_ref()
+                    == Some(&response)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("saturated renewal scan starved OCSP refresh");
+        assert_eq!(cache.resolve(&domain).unwrap().key.ocsp, Some(response));
+        assert_eq!(loads.load(Ordering::SeqCst), capacity + 1);
+        tokio::time::timeout(Duration::from_secs(1), cache.stop_and_wait())
+            .await
+            .unwrap();
+        handle.await.unwrap();
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "stop returned before renewal futures were dropped"
+        );
+        assert_eq!(
+            constructed.load(Ordering::SeqCst),
+            CERTIFICATE_JOB_CONCURRENCY,
+            "queued renewals ran during shutdown"
+        );
+        assert_eq!(Arc::strong_count(&cache), 1);
     }
 
     #[tokio::test]

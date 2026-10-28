@@ -10,10 +10,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -251,7 +252,13 @@ pub struct JobQueue {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     name: String,
     semaphore: Option<Arc<Semaphore>>,
+    admission: Option<Arc<Semaphore>>,
+    changed: watch::Sender<()>,
+    closed: AtomicBool,
 }
+
+pub(crate) const CERTIFICATE_JOB_CONCURRENCY: usize = 4;
+pub(crate) const CERTIFICATE_JOB_PENDING: usize = 64;
 
 struct Job {
     abort: Option<AbortHandle>,
@@ -266,6 +273,8 @@ struct JobCompletion {
     name: String,
     identity: Arc<()>,
     done: watch::Sender<bool>,
+    changed: watch::Sender<()>,
+    admission: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for JobCompletion {
@@ -279,7 +288,9 @@ impl Drop for JobCompletion {
                 jobs.remove(&self.name);
             }
         }
+        drop(self.admission.take());
         self.done.send_replace(true);
+        self.changed.send_replace(());
     }
 }
 
@@ -296,7 +307,31 @@ impl JobQueue {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             name: name.into(),
             semaphore: (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent))),
+            admission: None,
+            changed: watch::channel(()).0,
+            closed: AtomicBool::new(false),
         }
+    }
+
+    /// Bound both execution and registered work. At most `max_concurrent`
+    /// callbacks execute and `max_concurrent + max_pending` jobs are admitted.
+    /// Additional submissions wait in the caller before registration or spawn.
+    /// Dropping such a submission leaves no queued job. Running tasks are
+    /// aborted when this bounded queue is dropped; use `shutdown` to await them.
+    ///
+    /// `max_concurrent` must be nonzero, and the total must fit a Tokio semaphore.
+    pub fn with_limits(name: impl Into<String>, max_concurrent: usize, max_pending: usize) -> Self {
+        assert!(max_concurrent > 0, "job execution limit must be nonzero");
+        let capacity = max_concurrent
+            .checked_add(max_pending)
+            .expect("job capacity overflow");
+        let mut queue = Self::with_max_concurrent(name, max_concurrent);
+        queue.admission = Some(Arc::new(Semaphore::new(capacity)));
+        queue
+    }
+
+    pub(crate) fn certificate_jobs(name: impl Into<String>) -> Self {
+        Self::with_limits(name, CERTIFICATE_JOB_CONCURRENCY, CERTIFICATE_JOB_PENDING)
     }
 
     /// Submit work unless a task of the same name is still registered.
@@ -306,11 +341,40 @@ impl JobQueue {
         Fut: Future<Output = ()> + Send + 'static,
     {
         let runtime = tokio::runtime::Handle::current();
+        // Subscribe before checking the registry, so a same-name submission
+        // admitted while this call waits can promptly deduplicate even at cap.
+        let mut changed = self.changed.subscribe();
+        let admission = if let Some(capacity) = &self.admission {
+            let acquire = Arc::clone(capacity).acquire_owned();
+            tokio::pin!(acquire);
+            loop {
+                if self.closed.load(Ordering::Acquire)
+                    || self
+                        .jobs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains_key(&name)
+                {
+                    return;
+                }
+                tokio::select! {
+                    permit = &mut acquire => match permit {
+                        Ok(permit) => break Some(permit),
+                        Err(_) => return,
+                    },
+                    _ = changed.changed() => {},
+                }
+                // Keep the same semaphore future pinned across notifications:
+                // unrelated registry changes must not reset FIFO admission.
+            }
+        } else {
+            None
+        };
         let (done, completion) = watch::channel(false);
         let identity = Arc::new(());
         {
             let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-            if jobs.contains_key(&name) {
+            if self.closed.load(Ordering::Acquire) || jobs.contains_key(&name) {
                 return;
             }
             jobs.insert(
@@ -330,13 +394,19 @@ impl JobQueue {
             name: name.clone(),
             identity: Arc::clone(&identity),
             done,
+            changed: self.changed.clone(),
+            admission,
         };
+        self.changed.send_replace(());
         let semaphore = self.semaphore.clone();
         tracing::debug!(queue = %self.name, job = %name, "submitting background job");
         let handle = runtime.spawn(async move {
             let _cleanup = cleanup;
             let _permit = match &semaphore {
-                Some(sem) => Some(sem.acquire().await.expect("semaphore should not be closed")),
+                Some(sem) => match sem.acquire().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => return,
+                },
                 None => None,
             };
             f().await;
@@ -415,6 +485,52 @@ impl JobQueue {
     /// Whether no jobs are registered.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
+    }
+
+    fn close_and_abort(&self) -> Vec<watch::Receiver<bool>> {
+        let (completions, aborts) = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::Release);
+            let mut completions = Vec::with_capacity(jobs.len());
+            let mut aborts = Vec::with_capacity(jobs.len());
+            for job in jobs.values_mut() {
+                job.cancelled = true;
+                completions.push(job.completion.clone());
+                aborts.extend(job.abort.clone());
+            }
+            (completions, aborts)
+        };
+        if let Some(capacity) = &self.admission {
+            capacity.close();
+        }
+        if let Some(execution) = &self.semaphore {
+            execution.close();
+        }
+        self.changed.send_replace(());
+        for abort in aborts {
+            abort.abort();
+        }
+        completions
+    }
+
+    /// Stop admission, abort every admitted job, and await actual future cleanup.
+    /// New submissions become no-ops. This also wakes pending submissions.
+    pub async fn shutdown(&self) {
+        for mut completion in self.close_and_abort() {
+            while !*completion.borrow_and_update() {
+                if completion.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for JobQueue {
+    fn drop(&mut self) {
+        if self.admission.is_some() {
+            self.close_and_abort();
+        }
     }
 }
 
@@ -763,5 +879,190 @@ mod tests {
             .await;
         queue.cancel("abort").await;
         assert!(queue.is_empty().await);
+    }
+
+    struct Dropped(Arc<AtomicUsize>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_admission_deduplicates_at_capacity_and_drops_waiting_submissions() {
+        let queue = Arc::new(JobQueue::with_limits("admission", 1, 1));
+        for name in ["running", "pending"] {
+            queue.submit(name.into(), std::future::pending).await;
+        }
+        assert_eq!(queue.len().await, 2);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            queue.submit("pending".into(), || async {
+                panic!("duplicate ran");
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let token = Dropped(dropped.clone());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                queue.submit("discarded".into(), move || async move {
+                    let _token = token;
+                    panic!("unadmitted callback ran");
+                })
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(!queue.is_running("discarded").await);
+        assert_eq!(queue.len().await, 2);
+
+        let token = Dropped(dropped.clone());
+        let caller = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .submit("aborted".into(), move || async move {
+                        let _token = token;
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(!queue.is_running("aborted").await);
+
+        queue.cancel("running").await;
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 1);
+        queue
+            .submit("replacement".into(), std::future::pending)
+            .await;
+        assert_eq!(queue.len().await, 2);
+        queue.shutdown().await;
+        assert!(queue.is_empty().await);
+        assert_eq!(queue.admission.as_ref().unwrap().available_permits(), 2);
+        queue
+            .submit("closed".into(), || async {
+                panic!("closed queue ran");
+            })
+            .await;
+        assert!(queue.is_empty().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_same_name_deduplicates_when_another_waiter_is_admitted() {
+        let queue = JobQueue::with_limits("waiting-dedup", 1, 0);
+        queue.submit("blocker".into(), std::future::pending).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let work = || {
+            let calls = calls.clone();
+            move || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+        };
+        let first = queue.submit("same".into(), work());
+        let second = queue.submit("same".into(), work());
+        tokio::pin!(first, second);
+        // Poll both submissions into the semaphore's wait queue before freeing
+        // a slot; the second must then return while the first still holds it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut first)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut second)
+                .await
+                .is_err()
+        );
+        queue.cancel("blocker").await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second);
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(queue.len().await, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        queue.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_queue_caps_execution_and_registry_for_large_batches() {
+        let queue = Arc::new(JobQueue::with_limits("batch", 2, 3));
+        let active = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let caller = tokio::spawn({
+            let queue = queue.clone();
+            let active = active.clone();
+            let dropped = dropped.clone();
+            async move {
+                for index in 0..1000 {
+                    let active = active.clone();
+                    let dropped = dropped.clone();
+                    queue
+                        .submit(index.to_string(), move || async move {
+                            assert!(active.fetch_add(1, Ordering::SeqCst) < 2);
+                            let _drop = Dropped(dropped);
+                            std::future::pending::<()>().await;
+                        })
+                        .await;
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while queue.len().await < 5 || active.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !caller.is_finished(),
+            "large submission must apply backpressure"
+        );
+        assert_eq!(queue.len().await, 5);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        queue.shutdown().await;
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert!(queue.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn bounded_panic_and_abort_release_capacity_and_drop_aborts_children() {
+        let queue = JobQueue::with_limits("bounded-cleanup", 1, 0);
+        queue
+            .submit("panic".into(), || async {
+                panic!("expected bounded panic");
+            })
+            .await;
+        queue.wait("panic").await;
+        queue.submit("unpolled".into(), std::future::pending).await;
+        queue.cancel("unpolled").await;
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let token = Dropped(dropped.clone());
+        queue
+            .submit("drop".into(), move || async move {
+                let _token = token;
+                std::future::pending::<()>().await;
+            })
+            .await;
+        drop(queue);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
