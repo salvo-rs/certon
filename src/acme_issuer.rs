@@ -12,6 +12,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use x509_parser::prelude::FromDer;
 
@@ -911,6 +912,7 @@ impl AcmeIssuer {
         domains: &[String],
         use_test_ca: bool,
         attempt: usize,
+        deadline: Instant,
     ) -> Result<(IssuedCertificate, bool)> {
         let ca_url = if use_test_ca { &self.test_ca } else { &self.ca };
         let is_test = self.using_test_ca(ca_url);
@@ -1139,11 +1141,12 @@ impl AcmeIssuer {
 
         let final_pem = if let Some(ref preference) = self.preferred_chains {
             let chains = client
-                .download_certificate_chains(
+                .download_certificate_chains_with_deadline(
                     &account_key,
                     &acct.location,
                     &cert_url,
                     crate::acme_client::MAX_ALTERNATE_CHAINS,
+                    Some(deadline),
                 )
                 .await?;
             self.select_preferred_chain(&chains, preference)
@@ -1263,7 +1266,12 @@ impl AcmeIssuer {
 // ---------------------------------------------------------------------------
 
 impl AcmeIssuer {
-    async fn issue_inner(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+    async fn issue_inner(
+        &self,
+        csr_der: &[u8],
+        domains: &[String],
+        deadline: Instant,
+    ) -> Result<IssuedCertificate> {
         if self.resolver.is_some() {
             return Err(Error::Config("AcmeIssuer.resolver is not supported by arbitrary solvers; configure DNS resolution on Dns01Solver instead".into()));
         }
@@ -1272,7 +1280,9 @@ impl AcmeIssuer {
         // First attempt: production CA.
         attempt += 1;
         info!(attempt = attempt, domains = ?domains, "starting certificate issuance");
-        let result = self.do_issue(csr_der, domains, false, attempt).await;
+        let result = self
+            .do_issue(csr_der, domains, false, attempt, deadline)
+            .await;
 
         match result {
             Ok((cert, _used_test)) => Ok(cert),
@@ -1288,14 +1298,19 @@ impl AcmeIssuer {
 
                     attempt += 1;
                     info!(attempt = attempt, "retrying with test CA");
-                    match self.do_issue(csr_der, domains, true, attempt).await {
+                    match self
+                        .do_issue(csr_der, domains, true, attempt, deadline)
+                        .await
+                    {
                         Ok((_test_cert, _)) => {
                             info!("test CA issuance succeeded; retrying production CA once more");
                             // Test CA worked, so our setup is valid.
                             // Retry production CA once more.
                             attempt += 1;
                             info!(attempt = attempt, "retrying production CA");
-                            let (cert, _) = self.do_issue(csr_der, domains, false, attempt).await?;
+                            let (cert, _) = self
+                                .do_issue(csr_der, domains, false, attempt, deadline)
+                                .await?;
                             return Ok(cert);
                         }
                         Err(test_err) => {
@@ -1318,7 +1333,8 @@ impl AcmeIssuer {
 #[async_trait]
 impl CertIssuer for AcmeIssuer {
     async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
-        tokio::time::timeout(self.cert_obtain_timeout, self.issue_inner(csr_der, domains))
+        let deadline = Instant::now() + self.cert_obtain_timeout;
+        tokio::time::timeout_at(deadline, self.issue_inner(csr_der, domains, deadline))
             .await
             .map_err(|_| {
                 Error::Timeout(format!(

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use certon::acme_client::{AcmeClient, MAX_ALTERNATE_CHAINS};
 use certon::acme_issuer::ChainPreference;
@@ -16,6 +17,7 @@ struct Response {
     links: Vec<String>,
     status: u16,
     chunked: bool,
+    stall: bool,
 }
 
 impl Response {
@@ -25,6 +27,7 @@ impl Response {
             links,
             status: 200,
             chunked: false,
+            stall: false,
         }
     }
 }
@@ -43,6 +46,13 @@ impl Drop for Server {
 
 impl Server {
     async fn start(routes: HashMap<String, Response>) -> Self {
+        Self::start_with_finalize_delay(routes, Duration::ZERO).await
+    }
+
+    async fn start_with_finalize_delay(
+        routes: HashMap<String, Response>,
+        finalize_delay: Duration,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -92,6 +102,9 @@ impl Server {
                         serde_json::from_slice(&request[header_end..]).unwrap();
                     assert_eq!(jws["payload"], "");
                 }
+                if path == "/finalize" {
+                    tokio::time::sleep(finalize_delay).await;
+                }
                 let mut extra = String::new();
                 let generated = match path.as_str() {
                     "/directory" => Some(json!({
@@ -119,7 +132,11 @@ impl Server {
                         links: Vec::new(),
                         status: 404,
                         chunked: false,
+                        stall: false,
                     });
+                if response.stall {
+                    std::future::pending::<()>().await;
+                }
                 for link in &response.links {
                     extra.push_str(&format!("Link: {link}\r\n"));
                 }
@@ -226,6 +243,14 @@ fn chains() -> (String, String) {
 }
 
 async fn issue(server: &Server, preference: Option<ChainPreference>) -> String {
+    issue_with_timeout(server, preference, None).await
+}
+
+async fn issue_with_timeout(
+    server: &Server,
+    preference: Option<ChainPreference>,
+    timeout: Option<Duration>,
+) -> String {
     let directory = tempfile::tempdir().unwrap();
     let ca = format!("{}/directory", server.url);
     let builder = AcmeIssuer::builder()
@@ -234,6 +259,10 @@ async fn issue(server: &Server, preference: Option<ChainPreference>) -> String {
         .storage(Arc::new(FileStorage::new(directory.path())))
         .email("chains@example.com")
         .agreed(true);
+    let builder = match timeout {
+        Some(timeout) => builder.cert_obtain_timeout(timeout),
+        None => builder,
+    };
     let issuer = match preference {
         Some(preference) => builder.preferred_chains(preference).build(),
         None => builder.build(),
@@ -403,6 +432,7 @@ async fn certificate_response_limit_covers_content_length_and_chunked_bodies() {
                 links: Vec::new(),
                 status: 200,
                 chunked,
+                stall: false,
             },
         )]))
         .await;
@@ -420,4 +450,97 @@ async fn certificate_response_limit_covers_content_length_and_chunked_bodies() {
             .unwrap_err();
         assert!(error.to_string().contains("1 MiB"), "{error}");
     }
+}
+
+fn stalled_response() -> Response {
+    Response {
+        stall: true,
+        ..Response::pem("", Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn short_issuance_timeout_keeps_default_despite_stalled_alternates() {
+    let (default, _) = chains();
+    let server = Server::start_with_finalize_delay(
+        HashMap::from([
+            (
+                "/cert/default".into(),
+                Response::pem(
+                    &default,
+                    vec![
+                        r#"</cert/stall-1>; rel=alternate, </cert/stall-2>; rel=alternate"#.into(),
+                    ],
+                ),
+            ),
+            ("/cert/stall-1".into(), stalled_response()),
+            ("/cert/stall-2".into(), stalled_response()),
+        ]),
+        Duration::from_millis(500),
+    )
+    .await;
+    // Most of this short issuance budget is consumed before downloading the
+    // default. A new relative timeout at discovery would overrun the caller.
+    let issued = issue_with_timeout(
+        &server,
+        Some(ChainPreference::default()),
+        Some(Duration::from_millis(800)),
+    )
+    .await;
+    assert_eq!(issued, default);
+    assert_eq!(server.certificate_requests().len(), 2);
+}
+
+#[tokio::test]
+async fn short_issuance_timeout_keeps_a_collected_chain_despite_stalled_alternates() {
+    let (default, alternate) = chains();
+    let server = Server::start_with_finalize_delay(HashMap::from([
+        ("/cert/default".into(), Response::pem(&default, vec![r#"</cert/valid>; rel=alternate, </cert/stall-1>; rel=alternate, </cert/stall-2>; rel=alternate"#.into()])),
+        ("/cert/valid".into(), Response::pem(&alternate, Vec::new())),
+        ("/cert/stall-1".into(), stalled_response()),
+        ("/cert/stall-2".into(), stalled_response()),
+    ]), Duration::from_millis(500)).await;
+    let preference = ChainPreference {
+        root_common_name: vec!["Compact Root".into()],
+        ..Default::default()
+    };
+    let issued =
+        issue_with_timeout(&server, Some(preference), Some(Duration::from_millis(800))).await;
+    assert_eq!(issued, alternate);
+    assert_eq!(server.certificate_requests().len(), 3);
+}
+
+#[tokio::test]
+async fn public_chain_discovery_uses_one_aggregate_budget() {
+    let (default, _) = chains();
+    let server = Server::start(HashMap::from([
+        (
+            "/cert/default".into(),
+            Response::pem(
+                &default,
+                vec![r#"</cert/stall-1>; rel=alternate, </cert/stall-2>; rel=alternate"#.into()],
+            ),
+        ),
+        ("/cert/stall-1".into(), stalled_response()),
+        ("/cert/stall-2".into(), stalled_response()),
+    ]))
+    .await;
+    let client = AcmeClient::new(&format!("{}/directory", server.url))
+        .await
+        .unwrap();
+    let key = certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(7),
+        client.download_certificate_chains(
+            &key,
+            &format!("{}/account", server.url),
+            &format!("{}/cert/default", server.url),
+            MAX_ALTERNATE_CHAINS,
+        ),
+    )
+    .await
+    .expect("alternate discovery must have a total budget shorter than HTTP timeouts")
+    .unwrap();
+    assert_eq!(result, vec![default]);
+    assert_eq!(server.certificate_requests().len(), 2);
 }

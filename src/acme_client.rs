@@ -24,6 +24,7 @@ use ring as crypto_provider;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::crypto::PrivateKey;
@@ -56,6 +57,7 @@ pub const GOOGLE_TRUST_PRODUCTION: &str = "https://dv.acme-v02.api.pki.goog/dire
 /// Maximum alternate-chain requests made by one download operation.
 pub const MAX_ALTERNATE_CHAINS: usize = 8;
 const MAX_CERTIFICATE_CHAIN_BYTES: usize = 1024 * 1024;
+const MAX_ALTERNATE_DISCOVERY_TIME: Duration = Duration::from_secs(5);
 
 fn certificate_chain_leaf(pem: &str) -> Result<Vec<u8>> {
     let certificates = crate::crypto::parse_certs_from_pem_bundle(pem)?;
@@ -1419,6 +1421,8 @@ impl AcmeClient {
     /// limited to 1 MiB, duplicate/cyclic URLs are fetched at most once, and
     /// failed or malformed alternatives are ignored. Alternatives must contain
     /// the same leaf certificate as the default chain. Chain order is preserved.
+    /// All alternate requests share a five-second budget after the default has
+    /// arrived; expiration returns the chains already downloaded.
     pub async fn download_certificate_chains(
         &self,
         account_key: &PrivateKey,
@@ -1426,10 +1430,38 @@ impl AcmeClient {
         cert_url: &str,
         max_alternates: usize,
     ) -> Result<Vec<String>> {
+        self.download_certificate_chains_with_deadline(
+            account_key,
+            account_url,
+            cert_url,
+            max_alternates,
+            None,
+        )
+        .await
+    }
+
+    /// Reserve time to return an already-issued certificate before the caller's
+    /// overall issuance deadline. The deadline spans all prior work and retries.
+    pub(crate) async fn download_certificate_chains_with_deadline(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        cert_url: &str,
+        max_alternates: usize,
+        issuance_deadline: Option<Instant>,
+    ) -> Result<Vec<String>> {
         let limit = max_alternates.min(MAX_ALTERNATE_CHAINS);
         let (default, links) = self
             .download_certificate_response(account_key, account_url, cert_url)
             .await?;
+        let now = Instant::now();
+        // Discovery is optional: spend at most half of the caller's remaining
+        // time, leaving the other half for chain selection and returning the
+        // valid default. This also handles time already spent before download.
+        let discovery_budget = issuance_deadline.map_or(MAX_ALTERNATE_DISCOVERY_TIME, |deadline| {
+            MAX_ALTERNATE_DISCOVERY_TIME.min(deadline.saturating_duration_since(now) / 2)
+        });
+        let discovery_deadline = now + discovery_budget;
         let leaf = certificate_chain_leaf(&default)?;
         let mut chains = vec![default];
         let mut seen = HashSet::new();
@@ -1440,11 +1472,16 @@ impl AcmeClient {
         let mut pending = VecDeque::new();
         enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
         while let Some(url) = pending.pop_front() {
-            match self
-                .download_certificate_response(account_key, account_url, &url)
-                .await
-            {
-                Ok((pem, links)) => match certificate_chain_leaf(&pem) {
+            if Instant::now() >= discovery_deadline {
+                break;
+            }
+            let download = tokio::time::timeout_at(
+                discovery_deadline,
+                self.download_certificate_response(account_key, account_url, &url),
+            )
+            .await;
+            match download {
+                Ok(Ok((pem, links))) => match certificate_chain_leaf(&pem) {
                     Ok(alternate_leaf) if alternate_leaf == leaf => {
                         if !chains.contains(&pem) {
                             chains.push(pem);
@@ -1456,8 +1493,15 @@ impl AcmeClient {
                         "ignoring alternate chain with an invalid or different leaf certificate"
                     ),
                 },
-                Err(error) => {
+                Ok(Err(error)) => {
                     warn!(url, %error, "ignoring unavailable alternate certificate chain")
+                }
+                Err(_) => {
+                    debug!(
+                        chain_count = chains.len(),
+                        "alternate discovery budget exhausted; keeping downloaded chains"
+                    );
+                    break;
                 }
             }
         }
