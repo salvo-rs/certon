@@ -809,10 +809,11 @@ impl CertCache {
         {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             if let Some(domain) = domain {
-                if cert.not_before > Utc::now() {
+                let now = Utc::now();
+                if cert.not_before > now {
                     return Err(crate::error::CertError::NotYetValid(domain.to_owned()).into());
                 }
-                if cert.expired() {
+                if now >= cert.not_after {
                     return Err(crate::error::CertError::Expired(domain.to_owned()).into());
                 }
             }
@@ -993,7 +994,6 @@ impl CertCache {
         accepts: impl Fn(&CertifiedKey) -> bool,
     ) -> (bool, Vec<CachedKeyCandidate>) {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        let now = Utc::now();
         let matches = state.matching(name);
         let matched = !matches.is_empty();
         let now = Utc::now();
