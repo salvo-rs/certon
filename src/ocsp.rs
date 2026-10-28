@@ -237,6 +237,9 @@ const CERT_STATUS_REVOKED: u8 = 1;
 // Public API: high-level OCSP stapling
 // ---------------------------------------------------------------------------
 
+/// Skip OCSP for certificates with a total lifetime shorter than seven days.
+const SHORT_LIVED_CERT_DAYS: i64 = 7;
+
 /// Attempt to staple an OCSP response to `cert`.
 ///
 /// This is the main entry point for OCSP stapling. The function:
@@ -250,18 +253,23 @@ const CERT_STATUS_REVOKED: u8 = 1;
 /// Returns `Ok(true)` only when a current, signed Good response was attached.
 /// `Ok(false)` means no usable staple is available. A verified revocation is
 /// recorded in [`Certificate::ocsp_status`], never inferred from this boolean.
-/// Certificates with a total lifetime shorter than this are considered
-/// short-lived and OCSP stapling is skipped for them.
-const SHORT_LIVED_CERT_DAYS: i64 = 7;
-
+///
+/// A verified `Revoked` status is retained on this certificate until it is
+/// replaced. Refresh errors, Unknown responses and older Good responses cannot
+/// undo it. Revoked certificates never receive staple bytes.
 pub async fn staple_ocsp(
     storage: &dyn Storage,
     cert: &mut Certificate,
     _config: &OcspConfig,
 ) -> Result<bool> {
-    // A failed refresh must never leave a stale response attached or be mistaken
-    // for a newly verified revocation by the maintenance loop.
+    // A failed refresh must never leave a stale response attached. A verified
+    // revocation is sticky for this certificate: an outage, Unknown response or
+    // replay of an older, still-fresh Good response cannot make it usable again.
+    // Replacing the certificate creates a new Certificate with no OCSP status.
     cert.ocsp_response = None;
+    if cert.ocsp_status == Some(OcspStatus::Revoked) {
+        return Ok(false);
+    }
     cert.ocsp_status = None;
     if _config.disable_stapling {
         return Ok(false);
@@ -1689,10 +1697,10 @@ fn parse_generalized_time_from_bytes(bytes: &[u8]) -> Option<DateTime<Utc>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn signed_chain() -> (
+    pub(crate) fn signed_chain() -> (
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rcgen::KeyPair,
         String,
@@ -1718,7 +1726,7 @@ mod tests {
         )
     }
 
-    fn signed_response(
+    pub(crate) fn signed_response(
         chain: &[rustls::pki_types::CertificateDer<'static>],
         key: &rcgen::KeyPair,
         status: u8,
@@ -1850,6 +1858,8 @@ mod tests {
             (1, OcspStatus::Revoked),
             (2, OcspStatus::Unknown),
         ] {
+            // Each status is independently observed on a newly loaded certificate.
+            cert.ocsp_status = None;
             let raw = signed_response(
                 &chain,
                 &key,

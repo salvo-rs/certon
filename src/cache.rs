@@ -520,6 +520,47 @@ impl CertCache {
         dispatch_events(&options, events);
     }
 
+    /// Publish only OCSP fields, preserving the current certificate metadata.
+    /// Membership and revocation checks share the same write lock as the update:
+    /// stale refreshes cannot resurrect removed certificates or undo revocation.
+    /// A new certificate hash is installed through the ordinary `replace` API.
+    pub(crate) async fn update_ocsp_if_present(
+        &self,
+        hash: &str,
+        status: Option<crate::ocsp::OcspStatus>,
+        response: Option<Vec<u8>>,
+    ) -> bool {
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let event = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let Some(current) = state.certificates.get_mut(hash) else {
+                return false;
+            };
+            if current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                && status != Some(crate::ocsp::OcspStatus::Revoked)
+            {
+                return false;
+            }
+            current.certificate.ocsp_status = status;
+            current.certificate.ocsp_response = response.clone();
+            if let Some(key) = &mut current.key {
+                // Clone just the rustls container when an in-flight handshake
+                // shares it; retain the prepared signing key without crypto work.
+                Arc::make_mut(key).ocsp = response;
+            }
+            CacheEvent::Updated {
+                names: current.certificate.names.clone(),
+                hash: hash.to_owned(),
+            }
+        };
+        dispatch_events(&options, vec![event]);
+        true
+    }
+
     /// Get the best exact or single leftmost-label wildcard match.
     pub async fn get_by_name(&self, name: &str) -> Option<Certificate> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
