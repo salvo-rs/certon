@@ -84,7 +84,7 @@ const EMERGENCY_RENEWAL_HOURS: i64 = 24;
 ///
 /// Construct via [`Certificate::from_pem`] (for PEM-encoded data) or
 /// [`Certificate::from_der`] (for pre-parsed DER chains).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Certificate {
     /// The certificate chain as DER-encoded certificates.
     /// The first entry is the leaf certificate.
@@ -137,6 +137,26 @@ pub struct Certificate {
     /// from ARI take precedence over the standard time-based renewal
     /// check.
     pub ari: Option<RenewalInfo>,
+}
+
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Certificate")
+            .field("names", &self.names)
+            .field("hash", &self.hash)
+            .field("managed", &self.managed)
+            .field("issuer_key", &self.issuer_key)
+            .field("tags", &self.tags)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .field(
+                "private_key_der",
+                &self.private_key_der.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("private_key_kind", &self.private_key_kind)
+            .field("ocsp_status", &self.ocsp_status)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Certificate {
@@ -698,24 +718,15 @@ pub fn match_wildcard(subject: &str, wildcard: &str) -> bool {
         return true;
     }
 
-    if !wildcard.contains('*') {
+    let Some(suffix) = wildcard.strip_prefix("*.") else {
+        return false;
+    };
+    if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
         return false;
     }
-
-    let labels: Vec<&str> = subject.split('.').collect();
-    for i in 0..labels.len() {
-        if labels[i].is_empty() {
-            continue;
-        }
-        let mut candidate: Vec<&str> = labels.clone();
-        candidate[i] = "*";
-        let joined = candidate.join(".");
-        if joined == wildcard {
-            return true;
-        }
-    }
-
-    false
+    subject
+        .split_once('.')
+        .is_some_and(|(label, rest)| !label.is_empty() && !label.contains('*') && rest == suffix)
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,5 +1200,29 @@ mod tests {
         let t = Utc::now().with_nanosecond(0).unwrap();
         let exp = expires_at(t);
         assert_eq!(exp - t, ChronoDuration::seconds(1));
+    }
+
+    #[test]
+    fn wildcard_is_only_an_entire_leftmost_label() {
+        assert!(!match_wildcard("a.b.com", "a.*.com"));
+        assert!(!match_wildcard("a.b.com", "a.b.*"));
+        assert!(!match_wildcard("a.b.com", "*.*.com"));
+        assert!(!match_wildcard(".example.com", "*.example.com"));
+        assert!(!match_wildcard("deep.a.example.com", "*.example.com"));
+        assert!(match_wildcard("a.example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn certificate_debug_redacts_private_key_bytes() {
+        let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let mut cert = Certificate::from_pem(
+            generated.cert.pem().as_bytes(),
+            generated.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        cert.private_key_der = Some(vec![222, 173, 190, 239, 222, 173]);
+        let debug = format!("{cert:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("[222, 173, 190, 239, 222, 173]"));
     }
 }

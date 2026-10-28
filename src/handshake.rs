@@ -22,12 +22,12 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Decision function that determines whether on-demand TLS is allowed for a name.
 type DecisionFunc = Arc<dyn Fn(&str) -> bool + Send + Sync>;
@@ -76,8 +76,8 @@ pub struct OnDemandConfig {
 
     /// Optional rate limiter to throttle on-demand certificate issuance.
     ///
-    /// When set, the resolver will check `try_allow()` before spawning an
-    /// obtain operation. If the rate limit is exhausted, the request is
+    /// When set, admitted background work checks `try_allow()` before calling
+    /// the obtain callback. If the rate limit is exhausted, the request is
     /// silently dropped (no certificate is obtained).
     pub rate_limit: Option<Arc<RateLimiter>>,
 
@@ -86,6 +86,9 @@ pub struct OnDemandConfig {
     /// This function is spawned in the background (via `tokio::spawn`) when
     /// a certificate is needed but not cached. The obtained certificate is
     /// expected to be placed into the [`CertCache`] by the callback.
+    /// Work is deduplicated by domain, with at most 32 concurrent obtains and
+    /// a 60-second cooldown after completion or failure. The cooldown registry
+    /// retains at most 256 domains. Acquisition requires an active Tokio runtime.
     pub obtain_func: Option<ObtainFunc>,
 }
 
@@ -175,16 +178,16 @@ pub struct CertResolver {
     /// Challenge certificates for TLS-ALPN-01 validation, keyed by domain name.
     acme_challenges: Arc<RwLock<HashMap<String, Arc<CertifiedKey>>>>,
 
-    /// Pending on-demand obtain operations, keyed by domain name.
-    ///
-    /// When an on-demand TLS obtain is triggered for a domain, a [`Notify`]
-    /// is created so that concurrent handshakes for the same domain can
-    /// wait for the obtain to complete rather than spawning duplicate work.
-    pending_obtains: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    /// Bounded, single-flight background work with retry cooldowns.
+    pending_obtains: Arc<Mutex<BackgroundTasks>>,
+    pending_ocsp: Arc<Mutex<BackgroundTasks>>,
 
     /// Optional callback that triggers a background OCSP staple refresh
     /// for a given domain. This is spawned as a background task to avoid
-    /// blocking the TLS handshake.
+    /// blocking the TLS handshake. Refreshes are deduplicated by certificate
+    /// hash, limited to 32 concurrent tasks, with a 60-second retry cooldown.
+    /// Without an active Tokio runtime, cached certificates are served without
+    /// scheduling a refresh.
     pub ocsp_refresh_func: Option<OcspRefreshFunc>,
 }
 
@@ -214,7 +217,8 @@ impl CertResolver {
             default_server_name: None,
             fallback_server_name: None,
             acme_challenges: Arc::new(RwLock::new(HashMap::new())),
-            pending_obtains: Arc::new(Mutex::new(HashMap::new())),
+            pending_obtains: Arc::new(Mutex::new(BackgroundTasks::default())),
+            pending_ocsp: Arc::new(Mutex::new(BackgroundTasks::default())),
             ocsp_refresh_func: None,
         }
     }
@@ -232,7 +236,8 @@ impl CertResolver {
             default_server_name: None,
             fallback_server_name: None,
             acme_challenges: Arc::new(RwLock::new(HashMap::new())),
-            pending_obtains: Arc::new(Mutex::new(HashMap::new())),
+            pending_obtains: Arc::new(Mutex::new(BackgroundTasks::default())),
+            pending_ocsp: Arc::new(Mutex::new(BackgroundTasks::default())),
             ocsp_refresh_func: None,
         }
     }
@@ -253,14 +258,20 @@ impl CertResolver {
     /// a matching SNI, this challenge certificate will be returned instead
     /// of the normal certificate.
     pub async fn set_challenge_cert(&self, domain: String, cert: Arc<CertifiedKey>) {
-        let mut challenges = self.acme_challenges.write().await;
-        challenges.insert(domain, cert);
+        let mut challenges = self
+            .acme_challenges
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        challenges.insert(domain.to_lowercase(), cert);
     }
 
     /// Remove a previously registered TLS-ALPN-01 challenge certificate.
     pub async fn remove_challenge_cert(&self, domain: &str) {
-        let mut challenges = self.acme_challenges.write().await;
-        challenges.remove(domain);
+        let mut challenges = self
+            .acme_challenges
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        challenges.remove(&domain.to_lowercase());
     }
 
     /// Set the default (fallback) certificate.
@@ -268,13 +279,13 @@ impl CertResolver {
     /// This certificate is returned when no match is found in the cache for
     /// the requested SNI name. It can be updated at runtime.
     pub async fn set_default_cert(&self, cert: Arc<CertifiedKey>) {
-        let mut guard = self.default_cert.write().await;
+        let mut guard = self.default_cert.write().unwrap_or_else(|e| e.into_inner());
         *guard = Some(cert);
     }
 
     /// Clear the default (fallback) certificate.
     pub async fn clear_default_cert(&self) {
-        let mut guard = self.default_cert.write().await;
+        let mut guard = self.default_cert.write().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
@@ -287,7 +298,7 @@ impl CertResolver {
     /// `None` if no certificate is available.
     fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
         let name = match server_name {
-            Some(n) if !n.is_empty() => n.to_owned(),
+            Some(n) if !n.is_empty() => n.to_lowercase(),
             _ => {
                 // No SNI: try default_server_name from config.
                 if let Some(ref default_name) = self.default_server_name {
@@ -308,29 +319,6 @@ impl CertResolver {
         // Step 1: Look up the exact name in the certificate cache.
         if let Some(result) = self.try_resolve_from_cache_with_ocsp_check(&name) {
             return Some(result);
-        }
-
-        // Step 1b: Wildcard matching — try replacing labels from the left
-        // with `*` to find wildcard certificates.
-        // For "foo.bar.example.com", try:
-        //   *.bar.example.com
-        //   *.example.com
-        //   *.com
-        {
-            let labels: Vec<&str> = name.split('.').collect();
-            if labels.len() >= 2 {
-                for i in 1..labels.len() {
-                    let wildcard = format!("*.{}", labels[i..].join("."));
-                    if let Some(result) = self.try_resolve_from_cache(&wildcard) {
-                        debug!(
-                            sni = %name,
-                            wildcard = %wildcard,
-                            "certificate found via wildcard matching",
-                        );
-                        return Some(result);
-                    }
-                }
-            }
         }
 
         // Step 2: On-demand TLS — trigger background certificate acquisition.
@@ -368,144 +356,47 @@ impl CertResolver {
         self.try_default_cert()
     }
 
-    /// Try to resolve a certificate for `name` from the cache and convert it
-    /// to a `CertifiedKey`. Returns `None` on miss or conversion failure.
+    /// The cache owns the prebuilt signing key; a handshake only clones its Arc.
     fn try_resolve_from_cache(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        if let Some(cert) = self.try_cache_lookup(name) {
-            match cert_to_certified_key(&cert) {
-                Ok(ck) => {
-                    debug!(sni = %name, hash = %cert.hash, "certificate found in cache");
-                    return Some(ck);
-                }
-                Err(e) => {
-                    warn!(
-                        sni = %name,
-                        hash = %cert.hash,
-                        error = %e,
-                        "failed to convert cached certificate to CertifiedKey",
-                    );
-                }
-            }
-        }
-        None
+        self.cache.resolve(name).map(|cached| cached.key)
     }
 
-    /// Like [`try_resolve_from_cache`], but also triggers a background OCSP
-    /// refresh if the certificate is missing its OCSP staple.
     fn try_resolve_from_cache_with_ocsp_check(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        if let Some(cert) = self.try_cache_lookup(name) {
-            // Task 10: if the OCSP status is missing or the OCSP response
-            // bytes are absent, trigger a background OCSP refresh without
-            // blocking the handshake.
-            if (cert.ocsp_status.is_none() || cert.ocsp_response.is_none())
-                && let Some(ref refresh_fn) = self.ocsp_refresh_func
-            {
-                let refresh = Arc::clone(refresh_fn);
-                let domain = name.to_owned();
-                debug!(
-                    sni = %name,
-                    hash = %cert.hash,
-                    "OCSP staple missing; spawning background refresh",
-                );
-                tokio::spawn(async move {
-                    refresh(domain).await;
-                });
-            }
-
-            match cert_to_certified_key(&cert) {
-                Ok(ck) => {
-                    debug!(sni = %name, hash = %cert.hash, "certificate found in cache");
-                    return Some(ck);
-                }
-                Err(e) => {
-                    warn!(
-                        sni = %name,
-                        hash = %cert.hash,
-                        error = %e,
-                        "failed to convert cached certificate to CertifiedKey",
-                    );
-                }
-            }
+        let cached = self.cache.resolve(name)?;
+        if cached.needs_ocsp
+            && let Some(refresh_fn) = &self.ocsp_refresh_func
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+            && let Some(work) = BackgroundWork::try_start(&self.pending_ocsp, cached.hash)
+        {
+            let refresh = Arc::clone(refresh_fn);
+            let domain = name.to_owned();
+            runtime.spawn(async move {
+                let _work = work;
+                refresh(domain).await;
+            });
         }
-        None
+        Some(cached.key)
     }
 
-    /// Attempt a synchronous cache lookup.
-    ///
-    /// Uses `try_read` on the internal RwLocks to avoid blocking in a sync
-    /// context. Returns `None` if the locks are contended or no certificate
-    /// matches.
-    fn try_cache_lookup(&self, name: &str) -> Option<Certificate> {
-        // We need to perform the lookup that CertCache::get_by_name does,
-        // but synchronously. We use tokio's `Handle::block_on` if we're
-        // inside a tokio runtime, falling back to `try_read`.
-        //
-        // The recommended approach for rustls resolvers is to use
-        // `tokio::runtime::Handle::try_current()` and `block_in_place`.
-        // However, this can deadlock if called from within a non-blocking
-        // context. The safest approach is `block_in_place` which works from
-        // multi-threaded runtimes.
-        let handle = tokio::runtime::Handle::try_current().ok()?;
-
-        // `block_in_place` moves the current task off the worker thread so
-        // that we can safely block on async operations. This requires a
-        // multi-threaded runtime; on a current-thread runtime it will panic.
-        // For production TLS servers a multi-threaded runtime is expected.
-
-        tokio::task::block_in_place(|| handle.block_on(self.cache.get_by_name(name)))
-    }
-
-    /// Trigger background certificate acquisition for the given name.
-    ///
-    /// Uses leader/waiter coordination: if an obtain is already in progress
-    /// for this domain, the current caller does not spawn a duplicate task.
-    /// Instead, subsequent handshakes will find the certificate in cache once
-    /// the first obtain completes.
     fn trigger_on_demand_obtain(&self, on_demand: &Arc<OnDemandConfig>, name: &str) {
-        // Check if there is already a pending obtain for this domain.
-        // We use try_lock to avoid blocking in a sync context.
-        let pending = self.pending_obtains.clone();
-        let name_owned = name.to_owned();
-
-        // Try to check and register as leader in a non-blocking way.
-        let maybe_guard = self.pending_obtains.try_lock();
-        match maybe_guard {
-            Ok(mut guard) => {
-                if guard.contains_key(&name_owned) {
-                    // Another task is already obtaining this certificate.
-                    debug!(
-                        sni = %name,
-                        "on-demand obtain already in progress for this domain; waiting",
-                    );
-                    return;
-                }
-                // Register as leader.
-                let notify = Arc::new(Notify::new());
-                guard.insert(name_owned.clone(), Arc::clone(&notify));
-
-                // Spawn the obtain task.
-                let on_demand = Arc::clone(on_demand);
-                let name_for_task = name_owned.clone();
-
-                tokio::spawn(async move {
-                    Self::do_on_demand_obtain(&on_demand, &name_for_task).await;
-
-                    // Notify all waiters and remove from pending map.
-                    notify.notify_waiters();
-                    let mut guard = pending.lock().await;
-                    guard.remove(&name_for_task);
-                });
-            }
-            Err(_) => {
-                // Lock contended; fall through and spawn without dedup
-                // coordination to avoid blocking the handshake.
-                let on_demand = Arc::clone(on_demand);
-                let name_for_task = name_owned;
-                tokio::spawn(async move {
-                    Self::do_on_demand_obtain(&on_demand, &name_for_task).await;
-                });
-            }
+        // Plain synchronous rustls users can serve cached/default certificates
+        // without a runtime. Async acquisition requires one, so skip it there.
+        if on_demand.obtain_func.is_none() {
+            return;
         }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Some(work) = BackgroundWork::try_start(&self.pending_obtains, name.to_lowercase())
+        else {
+            return;
+        };
+        let on_demand = Arc::clone(on_demand);
+        let domain = name.to_owned();
+        runtime.spawn(async move {
+            let _work = work;
+            Self::do_on_demand_obtain(&on_demand, &domain).await;
+        });
     }
 
     /// Execute the on-demand obtain, respecting rate limits.
@@ -532,16 +423,12 @@ impl CertResolver {
         }
     }
 
-    /// Try to return the default certificate (non-blocking).
+    /// Short synchronous reads do not turn contention into a false cache miss.
     fn try_default_cert(&self) -> Option<Arc<CertifiedKey>> {
-        // Use `try_read` to avoid blocking.
-        match self.default_cert.try_read() {
-            Ok(guard) => guard.clone(),
-            Err(_) => {
-                debug!("could not read default cert (lock contended)");
-                None
-            }
-        }
+        self.default_cert
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -576,13 +463,59 @@ impl ResolvesServerCert for CertResolver {
 impl CertResolver {
     /// Attempt a synchronous lookup for a TLS-ALPN-01 challenge certificate.
     fn try_challenge_lookup(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        match self.acme_challenges.try_read() {
-            Ok(guard) => guard.get(name).cloned(),
-            Err(_) => {
-                debug!("could not read acme_challenges (lock contended)");
-                None
-            }
+        self.acme_challenges
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&name.to_lowercase())
+            .cloned()
+    }
+}
+
+// A handshake never queues unlimited work. The per-key cooldown also covers
+// failed refreshes, unavailable OCSP responders and rapidly failing issuers.
+const MAX_BACKGROUND_TASKS: usize = 32;
+const MAX_BACKGROUND_KEYS: usize = 256;
+const BACKGROUND_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct BackgroundTasks {
+    // None means running; Some is the earliest permitted retry time.
+    entries: HashMap<String, Option<Instant>>,
+}
+
+struct BackgroundWork {
+    tasks: Arc<Mutex<BackgroundTasks>>,
+    key: String,
+}
+
+impl BackgroundWork {
+    fn try_start(tasks: &Arc<Mutex<BackgroundTasks>>, key: String) -> Option<Self> {
+        let now = Instant::now();
+        let mut state = tasks.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .entries
+            .retain(|_, retry| retry.is_none_or(|at| at > now));
+        if state.entries.contains_key(&key)
+            || state.entries.len() >= MAX_BACKGROUND_KEYS
+            || state.entries.values().filter(|at| at.is_none()).count() >= MAX_BACKGROUND_TASKS
+        {
+            return None;
         }
+        state.entries.insert(key.clone(), None);
+        Some(Self {
+            tasks: Arc::clone(tasks),
+            key,
+        })
+    }
+}
+
+impl Drop for BackgroundWork {
+    fn drop(&mut self) {
+        let mut state = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        state.entries.insert(
+            self.key.clone(),
+            Some(Instant::now() + BACKGROUND_RETRY_DELAY),
+        );
     }
 }
 
@@ -859,5 +792,213 @@ mod tests {
         let resolver = CertResolver::new(cache);
         let debug_str = format!("{:?}", resolver);
         assert!(debug_str.contains("CertResolver"));
+    }
+
+    async fn cached_real_certificate(names: &[&str]) -> (Arc<CertCache>, Certificate) {
+        let generated = rcgen::generate_simple_self_signed(
+            names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let cert = Certificate::from_pem(
+            generated.cert.pem().as_bytes(),
+            generated.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let cache = CertCache::new(CacheOptions::default());
+        cache.add(cert.clone()).await;
+        (cache, cert)
+    }
+
+    fn complete_rustls_handshake(cache: Arc<CertCache>, cert: &Certificate) {
+        crate::http::install_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert_chain[0].clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver::new(cache)));
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            "example.com".try_into().unwrap(),
+        )
+        .unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+        for _ in 0..10 {
+            let mut bytes = Vec::new();
+            client.write_tls(&mut bytes).unwrap();
+            server.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            server.process_new_packets().unwrap();
+            let mut bytes = Vec::new();
+            server.write_tls(&mut bytes).unwrap();
+            client.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+        }
+        panic!("TLS handshake did not finish");
+    }
+
+    #[tokio::test]
+    async fn real_handshake_on_current_thread_runtime() {
+        let (cache, cert) = cached_real_certificate(&["example.com"]).await;
+        complete_rustls_handshake(cache, &cert);
+    }
+
+    #[test]
+    fn real_handshake_without_tokio_runtime() {
+        let (cache, cert) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(cached_real_certificate(&["example.com"]))
+        };
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        complete_rustls_handshake(cache, &cert);
+    }
+
+    #[tokio::test]
+    async fn serving_key_is_reused_and_replaced_with_ocsp() {
+        let (cache, mut cert) = cached_real_certificate(&["*.example.com"]).await;
+        let resolver = CertResolver::new(Arc::clone(&cache));
+        let first = resolver.resolve_name(Some("a.example.com")).unwrap();
+        for _ in 0..100 {
+            assert!(Arc::ptr_eq(
+                &first,
+                &resolver.resolve_name(Some("b.example.com")).unwrap()
+            ));
+        }
+        assert!(resolver.resolve_name(Some("deep.a.example.com")).is_none());
+        assert!(resolver.resolve_name(Some("example.com")).is_none());
+        cert.ocsp_response = Some(vec![1, 2, 3]);
+        cache.replace(&cert.hash.clone(), cert).await;
+        let updated = resolver.resolve_name(Some("a.example.com")).unwrap();
+        assert!(!Arc::ptr_eq(&first, &updated));
+        assert_eq!(updated.ocsp, Some(vec![1, 2, 3]));
+        assert!(Arc::ptr_eq(
+            &updated,
+            &resolver.resolve_name(Some("b.example.com")).unwrap()
+        ));
+        assert_eq!(first.ocsp, None);
+    }
+
+    #[tokio::test]
+    async fn on_demand_is_single_flight_and_cools_down() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let config = Arc::new(OnDemandConfig {
+            decision_func: Some(Arc::new(|_| true)),
+            host_allowlist: None,
+            rate_limit: None,
+            obtain_func: Some(Arc::new({
+                let calls = Arc::clone(&calls);
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move |_| {
+                    let calls = Arc::clone(&calls);
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    Box::pin(async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(())
+                    })
+                }
+            })),
+        });
+        let resolver =
+            CertResolver::with_on_demand(CertCache::new(CacheOptions::default()), config);
+        for _ in 0..100 {
+            assert!(
+                resolver
+                    .resolve_name(Some("customer.example.com"))
+                    .is_none()
+            );
+        }
+        started.notified().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_one();
+        tokio::task::yield_now().await;
+        resolver.resolve_name(Some("customer.example.com"));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ocsp_refresh_is_deduplicated_by_certificate_hash() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (cache, _) = cached_real_certificate(&["*.example.com"]).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut resolver = CertResolver::new(cache);
+        resolver.ocsp_refresh_func = Some(Arc::new({
+            let calls = Arc::clone(&calls);
+            move |_| {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }));
+        for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+            assert!(resolver.resolve_name(Some(domain)).is_some());
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        resolver.resolve_name(Some("d.example.com"));
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn background_work_has_task_and_memory_bounds_and_retry_cooldown() {
+        let tasks = Arc::new(Mutex::new(BackgroundTasks::default()));
+        let permits: Vec<_> = (0..MAX_BACKGROUND_TASKS)
+            .map(|i| BackgroundWork::try_start(&tasks, i.to_string()).unwrap())
+            .collect();
+        assert!(BackgroundWork::try_start(&tasks, "overflow".into()).is_none());
+        drop(permits);
+        assert!(BackgroundWork::try_start(&tasks, "0".into()).is_none());
+        for i in MAX_BACKGROUND_TASKS..MAX_BACKGROUND_KEYS {
+            drop(BackgroundWork::try_start(&tasks, i.to_string()).unwrap());
+        }
+        assert!(BackgroundWork::try_start(&tasks, "overflow".into()).is_none());
+        tasks
+            .lock()
+            .unwrap()
+            .entries
+            .insert("0".into(), Some(Instant::now() - Duration::from_secs(1)));
+        assert!(BackgroundWork::try_start(&tasks, "0".into()).is_some());
+    }
+
+    #[tokio::test]
+    async fn aborted_background_work_releases_single_flight_slot() {
+        let tasks = Arc::new(Mutex::new(BackgroundTasks::default()));
+        let work = BackgroundWork::try_start(&tasks, "example.com".into()).unwrap();
+        let task = tokio::spawn(async move {
+            let _work = work;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(tasks.lock().unwrap().entries["example.com"].is_some());
+    }
+
+    #[test]
+    fn background_acquisition_without_runtime_does_not_panic() {
+        let config = Arc::new(OnDemandConfig {
+            decision_func: Some(Arc::new(|_| true)),
+            host_allowlist: None,
+            rate_limit: None,
+            obtain_func: Some(Arc::new(|_| Box::pin(async { Ok(()) }))),
+        });
+        let resolver =
+            CertResolver::with_on_demand(CertCache::new(CacheOptions::default()), config);
+        assert!(resolver.resolve_name(Some("example.com")).is_none());
     }
 }
