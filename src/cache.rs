@@ -263,6 +263,11 @@ pub(crate) struct CachedKeyLookup {
     pub selected: Option<CachedKey>,
 }
 
+pub(crate) struct CachedKeyCandidate {
+    pub certificate: Arc<Certificate>,
+    pub key: CachedKey,
+}
+
 /// Registered before spawning maintenance, so immediate shutdown cannot race
 /// task startup. Dropping an unpolled or aborted task releases its registration.
 pub(crate) struct MaintenanceGuard {
@@ -727,6 +732,37 @@ impl CertCache {
                 })
             });
         CachedKeyLookup { matched, selected }
+    }
+
+    /// An immutable selection snapshot. User hooks must run after this returns,
+    /// without the cache lock, and need no private-key or certificate byte copy.
+    pub(crate) fn selection_candidates(
+        &self,
+        name: &str,
+        accepts: impl Fn(&CertifiedKey) -> bool,
+    ) -> (bool, Vec<CachedKeyCandidate>) {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let matches = state.matching(name);
+        let matched = !matches.is_empty();
+        let mut candidates: Vec<_> = matches
+            .into_iter()
+            .filter(|entry| entry.key.as_ref().is_some_and(|key| accepts(key)))
+            .filter_map(|entry| {
+                Some(CachedKeyCandidate {
+                    certificate: Arc::clone(&entry.certificate),
+                    key: CachedKey {
+                        key: Arc::clone(entry.key.as_ref()?),
+                        hash: entry.certificate.hash.clone(),
+                        needs_ocsp: entry.certificate.ocsp_status.is_none()
+                            || entry.certificate.ocsp_response.is_none(),
+                    },
+                })
+            })
+            .collect();
+        drop(state);
+        let now = Utc::now();
+        candidates.sort_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now));
+        (matched, candidates)
     }
 
     /// Look up metadata by content hash.
