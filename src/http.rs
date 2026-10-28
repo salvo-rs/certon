@@ -36,6 +36,40 @@ use crate::error::{Error, Result};
 /// existed; now they use it because there is one.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Maximum JSON document accepted from an ACME or ZeroSSL endpoint.
+pub(crate) const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
+/// Error details are diagnostic data, so they have a smaller memory/log budget.
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a response incrementally, enforcing the limit even for chunked bodies.
+/// `context` must be a static operation label, never a URL containing credentials.
+pub(crate) async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    context: &'static str,
+) -> Result<Vec<u8>> {
+    let too_large = || Error::Other(format!("{context} response body exceeds {limit} bytes"));
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        Error::Other(format!(
+            "failed to read {context} response: {}",
+            error.without_url()
+        ))
+    })? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Default identification, when the embedder has not chosen one.
 const DEFAULT_USER_AGENT: &str = concat!("certon/", env!("CARGO_PKG_VERSION"));
 
@@ -105,7 +139,81 @@ pub(crate) fn install_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
+
+    async fn wire_response(
+        wire: Vec<u8>,
+        hold_open: bool,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/?access_key=secret-for-redaction",
+            listener.local_addr().unwrap()
+        );
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let _ = stream.write_all(&wire).await;
+            if hold_open {
+                std::future::pending::<()>().await;
+            }
+        });
+        (client().unwrap().get(url).send().await.unwrap(), task)
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_is_rejected_without_waiting_for_the_body() {
+        let (response, task) = wire_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n".to_vec(),
+            true,
+        )
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_body_limited(response, 4, "test"),
+        )
+        .await
+        .expect("declared size must be checked before reading the body");
+        task.abort();
+        assert!(result.unwrap_err().to_string().contains("exceeds 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn chunked_limits_accept_the_boundary_and_reject_the_next_byte() {
+        for (chunks, expected) in [
+            ("2\r\nab\r\n2\r\ncd\r\n0\r\n\r\n", Some(b"abcd".as_slice())),
+            ("3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n", None),
+        ] {
+            let wire = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}");
+            let (response, task) = wire_response(wire.into_bytes(), false).await;
+            let result = read_body_limited(response, 4, "test").await;
+            task.await.unwrap();
+            match expected {
+                Some(bytes) => assert_eq!(result.unwrap(), bytes),
+                None => assert!(result.unwrap_err().to_string().contains("exceeds 4 bytes")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_response_errors_do_not_expose_request_credentials() {
+        let (response, task) = wire_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nNOT-HEX\r\n".to_vec(),
+            false,
+        )
+        .await;
+        let error = read_body_limited(response, 64, "test")
+            .await
+            .unwrap_err()
+            .to_string();
+        task.await.unwrap();
+        assert!(error.contains("failed to read test response"));
+        assert!(!error.contains("secret-for-redaction"));
+        assert!(!error.contains("access_key"));
+    }
 
     #[test]
     fn the_default_user_agent_carries_the_real_version() {

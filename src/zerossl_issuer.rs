@@ -37,6 +37,22 @@ fn zerossl_client() -> Result<&'static reqwest::Client> {
     crate::http::client()
 }
 
+async fn zerossl_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    action: &'static str,
+) -> Result<T> {
+    let body =
+        crate::http::read_body_limited(response, crate::http::MAX_JSON_BODY_BYTES, action).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| Error::Other(format!("failed to parse {action} JSON response: {e}")))
+}
+
+async fn zerossl_error_body(response: reqwest::Response, action: &'static str) -> Result<String> {
+    let body =
+        crate::http::read_body_limited(response, crate::http::MAX_ERROR_BODY_BYTES, action).await?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
 fn zerossl_url(base: &str, api_key: &str) -> Result<Url> {
     let mut url = Url::parse(base)
         .map_err(|e| Error::Other(format!("failed to build ZeroSSL API URL: {e}")))?;
@@ -200,19 +216,13 @@ async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> 
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read body>".to_owned());
+        let body = zerossl_error_body(resp, "ZeroSSL EAB error").await?;
         return Err(Error::Other(format!(
             "ZeroSSL EAB endpoint returned HTTP {status}: {body}"
         )));
     }
 
-    let eab_resp: EabCredentialsResponse = resp
-        .json()
-        .await
-        .map_err(|e| Error::Other(format!("failed to parse ZeroSSL EAB response: {e}")))?;
+    let eab_resp: EabCredentialsResponse = zerossl_json(resp, "ZeroSSL EAB").await?;
 
     if !eab_resp.success {
         let detail = eab_resp
@@ -405,6 +415,91 @@ impl ZeroSslIssuerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn body_response(
+        body: &str,
+        chunked: bool,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let body = body.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let encoding = if chunked {
+                "Transfer-Encoding: chunked\r\n".to_owned()
+            } else {
+                format!("Content-Length: {}\r\n", body.len())
+            };
+            let header = format!("HTTP/1.1 200 OK\r\n{encoding}Connection: close\r\n\r\n");
+            if stream.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            if chunked {
+                for part in body.as_bytes().chunks(4096) {
+                    if stream
+                        .write_all(format!("{:x}\r\n", part.len()).as_bytes())
+                        .await
+                        .is_err()
+                        || stream.write_all(part).await.is_err()
+                        || stream.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+            } else {
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+        (
+            zerossl_client().unwrap().get(url).send().await.unwrap(),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn zerossl_json_readers_bound_known_and_chunked_bodies() {
+        for chunked in [false, true] {
+            let (response, task) = body_response("{\"success\":true}", chunked).await;
+            let value: serde_json::Value = zerossl_json(response, "ZeroSSL test").await.unwrap();
+            assert_eq!(value["success"], true);
+            task.await.unwrap();
+            let oversized =
+                serde_json::json!({"padding": "x".repeat(crate::http::MAX_JSON_BODY_BYTES)})
+                    .to_string();
+            let (response, task) = body_response(&oversized, chunked).await;
+            let error = zerossl_json::<serde_json::Value>(response, "ZeroSSL test")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds"));
+            assert!(error.to_string().len() < 1024);
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn zerossl_error_readers_use_the_smaller_log_budget() {
+        for chunked in [false, true] {
+            let (response, task) = body_response("diagnostic", chunked).await;
+            assert_eq!(
+                zerossl_error_body(response, "ZeroSSL test error")
+                    .await
+                    .unwrap(),
+                "diagnostic"
+            );
+            task.await.unwrap();
+            let (response, task) =
+                body_response(&"x".repeat(crate::http::MAX_ERROR_BODY_BYTES + 1), chunked).await;
+            let error = zerossl_error_body(response, "ZeroSSL test error")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds 65536 bytes"));
+            task.await.unwrap();
+        }
+    }
 
     #[test]
     fn test_zerossl_issuer_key() {
@@ -714,20 +809,13 @@ impl ZeroSslApiIssuer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_owned());
+            let body = zerossl_error_body(resp, "ZeroSSL create error").await?;
             return Err(Error::Other(format!(
                 "ZeroSSL create certificate returned HTTP {status}: {body}"
             )));
         }
 
-        let cert_resp: ZeroSslCertResponse = resp.json().await.map_err(|e| {
-            Error::Other(format!(
-                "failed to parse ZeroSSL create certificate response: {e}"
-            ))
-        })?;
+        let cert_resp: ZeroSslCertResponse = zerossl_json(resp, "ZeroSSL create").await?;
 
         if let Some(ref err) = cert_resp.error {
             return Err(Error::Other(format!(
@@ -767,10 +855,7 @@ impl ZeroSslApiIssuer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_owned());
+            let body = zerossl_error_body(resp, "ZeroSSL email validation error").await?;
             return Err(Error::Other(format!(
                 "ZeroSSL email validation returned HTTP {status}: {body}"
             )));
@@ -809,10 +894,7 @@ impl ZeroSslApiIssuer {
 
             let status = resp.status();
             if !status.is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "<failed to read body>".to_owned());
+                let body = zerossl_error_body(resp, "ZeroSSL status error").await?;
                 warn!(
                     cert_id = cert_id,
                     http_status = %status,
@@ -822,9 +904,7 @@ impl ZeroSslApiIssuer {
                 continue;
             }
 
-            let cert_resp: ZeroSslCertResponse = resp.json().await.map_err(|e| {
-                Error::Other(format!("failed to parse ZeroSSL status response: {e}"))
-            })?;
+            let cert_resp: ZeroSslCertResponse = zerossl_json(resp, "ZeroSSL status").await?;
 
             match cert_resp.status.as_str() {
                 "issued" => {
@@ -873,19 +953,13 @@ impl ZeroSslApiIssuer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_owned());
+            let body = zerossl_error_body(resp, "ZeroSSL download error").await?;
             return Err(Error::Other(format!(
                 "ZeroSSL download returned HTTP {status}: {body}"
             )));
         }
 
-        let download: ZeroSslDownloadResponse = resp
-            .json()
-            .await
-            .map_err(|e| Error::Other(format!("failed to parse ZeroSSL download response: {e}")))?;
+        let download: ZeroSslDownloadResponse = zerossl_json(resp, "ZeroSSL download").await?;
 
         // Concatenate the leaf certificate and CA bundle into a single PEM chain.
         let full_chain = format!("{}{}", download.certificate_crt, download.ca_bundle_crt);
@@ -1016,10 +1090,7 @@ impl Revoker for ZeroSslApiIssuer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| "<failed to read body>".to_owned());
+            let body = zerossl_error_body(resp, "ZeroSSL revoke error").await?;
             return Err(Error::Other(format!(
                 "ZeroSSL revoke returned HTTP {status}: {body}"
             )));

@@ -66,6 +66,19 @@ cargo deny --locked --all-features check licenses bans sources
 
 Use the pinned `cargo-deny` 0.20.2 version from the workflow.
 
+## Outbound response budgets
+
+ACME and ZeroSSL JSON responses are limited to 1 MiB. Error response bodies
+are limited to 64 KiB before parsing or including diagnostic text in errors
+and logs. The reader checks both declared Content-Length and each streamed
+chunk, so chunked or unknown-length responses use the same budget. Oversized
+bodies produce a bounded error message rather than including their contents.
+Transport read errors omit the request URL to protect query credentials.
+
+The shared HTTP client's existing 30-second request timeout includes body
+consumption. A caller-supplied HTTP client's timeout policy is preserved;
+the response size limits apply to that transport as well.
+
 Windows CI places Cargo artifacts, Cargo data and temporary files under
 `D:/BuildCache/certon-ci`; its setup checks the target directory with Cargo
 metadata. Linux/macOS hosted runners use their native runner filesystems and
