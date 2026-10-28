@@ -15,9 +15,12 @@
 //! handler.start("0.0.0.0:80").await?;
 //! ```
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
@@ -26,13 +29,34 @@ use crate::error::{Error, Result};
 // HttpsRedirectHandler
 // ---------------------------------------------------------------------------
 
+/// Resource limits for one redirect listener, shared by all its connections.
+#[derive(Debug, Clone, Copy)]
+pub struct RedirectLimits {
+    /// Maximum admitted connections, including idle readers and blocked writers.
+    /// Excess connections are closed immediately without spawning a task.
+    pub max_connections: usize,
+    /// Total wall-clock budget from acceptance through the final response write.
+    /// Incoming bytes do not reset this deadline.
+    pub connection_timeout: Duration,
+    /// Maximum request-header bytes, including the terminating CRLF pair.
+    pub max_header_bytes: usize,
+}
+
+impl Default for RedirectLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: 256,
+            connection_timeout: Duration::from_secs(10),
+            max_header_bytes: 16 * 1024,
+        }
+    }
+}
+
 /// A simple HTTP server that responds to every request with a `301 Moved
 /// Permanently` redirect to the HTTPS equivalent of the requested URL.
 ///
-/// This handler also serves ACME HTTP-01 challenge responses if an
-/// [`Http01Solver`](crate::solvers::Http01Solver) token map is provided,
-/// allowing the same port-80 listener to handle both redirects and ACME
-/// validation.
+/// Configure a canonical host or allowlist before starting the listener.
+/// Each listener enforces [`RedirectLimits`] and owns all child connections.
 #[derive(Debug, Clone)]
 pub struct HttpsRedirectHandler {
     /// The HTTPS port to redirect to. When set to `443` (default), the port
@@ -45,6 +69,7 @@ pub struct HttpsRedirectHandler {
 
     /// Accepted request hosts when no canonical host is configured.
     allowed_hosts: Vec<String>,
+    limits: RedirectLimits,
 }
 
 impl Default for HttpsRedirectHandler {
@@ -53,6 +78,7 @@ impl Default for HttpsRedirectHandler {
             https_port: 443,
             canonical_host: None,
             allowed_hosts: Vec::new(),
+            limits: RedirectLimits::default(),
         }
     }
 }
@@ -64,6 +90,7 @@ impl HttpsRedirectHandler {
             https_port,
             canonical_host: None,
             allowed_hosts: Vec::new(),
+            limits: RedirectLimits::default(),
         }
     }
 
@@ -79,11 +106,29 @@ impl HttpsRedirectHandler {
         Ok(self)
     }
 
+    /// Set the connection budget, total request/response deadline and header cap.
+    /// Limits must be nonzero; at least four bytes are needed for the header terminator.
+    pub fn with_limits(mut self, limits: RedirectLimits) -> Result<Self> {
+        if limits.max_connections == 0
+            || limits.max_header_bytes < 4
+            || limits.connection_timeout.is_zero()
+            || std::time::Instant::now()
+                .checked_add(limits.connection_timeout)
+                .is_none()
+        {
+            return Err(Error::Config("invalid HTTP redirect limits".into()));
+        }
+        self.limits = limits;
+        Ok(self)
+    }
+
     /// Start the redirect server on the given bind address (e.g.
     /// `"0.0.0.0:80"`).
     ///
     /// Returns a [`JoinHandle`] for the spawned server task. The server runs
-    /// until the handle is dropped or aborted.
+    /// until the handle is aborted. Aborting also cancels all admitted
+    /// connections; await the aborted handle to observe listener shutdown.
+    /// Dropping a Tokio JoinHandle detaches the server and does not stop it.
     pub async fn start(&self, bind_addr: &str) -> Result<JoinHandle<()>> {
         if self.canonical_host.is_none() && self.allowed_hosts.is_empty() {
             return Err(Error::Config(
@@ -97,22 +142,7 @@ impl HttpsRedirectHandler {
             ))
         })?;
 
-        let handler = self.clone();
-
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _addr)) => {
-                        tokio::spawn(handle_redirect_connection(stream, handler.clone()));
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to accept HTTP connection for redirect");
-                    }
-                }
-            }
-        });
-
-        Ok(handle)
+        Ok(tokio::spawn(serve_redirect(listener, self.clone())))
     }
 
     /// Build the HTTPS redirect URL from the request's `Host` header and
@@ -153,62 +183,118 @@ impl HttpsRedirectHandler {
     }
 }
 
-/// Handle a single HTTP connection: parse enough of the request to extract
-/// the Host header and path, then send back a 301 redirect to HTTPS.
-async fn handle_redirect_connection(
-    mut stream: tokio::net::TcpStream,
-    handler: HttpsRedirectHandler,
+async fn serve_redirect(listener: TcpListener, handler: HttpsRedirectHandler) {
+    // JoinSet owns child futures. Dropping the server future aborts them even
+    // while they are waiting for input or socket write capacity.
+    let mut connections = JoinSet::new();
+    let handler = Arc::new(handler);
+    loop {
+        tokio::select! {
+            biased;
+            result = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(e)) = result { debug!(error = %e, "redirect connection task ended"); }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    if connections.len() >= handler.limits.max_connections {
+                        drop(stream);
+                        continue;
+                    }
+                    let Some(deadline) = tokio::time::Instant::now().checked_add(handler.limits.connection_timeout) else {
+                        drop(stream);
+                        continue;
+                    };
+                    let handler = handler.clone();
+                    connections.spawn(async move {
+                        handle_redirect_io(stream, &handler, deadline).await;
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to accept HTTP connection for redirect");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+async fn handle_redirect_connection(stream: tokio::net::TcpStream, handler: HttpsRedirectHandler) {
+    let deadline = tokio::time::Instant::now() + handler.limits.connection_timeout;
+    handle_redirect_io(stream, &handler, deadline).await;
+}
+
+async fn handle_redirect_io<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    handler: &HttpsRedirectHandler,
+    deadline: tokio::time::Instant,
 ) {
-    let mut buf = vec![0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(e) => {
-            debug!(error = %e, "error reading HTTP request for redirect");
+    if tokio::time::timeout_at(deadline, redirect_exchange(&mut stream, handler))
+        .await
+        .is_err()
+    {
+        debug!("HTTP redirect connection deadline exceeded");
+    }
+}
+
+async fn redirect_exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    handler: &HttpsRedirectHandler,
+) {
+    let mut request = Vec::with_capacity(handler.limits.max_header_bytes.min(4096));
+    let mut chunk = [0; 1024];
+    loop {
+        if request.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        let remaining = handler.limits.max_header_bytes - request.len();
+        if remaining == 0 {
+            let _ = stream.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
             return;
         }
-    };
-
-    let request = String::from_utf8_lossy(&buf[..n]);
-
-    // Parse the first line to get the request path.
-    let path = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-
-    // Parse the Host header.
-    let host = request
-        .lines()
-        .find(|line| line.to_lowercase().starts_with("host:"))
-        .map(|line| line[5..].trim())
-        .unwrap_or("localhost");
-
-    let location = match handler.try_redirect_url(host, path) {
-        Ok(location) => location,
-        Err(e) => {
-            debug!(error = %e, "rejecting HTTP redirect request with invalid Host");
-            let response = "HTTP/1.1 400 Bad Request\r\n\
-                            Content-Length: 0\r\n\
-                            Connection: close\r\n\
-                            \r\n";
-            let _ = stream.write_all(response.as_bytes()).await;
-            return;
+        let count = remaining.min(chunk.len());
+        match stream.read(&mut chunk[..count]).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let location = parse_redirect_request(&request, handler);
+    let response = match location {
+        Ok(location) => format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        ),
+        Err(_) => {
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
         }
     };
-
-    let response = format!(
-        "HTTP/1.1 301 Moved Permanently\r\n\
-         Location: {location}\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
-
     if let Err(e) = stream.write_all(response.as_bytes()).await {
         debug!(error = %e, "error writing HTTP redirect response");
     }
+}
+
+fn parse_redirect_request(request: &[u8], handler: &HttpsRedirectHandler) -> Result<String> {
+    let bad_request = || Error::Config("invalid HTTP redirect request".into());
+    let request = std::str::from_utf8(request).map_err(|_| bad_request())?;
+    let header_end = request.find("\r\n\r\n").ok_or_else(bad_request)?;
+    let mut lines = request[..header_end].split("\r\n");
+    let mut first = lines.next().ok_or_else(bad_request)?.split_whitespace();
+    let _method = first.next().ok_or_else(bad_request)?;
+    let path = first.next().ok_or_else(bad_request)?;
+    let version = first.next().ok_or_else(bad_request)?;
+    if first.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(bad_request());
+    }
+    let mut host = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or_else(bad_request)?;
+        if name.eq_ignore_ascii_case("host") {
+            if host.is_some() {
+                return Err(bad_request());
+            }
+            host = Some(value.trim());
+        }
+    }
+    handler.try_redirect_url(host.unwrap_or(""), path)
 }
 
 /// Convenience function: start an HTTP→HTTPS redirect server on `bind_addr`.
@@ -325,6 +411,222 @@ fn sanitize_redirect_path(path: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limited_handler(timeout: Duration, max_connections: usize) -> HttpsRedirectHandler {
+        HttpsRedirectHandler::default()
+            .with_canonical_host("example.com")
+            .unwrap()
+            .with_limits(RedirectLimits {
+                max_connections,
+                connection_timeout: timeout,
+                max_header_bytes: 8192,
+            })
+            .unwrap()
+    }
+
+    async fn test_server(handler: HttpsRedirectHandler) -> (std::net::SocketAddr, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        (address, tokio::spawn(serve_redirect(listener, handler)))
+    }
+
+    async fn read_closed(stream: &mut tokio::net::TcpStream) {
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("connection must close");
+        match result {
+            Ok(0) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!("unexpected connection result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_connections_expire() {
+        let (address, task) = test_server(limited_handler(Duration::from_millis(60), 2)).await;
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        read_closed(&mut client).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn connection_limit_rejects_excess_and_releases_capacity() {
+        let (address, task) = test_server(limited_handler(Duration::from_secs(5), 1)).await;
+        let mut first = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        read_closed(&mut excess).await;
+        first
+            .write_all(b"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), first.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 301"));
+        let mut next = tokio::net::TcpStream::connect(address).await.unwrap();
+        next.write_all(b"GET /next HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        response.clear();
+        tokio::time::timeout(Duration::from_secs(2), next.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.contains("https://example.com/next"));
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn aborting_listener_cancels_admitted_idle_connections() {
+        let (address, task) = test_server(limited_handler(Duration::from_secs(60), 1)).await;
+        let mut first = tokio::net::TcpStream::connect(address).await.unwrap();
+        // Rejection of the second connection proves the first was admitted.
+        let mut excess = tokio::net::TcpStream::connect(address).await.unwrap();
+        read_closed(&mut excess).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        read_closed(&mut first).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn trickled_bytes_do_not_extend_total_deadline() {
+        let handler = limited_handler(Duration::from_millis(100), 2);
+        let (mut client, server) = tokio::io::duplex(64);
+        let deadline = tokio::time::Instant::now() + handler.limits.connection_timeout;
+        let task = tokio::spawn(async move {
+            handle_redirect_io(server, &handler, deadline).await;
+        });
+        let writer = tokio::spawn(async move {
+            for _ in 0..30 {
+                if client.write_all(b"G").await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("slow request was allowed to reset its deadline");
+        });
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_response_write_uses_the_same_deadline() {
+        let handler = limited_handler(Duration::from_millis(100), 2);
+        let (mut client, server) = tokio::io::duplex(16);
+        let deadline = tokio::time::Instant::now() + handler.limits.connection_timeout;
+        let task = tokio::spawn(async move {
+            handle_redirect_io(server, &handler, deadline).await;
+        });
+        let request = format!(
+            "GET /{} HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "p".repeat(4096)
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        // Do not read: the 16-byte output buffer forces the server write to wait.
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(!response.is_empty());
+        assert!(!response.windows(4).any(|w| w == b"\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn oversized_headers_are_rejected_within_budget() {
+        let handler = limited_handler(Duration::from_secs(2), 2)
+            .with_limits(RedirectLimits {
+                max_header_bytes: 64,
+                ..RedirectLimits::default()
+            })
+            .unwrap();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            handle_redirect_io(
+                server,
+                &handler,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        });
+        client.write_all(&[b'X'; 128]).await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 431"));
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn invalid_limits_are_rejected() {
+        for limits in [
+            RedirectLimits {
+                max_connections: 0,
+                ..RedirectLimits::default()
+            },
+            RedirectLimits {
+                connection_timeout: Duration::ZERO,
+                ..RedirectLimits::default()
+            },
+            RedirectLimits {
+                max_header_bytes: 3,
+                ..RedirectLimits::default()
+            },
+        ] {
+            assert!(HttpsRedirectHandler::default().with_limits(limits).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn fragmented_request_waits_for_complete_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let handler = HttpsRedirectHandler::default()
+            .with_canonical_host("example.com")
+            .unwrap();
+        let task = tokio::spawn(handle_redirect_connection(stream, handler));
+        client.write_all(b"GET /path HTTP/1.1\r\nHo").await.unwrap();
+        let mut byte = [0];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), client.read(&mut byte))
+                .await
+                .is_err(),
+            "must wait for the full headers"
+        );
+        client.write_all(b"st: example.com\r\n\r\n").await.unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.contains("Location: https://example.com/path\r\n"));
+        task.await.unwrap();
+    }
 
     #[test]
     fn test_redirect_url_default_port() {

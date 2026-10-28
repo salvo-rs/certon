@@ -146,3 +146,16 @@ Distributed HTTP-01 challenge storage:
 - Challenge tokens/thumbprints are limited to 512 base64url characters. New
   entry JSON is limited to 4 KiB on reading; legacy maps to 64 KiB. Storage is
   a whole-value API, so backends must separately enforce allocation limits.
+
+HTTP redirect listener resource limits:
+
+- `HttpsRedirectHandler` defaults to 256 admitted connections per listener,
+  a 10-second total acceptance-to-response deadline, and a 16 KiB header cap.
+  Configure these with `.with_limits(RedirectLimits { ... })`. Over-budget
+  connections are closed without spawning tasks; oversized headers receive
+  431 when the connection can write within its remaining deadline.
+- The deadline includes fragmented/slow header reads and response writes;
+  incoming bytes do not extend it. The listener waits for complete headers.
+- Abort the `JoinHandle` returned by `.start()` and await it to stop the
+  listener. Its owned connection tasks are cancelled on shutdown. Dropping
+  that handle only detaches the server, following Tokio's normal semantics.

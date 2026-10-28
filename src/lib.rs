@@ -98,7 +98,9 @@ pub use maintain::MaintenanceConfig;
 pub use manager::{CertManager, CertManagerBuilder};
 pub use ocsp::OcspConfig;
 pub use policy::{CertificateSelector, IssuerPolicy, Policy};
-pub use redirect::{HttpsRedirectHandler, start_https_redirect, start_https_redirect_to_host};
+pub use redirect::{
+    HttpsRedirectHandler, RedirectLimits, start_https_redirect, start_https_redirect_to_host,
+};
 pub use solvers::{DistributedSolver, Http01Solver, Solver, TlsAlpn01Solver};
 #[cfg(feature = "dns-01")]
 pub use solvers::{Dns01Solver, DnsProvider};
