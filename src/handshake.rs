@@ -327,12 +327,14 @@ impl CertResolver {
         debug!(sni = %name, "resolving certificate for TLS handshake");
 
         // Step 1: Look up the exact name in the certificate cache.
-        if let Some(result) = self.try_resolve_from_cache_with_ocsp_check(&name, schemes) {
+        let (cached_match, selected) = self.try_resolve_from_cache_with_ocsp_check(&name, schemes);
+        if let Some(result) = selected {
             return Some(result);
         }
 
-        // Step 2: On-demand TLS — trigger background certificate acquisition.
-        if let Some(ref on_demand) = self.on_demand {
+        // Step 2: Obtain only for a true cache miss. A client advertising an
+        // incompatible algorithm must not spend the issuance rate-limit budget.
+        if !cached_match && let Some(ref on_demand) = self.on_demand {
             if on_demand.is_allowed(&name) {
                 self.trigger_on_demand_obtain(on_demand, &name);
                 debug!(
@@ -373,6 +375,7 @@ impl CertResolver {
         schemes: Option<&[SignatureScheme]>,
     ) -> Option<Arc<CertifiedKey>> {
         self.resolve_cached_key(name, schemes)
+            .selected
             .map(|cached| cached.key)
     }
 
@@ -380,12 +383,18 @@ impl CertResolver {
         &self,
         name: &str,
         schemes: Option<&[SignatureScheme]>,
-    ) -> Option<crate::cache::CachedKey> {
+    ) -> crate::cache::CachedKeyLookup {
         match schemes {
             Some(schemes) => self
                 .cache
                 .resolve_with_filter(name, |key| key.key.choose_scheme(schemes).is_some()),
-            None => self.cache.resolve(name),
+            None => {
+                let selected = self.cache.resolve(name);
+                crate::cache::CachedKeyLookup {
+                    matched: selected.is_some(),
+                    selected,
+                }
+            }
         }
     }
 
@@ -393,8 +402,11 @@ impl CertResolver {
         &self,
         name: &str,
         schemes: Option<&[SignatureScheme]>,
-    ) -> Option<Arc<CertifiedKey>> {
-        let cached = self.resolve_cached_key(name, schemes)?;
+    ) -> (bool, Option<Arc<CertifiedKey>>) {
+        let lookup = self.resolve_cached_key(name, schemes);
+        let Some(cached) = lookup.selected else {
+            return (lookup.matched, None);
+        };
         if cached.needs_ocsp
             && let Some(refresh_fn) = &self.ocsp_refresh_func
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -407,7 +419,7 @@ impl CertResolver {
                 refresh(domain).await;
             });
         }
-        Some(cached.key)
+        (lookup.matched, Some(cached.key))
     }
 
     fn trigger_on_demand_obtain(&self, on_demand: &Arc<OnDemandConfig>, name: &str) {

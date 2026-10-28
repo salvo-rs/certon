@@ -49,6 +49,27 @@ fn handshake(
     sni: bool,
     acme: bool,
 ) -> (Result<Vec<u8>, rustls::Error>, Arc<RecordingResolver>) {
+    handshake_with_name(
+        Arc::new(RecordingResolver {
+            inner: resolver,
+            selections: Mutex::new(Vec::new()),
+        }),
+        trusted,
+        scheme,
+        "example.com",
+        sni,
+        acme,
+    )
+}
+
+fn handshake_with_name(
+    resolver: Arc<RecordingResolver>,
+    trusted: &[&Certificate],
+    scheme: SignatureScheme,
+    name: &str,
+    sni: bool,
+    acme: bool,
+) -> (Result<Vec<u8>, rustls::Error>, Arc<RecordingResolver>) {
     certon::install_default_crypto_provider();
     let mut provider = rustls::crypto::CryptoProvider::get_default()
         .unwrap()
@@ -74,10 +95,6 @@ fn handshake(
         .with_root_certificates(roots)
         .with_no_client_auth();
     client_config.enable_sni = sni;
-    let resolver = Arc::new(RecordingResolver {
-        inner: resolver,
-        selections: Mutex::new(Vec::new()),
-    });
     let mut server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver.clone());
@@ -86,7 +103,8 @@ fn handshake(
         server_config.alpn_protocols = client_config.alpn_protocols.clone();
     }
     let mut client =
-        ClientConnection::new(Arc::new(client_config), "example.com".try_into().unwrap()).unwrap();
+        ClientConnection::new(Arc::new(client_config), name.to_owned().try_into().unwrap())
+            .unwrap();
     let mut server = ServerConnection::new(Arc::new(server_config)).unwrap();
     let result = (|| {
         for _ in 0..10 {
@@ -105,6 +123,79 @@ fn handshake(
         panic!("TLS handshake did not complete");
     })();
     (result, resolver)
+}
+
+#[tokio::test(start_paused = true)]
+async fn incompatible_cached_keys_preserve_on_demand_budget_for_real_cache_misses() {
+    use std::time::Duration;
+
+    use certon::OnDemandConfig;
+    use certon::rate_limiter::RateLimiter;
+
+    for (cached_name, server_name) in [
+        ("example.com", "example.com"),
+        ("*.example.com", "tenant.example.com"),
+    ] {
+        let cert = certificate(&[cached_name], false, 2040);
+        let cache = CertCache::new(CacheOptions::default());
+        cache.add(cert.clone()).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let obtained = Arc::new(tokio::sync::Notify::new());
+        let config = Arc::new(OnDemandConfig {
+            decision_func: Some(Arc::new(|_| true)),
+            host_allowlist: None,
+            rate_limit: Some(Arc::new(RateLimiter::new(1, Duration::from_secs(3600)))),
+            obtain_func: Some(Arc::new({
+                let calls = calls.clone();
+                let obtained = obtained.clone();
+                move |name| {
+                    let calls = calls.clone();
+                    let obtained = obtained.clone();
+                    Box::pin(async move {
+                        calls.lock().unwrap().push(name);
+                        obtained.notify_one();
+                        Ok(())
+                    })
+                }
+            })),
+        });
+        let resolver = Arc::new(RecordingResolver {
+            inner: CertResolver::with_on_demand(cache, config),
+            selections: Mutex::new(Vec::new()),
+        });
+        let (result, _) = handshake_with_name(
+            resolver.clone(),
+            &[&cert],
+            SignatureScheme::ED25519,
+            server_name,
+            true,
+            false,
+        );
+        assert!(result.is_err());
+        // Paused time advances only once runnable obtain tasks have completed;
+        // this is not an assertion made before a mistakenly spawned task runs.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "cached {cached_name} triggered an obtain"
+        );
+
+        let (result, _) = handshake_with_name(
+            resolver,
+            &[&cert],
+            SignatureScheme::ED25519,
+            "missing.test",
+            true,
+            false,
+        );
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), obtained.notified())
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["missing.test"]);
+        // The one-event limiter and same resolver are shared across both real
+        // handshakes: success here also proves the cached miss spent no budget.
+    }
 }
 
 #[tokio::test]
