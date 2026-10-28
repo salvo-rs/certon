@@ -613,8 +613,8 @@ async fn legacy_domain_at_portable_filename_boundary_remains_supported() {
         "d".repeat(58)
     );
     assert_eq!(domain.len(), 250);
-    // Seed an existing legacy file directly: this exercises the reader's
-    // 255-byte basename boundary independently of atomic-writer temp names.
+    // Seed an existing legacy file directly so the regression exercises the
+    // cleanup rewrite with siblings, independently of how the old file arose.
     tokio::fs::create_dir(directory.path().join("challenge_tokens"))
         .await
         .unwrap();
@@ -622,27 +622,44 @@ async fn legacy_domain_at_portable_filename_boundary_remains_supported() {
         directory
             .path()
             .join(format!("challenge_tokens/{domain}.json")),
-        br#"{"Token":"Token.legacy"}"#,
+        br#"{"Token":"Token.legacy","Sibling":"Sibling.auth"}"#,
     )
     .await
     .unwrap();
+    let solver = DistributedSolver::new(Box::new(Noop), storage.clone());
+    solver.present(&domain, "Token", "Token.new").await.unwrap();
     let handler = HttpChallengeHandler::new(Arc::default(), Some(storage.clone()));
     assert_eq!(
         handler
             .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
             .await
             .unwrap(),
-        Some((200, "Token.legacy".into()))
+        Some((200, "Token.new".into()))
     );
-    DistributedSolver::new(Box::new(Noop), storage)
-        .cleanup(&domain, "Token", "Token.legacy")
-        .await
-        .unwrap();
+    solver.cleanup(&domain, "Token", "Token.new").await.unwrap();
     assert_eq!(
         handler
             .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Token")
             .await
             .unwrap(),
         Some((404, String::new()))
+    );
+    assert_eq!(
+        handler
+            .try_handle_http_request("GET", &domain, "/.well-known/acme-challenge/Sibling")
+            .await
+            .unwrap(),
+        Some((200, "Sibling.auth".into()))
+    );
+    let map: HashMap<String, String> = serde_json::from_slice(
+        &storage
+            .load(&format!("challenge_tokens/{domain}.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        map,
+        HashMap::from([("Sibling".into(), "Sibling.auth".into())])
     );
 }
