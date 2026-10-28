@@ -120,3 +120,26 @@ pairs. Use `(0, Duration::ZERO)` to disable limiting. Existing individual setter
 retain their signatures and now reject invalid pairs with the same panic policy
 as `new`, rather than leaving a waiter spinning forever. All updates wake
 existing waiters to recheck the policy; recorded event history is retained.
+
+Distributed HTTP-01 challenge storage:
+
+- `DistributedSolver` now writes version-2 JSON entries at
+  `<issuer-prefix>/challenge_tokens/v2/<SHA256(canonical-domain)>/<SHA256(token)>.json`.
+  The payload binds the original case-sensitive token to its canonical domain.
+  Tokens for one domain no longer share a read/modify/write JSON map.
+- `HttpChallengeHandler::handle_http_request` looks up the exact Host and token
+  without listing unrelated challenges. It returns 503 on storage failures;
+  `try_handle_http_request` exposes the underlying error. Malformed tokens and
+  Hosts are rejected before storage access. The local token map must be bound
+  with `.with_domain("example.com")` to serve Host-aware requests. The legacy
+  path-only API still supports local maps; bind a domain to enable storage.
+- Readers also accept the previous `<safe-domain>.json` token map for canonical
+  DNS names and IPv4 addresses. Ambiguous legacy IPv6 keys are not accepted.
+  Legacy cleanup preserves sibling tokens under a storage lock and reports
+  backend or corrupt-JSON errors instead of treating them as empty data.
+  Stop old distributed writers before upgrading the cluster: old writers do
+  not honor the new cleanup locks, and old readers cannot consume v2 entries.
+  Finish or retry pending challenges during this coordinated upgrade.
+- Challenge tokens/thumbprints are limited to 512 base64url characters. New
+  entry JSON is limited to 4 KiB on reading; legacy maps to 64 KiB. Storage is
+  a whole-value API, so backends must separately enforce allocation limits.
