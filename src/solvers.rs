@@ -52,7 +52,31 @@ use crate::error::{Error, Result};
 use crate::storage::Storage;
 
 /// Prebuilt challenge signing keys shared by every connection.
-type ChallengeMap = Arc<SyncRwLock<HashMap<String, Arc<rustls::sign::CertifiedKey>>>>;
+type ChallengeMap = Arc<SyncRwLock<HashMap<String, TlsChallenge>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChallengeOwner {
+    token: String,
+    key_auth: String,
+}
+
+impl ChallengeOwner {
+    fn new(token: &str, key_auth: &str) -> Self {
+        Self {
+            token: token.to_owned(),
+            key_auth: key_auth.to_owned(),
+        }
+    }
+    fn matches(&self, token: &str, key_auth: &str) -> bool {
+        self.token == token && self.key_auth == key_auth
+    }
+}
+
+#[derive(Debug)]
+struct TlsChallenge {
+    owner: ChallengeOwner,
+    key: Arc<rustls::sign::CertifiedKey>,
+}
 
 #[derive(Clone, Copy)]
 struct ChallengeLimits {
@@ -213,9 +237,9 @@ async fn finish_stopped_challenge_server(handle: &mut Option<ChallengeServer>) {
 /// registers the identifier (token or domain) and key authorization here.
 /// On cleanup, the entry is removed. This allows looking up active
 /// challenges globally without direct access to a specific solver instance.
-static ACTIVE_CHALLENGES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+static ACTIVE_CHALLENGES: OnceLock<RwLock<HashMap<String, ChallengeOwner>>> = OnceLock::new();
 
-fn active_challenges() -> &'static RwLock<HashMap<String, String>> {
+fn active_challenges() -> &'static RwLock<HashMap<String, ChallengeOwner>> {
     ACTIVE_CHALLENGES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -230,43 +254,23 @@ pub fn get_active_challenge(identifier: &str) -> Option<String> {
         Ok(_handle) => {
             // Cannot block_on inside async; try_read instead.
             let map = active_challenges().try_read().ok()?;
-            map.get(identifier).cloned()
+            map.get(identifier).map(|owner| owner.key_auth.clone())
         }
         Err(_) => None,
     }
 }
 
-/// Register an active challenge in the global map.
-async fn register_active_challenge(identifier: &str, key_auth: &str) -> Option<String> {
-    active_challenges()
-        .write()
-        .await
-        .insert(identifier.to_string(), key_auth.to_string())
-}
-
-async fn restore_active_challenge(identifier: &str, attempted: &str, previous: Option<String>) {
-    let mut map = active_challenges().write().await;
-    if map.get(identifier).is_some_and(|auth| auth == attempted) {
-        if let Some(previous) = previous {
-            map.insert(identifier.to_owned(), previous);
-        } else {
-            map.remove(identifier);
-        }
-    }
-}
-
-/// Remove an active challenge from the global map.
-async fn unregister_active_challenge(identifier: &str) {
-    let mut map = active_challenges().write().await;
-    map.remove(identifier);
-}
-
-/// Remove only the authorization owned by this HTTP cleanup operation.
-async fn unregister_active_challenge_if_matching(identifier: &str, key_auth: &str) {
-    let mut map = active_challenges().write().await;
+/// The caller holds the registry write guard while updating the local map,
+/// so cancellation cannot split cleanup/publication between the two records.
+fn unregister_active_challenge_if_matching(
+    map: &mut HashMap<String, ChallengeOwner>,
+    identifier: &str,
+    token: &str,
+    key_auth: &str,
+) {
     if map
         .get(identifier)
-        .is_some_and(|current| current == key_auth)
+        .is_some_and(|current| current.matches(token, key_auth))
     {
         map.remove(identifier);
     }
@@ -530,23 +534,13 @@ impl Solver for Http01Solver {
     async fn present(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
         let mut handle = self.server_handle.lock().await;
         finish_stopped_challenge_server(&mut handle).await;
-        let previous = self
-            .challenges
-            .write()
-            .await
-            .insert(token.to_owned(), key_auth.to_owned());
-        let previous_global = register_active_challenge(token, key_auth).await;
-        if let Err(error) = self.ensure_server_running(&mut handle).await {
-            let mut challenges = self.challenges.write().await;
-            if let Some(previous) = previous {
-                challenges.insert(token.to_owned(), previous);
-            } else {
-                challenges.remove(token);
-            }
-            drop(challenges);
-            restore_active_challenge(token, key_auth, previous_global).await;
-            return Err(error);
-        }
+        // Bind before publishing: rollback cannot establish that a previous
+        // registration still belongs to a live owner after another cleanup.
+        self.ensure_server_running(&mut handle).await?;
+        let mut registry = active_challenges().write().await;
+        let mut challenges = self.challenges.write().await;
+        challenges.insert(token.to_owned(), key_auth.to_owned());
+        registry.insert(token.to_owned(), ChallengeOwner::new(token, key_auth));
         debug!(token, "HTTP-01 challenge presented");
         Ok(())
     }
@@ -554,6 +548,7 @@ impl Solver for Http01Solver {
     async fn cleanup(&self, _domain: &str, token: &str, key_auth: &str) -> Result<()> {
         let mut handle = self.server_handle.lock().await;
         let should_stop = {
+            let mut registry = active_challenges().write().await;
             let mut challenges = self.challenges.write().await;
             if challenges
                 .get(token)
@@ -561,9 +556,9 @@ impl Solver for Http01Solver {
             {
                 challenges.remove(token);
             }
+            unregister_active_challenge_if_matching(&mut registry, token, token, key_auth);
             challenges.is_empty()
         };
-        unregister_active_challenge_if_matching(token, key_auth).await;
 
         if should_stop {
             stop_challenge_server(&mut handle).await;
@@ -601,6 +596,8 @@ const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 /// handshake deadline; [`Self::with_limits`] overrides both values. Final
 /// cleanup awaits every accepted connection. Drop requests shutdown without
 /// synchronously waiting for the runtime to release those connections.
+/// Cleanup removes a challenge only when both its original token and key
+/// authorization match, so an older cleanup cannot withdraw a replacement.
 ///
 /// **Important**: Port 443 must be reachable from the internet, and the
 /// client's SNI value must match the domain being validated.
@@ -716,6 +713,7 @@ impl TlsAlpn01Solver {
                 "failed to bind TLS-ALPN-01 challenge server on {addr}: {e}"
             ))
         })?;
+        crate::install_default_crypto_provider();
         let resolver = ChallengeCertResolver {
             challenges: Arc::clone(&self.challenges),
         };
@@ -758,43 +756,47 @@ impl std::fmt::Debug for TlsAlpn01Solver {
 
 #[async_trait]
 impl Solver for TlsAlpn01Solver {
-    async fn present(&self, domain: &str, _token: &str, key_auth: &str) -> Result<()> {
+    async fn present(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
         let (certs, key_der) = Self::generate_challenge_cert(domain, key_auth)?;
         let key = crate::handshake::signing_key_from_der(&key_der)
             .map_err(|e| Error::Other(format!("failed to load challenge signing key: {e}")))?;
-        let prepared = Arc::new(rustls::sign::CertifiedKey::new(certs, key));
+        let prepared = TlsChallenge {
+            key: Arc::new(rustls::sign::CertifiedKey::new(certs, key)),
+            owner: ChallengeOwner {
+                token: token.to_owned(),
+                key_auth: key_auth.to_owned(),
+            },
+        };
         let mut handle = self.server_handle.lock().await;
         finish_stopped_challenge_server(&mut handle).await;
-        let previous = self
-            .challenges
+        // The resolver shares the map, so an empty listener can be prepared
+        // before the proof is published. The CA is notified only after present.
+        self.ensure_server_running(&mut handle).await?;
+        let mut registry = active_challenges().write().await;
+        self.challenges
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(domain.to_owned(), prepared);
-        let previous_global = register_active_challenge(domain, key_auth).await;
-        if let Err(error) = self.ensure_server_running(&mut handle).await {
-            {
-                let mut challenges = self.challenges.write().unwrap_or_else(|e| e.into_inner());
-                if let Some(previous) = previous {
-                    challenges.insert(domain.to_owned(), previous);
-                } else {
-                    challenges.remove(domain);
-                }
-            }
-            restore_active_challenge(domain, key_auth, previous_global).await;
-            return Err(error);
-        }
+        registry.insert(domain.to_owned(), ChallengeOwner::new(token, key_auth));
         debug!(domain, "TLS-ALPN-01 challenge presented");
         Ok(())
     }
 
-    async fn cleanup(&self, domain: &str, _token: &str, _key_auth: &str) -> Result<()> {
+    async fn cleanup(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
         let mut handle = self.server_handle.lock().await;
         let should_stop = {
+            let mut registry = active_challenges().write().await;
             let mut challenges = self.challenges.write().unwrap_or_else(|e| e.into_inner());
-            challenges.remove(domain);
+            if challenges
+                .get(domain)
+                .is_some_and(|current| current.owner.matches(token, key_auth))
+            {
+                challenges.remove(domain);
+            }
+            unregister_active_challenge_if_matching(&mut registry, domain, token, key_auth);
             challenges.is_empty()
         };
-        unregister_active_challenge(domain).await;
+
         if should_stop {
             stop_challenge_server(&mut handle).await;
         }
@@ -827,7 +829,7 @@ impl rustls::server::ResolvesServerCert for ChallengeCertResolver {
         let sni = client_hello.server_name()?;
 
         let challenges = self.challenges.read().unwrap_or_else(|e| e.into_inner());
-        let key = challenges.get(sni)?;
+        let key = &challenges.get(sni)?.key;
         key.key.choose_scheme(client_hello.signature_schemes())?;
         Some(Arc::clone(key))
     }
@@ -1463,7 +1465,10 @@ mod tests {
             .write()
             .await
             .insert("cancelled-old".into(), "old.thumb".into());
-        register_active_challenge("cancelled-old", "old.thumb").await;
+        active_challenges().write().await.insert(
+            "cancelled-old".into(),
+            ChallengeOwner::new("cancelled-old", "old.thumb"),
+        );
         let accepting_second = Arc::new(tokio::sync::Notify::new());
         let dropping_accept = Arc::new(tokio::sync::Notify::new());
         let release = Release(Arc::new((
@@ -1599,7 +1604,7 @@ mod tests {
                 .read()
                 .await
                 .get(token)
-                .map(String::as_str),
+                .map(|owner| owner.key_auth.as_str()),
             Some("new-auth")
         );
         let handle = solver.server_handle.lock().await;
@@ -1630,7 +1635,7 @@ mod tests {
                 .read()
                 .await
                 .get(token)
-                .map(String::as_str),
+                .map(|owner| owner.key_auth.as_str()),
             Some("new-auth")
         );
         assert!(old.server_handle.lock().await.is_none());
@@ -1698,7 +1703,135 @@ mod tests {
     // -- TlsAlpn01Solver ---------------------------------------------------
 
     #[tokio::test]
-    async fn tls_bind_failure_rolls_back_only_its_attempted_challenge() {
+    async fn tls_stale_cleanup_keeps_the_replacement_token_and_proof() {
+        crate::install_default_crypto_provider();
+        for same_auth in [false, true] {
+            let solver = TlsAlpn01Solver::new(0);
+            let domain = "tls-local-owner.example";
+            let new_auth = if same_auth { "old.thumb" } else { "new.thumb" };
+            solver.present(domain, "old", "old.thumb").await.unwrap();
+            solver.present(domain, "new", new_auth).await.unwrap();
+            let task = solver.server_handle.lock().await.as_ref().unwrap().id();
+            let registered = active_challenges().read().await.get(domain).cloned();
+            let mut stale = vec![("old", "old.thumb"), ("old", new_auth)];
+            if !same_auth {
+                stale.push(("new", "old.thumb"));
+            }
+            for (token, auth) in stale {
+                solver.cleanup(domain, token, auth).await.unwrap();
+                assert!(
+                    solver.challenges.read().unwrap().contains_key(domain),
+                    "an old cleanup removed the replacement"
+                );
+                assert_eq!(
+                    active_challenges().read().await.get(domain).cloned(),
+                    registered
+                );
+                assert_eq!(
+                    solver.server_handle.lock().await.as_ref().unwrap().id(),
+                    task
+                );
+            }
+            solver.cleanup(domain, "new", new_auth).await.unwrap();
+            assert!(solver.challenges.read().unwrap().is_empty());
+            assert!(!active_challenges().read().await.contains_key(domain));
+            assert!(solver.server_handle.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_cleanup_preserves_a_different_solver_global_owner() {
+        crate::install_default_crypto_provider();
+        let old = TlsAlpn01Solver::new(0);
+        let new = TlsAlpn01Solver::new(0);
+        let domain = "tls-global-owner.example";
+        old.present(domain, "old", "old.thumb").await.unwrap();
+        new.present(domain, "new", "new.thumb").await.unwrap();
+        let registered = active_challenges().read().await.get(domain).cloned();
+        old.cleanup(domain, "old", "old.thumb").await.unwrap();
+        assert_eq!(
+            active_challenges().read().await.get(domain).cloned(),
+            registered
+        );
+        assert!(old.server_handle.lock().await.is_none());
+        assert!(new.server_handle.lock().await.is_some());
+        new.cleanup(domain, "new", "new.thumb").await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_last_cleanup_and_present_preserve_the_new_listener() {
+        crate::install_default_crypto_provider();
+        let solver = Arc::new(TlsAlpn01Solver::new(0));
+        for iteration in 0..16 {
+            let old = format!("tls-old-{iteration}.example");
+            let new = format!("tls-new-{iteration}.example");
+            solver.present(&old, "old", "old.thumb").await.unwrap();
+            let gate = Arc::new(tokio::sync::Barrier::new(3));
+            let cleanup = tokio::spawn({
+                let solver = solver.clone();
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    solver.cleanup(&old, "old", "old.thumb").await.unwrap();
+                }
+            });
+            let present = tokio::spawn({
+                let solver = solver.clone();
+                let gate = gate.clone();
+                let new = new.clone();
+                async move {
+                    gate.wait().await;
+                    solver.present(&new, "new", "new.thumb").await.unwrap();
+                }
+            });
+            gate.wait().await;
+            cleanup.await.unwrap();
+            present.await.unwrap();
+            assert!(solver.challenges.read().unwrap().contains_key(&new));
+            assert!(
+                !solver
+                    .server_handle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .is_finished()
+            );
+            solver.cleanup(&new, "new", "new.thumb").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_bind_failure_does_not_wait_for_or_mutate_the_global_registry() {
+        crate::install_default_crypto_provider();
+        let occupied = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let solver = TlsAlpn01Solver::new(occupied.local_addr().unwrap().port());
+        let domain = "tls-no-publication-on-failure.example";
+        let original = ChallengeOwner {
+            token: "foreign".into(),
+            key_auth: "foreign.thumb".into(),
+        };
+        let mut registry = active_challenges().write().await;
+        registry.insert(domain.into(), original.clone());
+        // Another owner's registry transaction remains in progress. A bind
+        // failure must return without staging a new registration or capturing
+        // an old registration that could be restored after its owner cleans up.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            solver.present(domain, "new", "new.thumb"),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "a failed bind must precede registry publication"
+        );
+        assert!(solver.challenges.read().unwrap().is_empty());
+        assert_eq!(registry.get(domain), Some(&original));
+        registry.remove(domain);
+    }
+
+    #[tokio::test]
+    async fn tls_bind_failure_preserves_the_existing_challenge() {
         crate::install_default_crypto_provider();
         let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserved.local_addr().unwrap().port();
@@ -1707,20 +1840,20 @@ mod tests {
         let failed = TlsAlpn01Solver::new(port);
         let domain = "tls-bind-rollback.example";
         original.present(domain, "old", "old.thumb").await.unwrap();
-        let original_key = original.challenges.read().unwrap()[domain].clone();
+        let original_key = original.challenges.read().unwrap()[domain].key.clone();
         assert!(failed.present(domain, "new", "new.thumb").await.is_err());
         assert!(failed.challenges.read().unwrap().is_empty());
         assert!(failed.server_handle.lock().await.is_none());
         assert!(Arc::ptr_eq(
             &original_key,
-            &original.challenges.read().unwrap()[domain]
+            &original.challenges.read().unwrap()[domain].key
         ));
         assert_eq!(
             active_challenges()
                 .read()
                 .await
                 .get(domain)
-                .map(String::as_str),
+                .map(|owner| owner.key_auth.as_str()),
             Some("old.thumb")
         );
         assert!(
