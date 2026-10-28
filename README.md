@@ -17,7 +17,7 @@ use certon::CertManager;
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let domains = vec!["example.com".into()];
-    let tls_config = certon::manage(&domains).await?;
+    let tls_config = certon::manage_with_agreement(&domains, true).await?;
     // Use tls_config with tokio-rustls, hyper, axum, salvo, etc.
     Ok(())
 }
@@ -147,7 +147,12 @@ rather than a puzzling "unknown key type".
 
 ## Quick Start
 
-The simplest way to get started -- one function call manages everything:
+Review the CA terms before passing `true` to `manage_with_agreement`. The
+original `manage()` and `obtain()` retain agreement disabled; new accounts
+require explicit consent. For recurring renewal, keep a `CertManager` and call
+`certon::start_maintenance(&manager)` as shown below.
+
+The simplest way to get started -- one function call obtains or loads the certificates:
 
 ```rust
 use certon::CertManager;
@@ -158,7 +163,7 @@ async fn main() -> certon::Result<()> {
 
     // Obtain (or load from storage) certificates and return a
     // rustls::ServerConfig ready for use with any TLS server.
-    let tls_config = certon::manage(&domains).await?;
+    let tls_config = certon::manage_with_agreement(&domains, true).await?;
 
     // Use tls_config with tokio-rustls, hyper, axum, salvo, etc.
     Ok(())
@@ -181,8 +186,15 @@ use certon::{CertManager, FileStorage, Storage};
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
+    // Review the CA terms before setting agreed(true).
+    let issuer = certon::AcmeIssuer::builder()
+        .storage(storage.clone())
+        .agreed(true)
+        .http01_solver(Arc::new(certon::Http01Solver::default()))
+        .build();
     let manager = CertManager::builder()
         .storage(storage)
+        .issuers(vec![Arc::new(issuer)])
         .build();
 
     let domains = vec!["example.com".into(), "www.example.com".into()];
@@ -190,6 +202,8 @@ async fn main() -> certon::Result<()> {
 
     // Start background maintenance (renewal + OCSP refresh).
     let _handle = certon::start_maintenance(&manager);
+    tokio::signal::ctrl_c().await.ok();
+    manager.cache.stop_and_wait().await;
 
     Ok(())
 }

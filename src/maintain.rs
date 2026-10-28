@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::async_jobs::JobQueue;
 use crate::cache::CertCache;
+use crate::cert_store::{CertStore, KeyValueCertStore};
 use crate::certificates::{Certificate, DEFAULT_RENEWAL_WINDOW_RATIO};
 use crate::error::Result;
 use crate::ocsp::{self, OcspConfig};
@@ -97,6 +98,23 @@ impl std::fmt::Debug for MaintenanceConfig {
 /// for that domain. It returns `Ok(())` on success or an error on failure.
 pub type RenewFn = dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
 
+/// Why maintenance requested a certificate renewal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenewalReason {
+    Expiring,
+    Revoked,
+}
+
+pub type ReasonedRenewFn =
+    dyn Fn(String, RenewalReason) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
+
+#[derive(Clone)]
+struct RenewalPolicy {
+    renew: Arc<ReasonedRenewFn>,
+    certificates: Arc<dyn CertStore>,
+    ratio: f64,
+}
+
 // ---------------------------------------------------------------------------
 // start_maintenance
 // ---------------------------------------------------------------------------
@@ -123,6 +141,30 @@ pub fn start_maintenance(
     config: MaintenanceConfig,
     renew_func: Arc<RenewFn>,
 ) -> JoinHandle<()> {
+    let certificates = Arc::new(KeyValueCertStore::new(config.storage.clone()));
+    let renew = Arc::new(move |domain, _reason| renew_func(domain));
+    start_maintenance_with_policy(
+        cache,
+        config,
+        renew,
+        certificates,
+        DEFAULT_RENEWAL_WINDOW_RATIO,
+    )
+}
+
+/// Start maintenance using the manager's certificate store and renewal policy.
+pub fn start_maintenance_with_policy(
+    cache: Arc<CertCache>,
+    config: MaintenanceConfig,
+    renew: Arc<ReasonedRenewFn>,
+    certificates: Arc<dyn CertStore>,
+    ratio: f64,
+) -> JoinHandle<()> {
+    let policy = RenewalPolicy {
+        renew,
+        certificates,
+        ratio,
+    };
     let renew_interval =
         normalize_interval(config.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
     let ocsp_interval = normalize_interval(config.ocsp_check_interval, DEFAULT_OCSP_CHECK_INTERVAL);
@@ -136,8 +178,7 @@ pub fn start_maintenance(
     let maintenance = cache.maintenance_guard();
     tokio::spawn(async move {
         let _maintenance = maintenance;
-        maintenance_loop_with_recovery(cache, config, renew_func, renew_interval, ocsp_interval)
-            .await;
+        maintenance_loop_with_recovery(cache, config, policy, renew_interval, ocsp_interval).await;
     })
 }
 
@@ -147,14 +188,14 @@ pub fn start_maintenance(
 async fn maintenance_loop_with_recovery(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
-    renew_func: Arc<RenewFn>,
+    policy: RenewalPolicy,
     renew_interval: Duration,
     ocsp_interval: Duration,
 ) {
     loop {
         let cache_clone = Arc::clone(&cache);
         let config_clone = config.clone();
-        let renew_func_clone = Arc::clone(&renew_func);
+        let policy_clone = policy.clone();
 
         let inner_maintenance = cache_clone.maintenance_guard();
         let task = tokio::task::spawn(async move {
@@ -162,13 +203,13 @@ async fn maintenance_loop_with_recovery(
             maintenance_loop(
                 cache_clone,
                 config_clone,
-                renew_func_clone,
+                policy_clone,
                 renew_interval,
                 ocsp_interval,
             )
             .await;
         });
-        // The recovery wrapper must not detach its loop when aborted.
+        // Aborting this outer task must not detach the inner maintenance loop.
         struct AbortOnDrop(tokio::task::AbortHandle);
         impl Drop for AbortOnDrop {
             fn drop(&mut self) {
@@ -213,7 +254,7 @@ async fn maintenance_loop_with_recovery(
 async fn maintenance_loop(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
-    renew_func: Arc<RenewFn>,
+    policy: RenewalPolicy,
     renew_interval: Duration,
     ocsp_interval: Duration,
 ) {
@@ -235,13 +276,7 @@ async fn maintenance_loop(
         tokio::select! {
             _ = renew_ticker.tick() => {
                 debug!("maintenance: running renewal check");
-                check_renewals(
-                    &cache,
-                    DEFAULT_RENEWAL_WINDOW_RATIO,
-                    renew_func.as_ref(),
-                    config.storage.as_ref(),
-                    &job_queue,
-                ).await;
+                check_renewals_with_policy(&cache, &policy, &job_queue).await;
             }
             _ = ocsp_ticker.tick() => {
                 debug!("maintenance: running OCSP staple check");
@@ -249,7 +284,7 @@ async fn maintenance_loop(
                     &cache,
                     config.storage.as_ref(),
                     &config.ocsp,
-                    renew_func.as_ref(),
+                    policy.renew.as_ref(),
                 ).await;
             }
             result = stop_rx.changed() => {
@@ -285,11 +320,9 @@ async fn maintenance_loop(
 /// certificate in storage has already been renewed by another instance
 /// (e.g. in a multi-instance deployment). If the stored certificate does
 /// not need renewal, it is reloaded into the cache instead of re-issuing.
-async fn check_renewals(
+async fn check_renewals_with_policy(
     cache: &CertCache,
-    renewal_ratio: f64,
-    renew_func: &RenewFn,
-    storage: &dyn Storage,
+    policy: &RenewalPolicy,
     job_queue: &JobQueue,
 ) {
     let managed_certs = cache.get_managed_certificates().await;
@@ -305,7 +338,7 @@ async fn check_renewals(
     );
 
     for cert in &managed_certs {
-        if !cert.needs_renewal(renewal_ratio) {
+        if !cert.needs_renewal(policy.ratio) {
             continue;
         }
 
@@ -326,7 +359,15 @@ async fn check_renewals(
 
         // Multi-instance coordination: check if the certificate in storage
         // has already been renewed by another instance.
-        if try_reload_from_storage(cache, storage, cert, &domain, renewal_ratio).await {
+        if try_reload_from_storage(
+            cache,
+            policy.certificates.as_ref(),
+            cert,
+            &domain,
+            policy.ratio,
+        )
+        .await
+        {
             continue;
         }
 
@@ -342,7 +383,7 @@ async fn check_renewals(
         // submission is silently ignored.
         let job_name = format!("renew_{}", domain);
         let domain_clone = domain.clone();
-        let renew_result = renew_func(domain_clone.clone());
+        let renew_result = (policy.renew)(domain_clone.clone(), RenewalReason::Expiring);
 
         job_queue
             .submit(job_name, move || async move {
@@ -371,36 +412,20 @@ async fn check_renewals(
 /// into the cache and return `true` (meaning: skip local renewal).
 async fn try_reload_from_storage(
     cache: &CertCache,
-    storage: &dyn Storage,
+    certificates: &dyn CertStore,
     cached_cert: &Certificate,
     domain: &str,
     renewal_ratio: f64,
 ) -> bool {
-    // Build the storage key for this certificate's PEM file.
-    let cert_key = crate::storage::site_cert_key(&cached_cert.issuer_key, domain);
-
-    // Try to load the cert PEM from storage.
-    let cert_pem = match storage.load(&cert_key).await {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
+    let resource = match certificates.load(&cached_cert.issuer_key, domain).await {
+        Ok(Some(resource)) => resource,
+        _ => return false,
     };
-
-    // Try to load the corresponding private key PEM.
-    let key_key = crate::storage::site_private_key(&cached_cert.issuer_key, domain);
-    let key_pem = match storage.load(&key_key).await {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-
-    // Try to parse the stored certificate.
-    let stored_cert = match Certificate::from_pem(&cert_pem, &key_pem) {
-        Ok(mut c) => {
-            c.managed = true;
-            c.issuer_key = cached_cert.issuer_key.clone();
-            c
-        }
-        Err(_) => return false,
-    };
+    let stored_cert =
+        match crate::manager::CertManager::parse_managed_certificate(&resource, domain) {
+            Ok(cert) => cert,
+            Err(_) => return false,
+        };
 
     // If the stored cert has a different hash AND does not need renewal,
     // it was renewed by another instance — reload it into the cache.
@@ -438,7 +463,7 @@ async fn update_ocsp_staples(
     cache: &CertCache,
     storage: &dyn Storage,
     config: &OcspConfig,
-    renew_func: &RenewFn,
+    renew_func: &ReasonedRenewFn,
 ) {
     if config.disable_stapling {
         debug!("maintenance: OCSP stapling is disabled; skipping update");
@@ -485,10 +510,9 @@ async fn update_ocsp_staples(
                     // that has the fresh OCSP staple.
                     cache.replace(&old_hash, updated_cert).await;
                 } else {
-                    // staple_ocsp returns Ok(false) when status is Revoked
-                    // OR when stapling is not available. We detect revocation
-                    // by checking if an OCSP response was actually set.
-                    if updated_cert.ocsp_response.is_some()
+                    // A missing staple also returns false. Only an explicit
+                    // Revoked status authorizes forced replacement.
+                    if updated_cert.ocsp_status == Some(ocsp::OcspStatus::Revoked)
                         && config.replace_revoked
                         && cert.managed
                     {
@@ -497,7 +521,7 @@ async fn update_ocsp_staples(
                             hash = %old_hash,
                             "maintenance: OCSP status is Revoked; triggering force-renewal",
                         );
-                        match renew_func(first_name.clone()).await {
+                        match renew_func(first_name.clone(), RenewalReason::Revoked).await {
                             Ok(()) => {
                                 info!(
                                     name = %first_name,
@@ -847,7 +871,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&call_count);
 
-        let renew_func: Box<RenewFn> = Box::new(move |_domain: String| {
+        let renew_func: Arc<ReasonedRenewFn> = Arc::new(move |_domain: String, _reason| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -856,11 +880,13 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(
+        check_renewals_with_policy(
             &cache,
-            DEFAULT_RENEWAL_WINDOW_RATIO,
-            renew_func.as_ref(),
-            &DummyStorage,
+            &RenewalPolicy {
+                renew: renew_func,
+                certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
+                ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+            },
             &job_queue,
         )
         .await;
@@ -880,7 +906,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&call_count);
 
-        let renew_func: Box<RenewFn> = Box::new(move |_domain: String| {
+        let renew_func: Arc<ReasonedRenewFn> = Arc::new(move |_domain: String, _reason| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -889,11 +915,13 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(
+        check_renewals_with_policy(
             &cache,
-            DEFAULT_RENEWAL_WINDOW_RATIO,
-            renew_func.as_ref(),
-            &DummyStorage,
+            &RenewalPolicy {
+                renew: renew_func,
+                certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
+                ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+            },
             &job_queue,
         )
         .await;
@@ -913,7 +941,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&call_count);
 
-        let renew_func: Box<RenewFn> = Box::new(move |_domain: String| {
+        let renew_func: Arc<ReasonedRenewFn> = Arc::new(move |_domain: String, _reason| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -922,11 +950,13 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(
+        check_renewals_with_policy(
             &cache,
-            DEFAULT_RENEWAL_WINDOW_RATIO,
-            renew_func.as_ref(),
-            &DummyStorage,
+            &RenewalPolicy {
+                renew: renew_func,
+                certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
+                ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+            },
             &job_queue,
         )
         .await;
@@ -945,7 +975,7 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&call_count);
 
-        let renew_func: Box<RenewFn> = Box::new(move |_domain: String| {
+        let renew_func: Arc<ReasonedRenewFn> = Arc::new(move |_domain: String, _reason| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -954,11 +984,13 @@ mod tests {
         });
 
         let job_queue = JobQueue::new("test");
-        check_renewals(
+        check_renewals_with_policy(
             &cache,
-            DEFAULT_RENEWAL_WINDOW_RATIO,
-            renew_func.as_ref(),
-            &DummyStorage,
+            &RenewalPolicy {
+                renew: renew_func,
+                certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
+                ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+            },
             &job_queue,
         )
         .await;
@@ -1006,6 +1038,57 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("MaintenanceConfig"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_uses_the_custom_renewal_ratio() {
+        let cache = CertCache::new(CacheOptions::default());
+        cache
+            .add(make_managed_cert(&["example.com"], "custom-ratio", 40))
+            .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let policy = RenewalPolicy {
+            ratio: 0.5,
+            certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
+            renew: Arc::new(move |_domain, reason| {
+                assert_eq!(reason, RenewalReason::Expiring);
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+        };
+        let jobs = JobQueue::new("custom-ratio");
+        check_renewals_with_policy(&cache, &policy, &jobs).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn maintenance_reloads_from_the_custom_certificate_store() {
+        use crate::cert_store::{CertStore, tests::InMemory};
+        let cache = CertCache::new(CacheOptions::default());
+        let mut old = make_managed_cert(&["example.com"], "old", 1);
+        old.issuer_key = "ca".into();
+        cache.add(old.clone()).await;
+        let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let resource = crate::CertificateResource {
+            sans: vec!["example.com".into()],
+            certificate_pem: generated.cert.pem().into_bytes(),
+            private_key_pem: generated.signing_key.serialize_pem().into_bytes(),
+            issuer_key: "ca".into(),
+            issuer_data: None,
+        };
+        let store = Arc::new(InMemory::default());
+        store.save("ca", &resource).await.unwrap();
+        let policy = RenewalPolicy {
+            ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+            certificates: store,
+            renew: Arc::new(|_, _| panic!("fresh certificate must be reloaded rather than issued")),
+        };
+        check_renewals_with_policy(&cache, &policy, &JobQueue::new("reload")).await;
+        let current = cache.get_all().await;
+        assert_eq!(current.len(), 1);
+        assert_ne!(current[0].hash, old.hash);
+        assert_eq!(current[0].issuer_key, "ca");
     }
 
     /// Minimal dummy storage for testing.
