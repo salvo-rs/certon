@@ -1254,9 +1254,13 @@ impl CertManager {
             }),
         )?;
 
-        // Generate or reuse private key.
+        // Reuse the resource selected for this renewal, rather than searching
+        // issuer order again and reviving an older issuer's private key.
         let (private_key, private_key_pem) = if self.policy.reuse_private_keys {
-            self.load_or_generate_private_key(domain).await?
+            let pem = std::str::from_utf8(&cert_res.private_key_pem)
+                .map_err(|error| Error::Config(format!("invalid private key PEM: {error}")))?;
+            let key = decode_private_key_pem(pem)?;
+            (key, pem.to_owned())
         } else {
             let pk = generate_private_key(self.policy.key_type)?;
             let pem = encode_private_key_pem(&pk)?;
