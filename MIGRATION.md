@@ -53,6 +53,21 @@ Certificate lifecycle corrections:
   `ReasonedRenewFn` / `RenewalReason` to distinguish expiration from revocation.
   The legacy low-level callback remains supported; callbacks using that API
   must implement their own revocation handling.
+- `manage_in_background` now applies backpressure and may wait while its
+  manager family's queue is full. A manager and its detached copies share
+  four execution slots and capacity for 68 admitted jobs (four running plus
+  64 pending). Cancelling the caller drops its not-yet-admitted submissions;
+  already-admitted jobs continue running.
+- Each maintenance loop has a separate four-execution, 68-admitted expiration
+  renewal budget. These are not process-wide limits: foreground operations,
+  handshake on-demand work, and sequential OCSP force-renewals are independent.
+  Renewal admission cannot block OCSP checks. Stopping maintenance cancels
+  waiting submissions, aborts admitted renewals, and awaits their cleanup.
+  Owned revocation workers still continue if their caller is dropped.
+- Public `JobQueue::new` and `with_max_concurrent` keep unbounded admission.
+  Use `JobQueue::with_limits` for bounded admission; `submit` waits before
+  registering or spawning. Dropping a bounded queue aborts its admitted work;
+  `shutdown().await` also waits for cleanup.
 
 
 Revocation now records durable, fail-closed intent before contacting the CA.

@@ -362,7 +362,7 @@ impl CertManagerBuilder {
             on_event: self.on_event,
             subject_transformer: self.subject_transformer,
             cert_selection: self.cert_selection,
-            job_queue: Arc::new(JobQueue::new("cert_management")),
+            job_queue: Arc::new(JobQueue::certificate_jobs("cert_management")),
         }
     }
 }
@@ -383,8 +383,9 @@ impl CertManager {
     /// a comment explaining that `CertManager` is not `Clone`. It still is not —
     /// a job queue is not something to duplicate — but everything else here is
     /// either a value or an `Arc`, so the copy is one place rather than a list
-    /// somebody has to keep in step with the struct.
-    pub(crate) fn detached(&self, job_name: &'static str) -> Self {
+    /// somebody has to keep in step with the struct. Detached managers share
+    /// the original queue's admission budget and named-job registry.
+    pub(crate) fn detached(&self, _job_name: &'static str) -> Self {
         Self {
             policy: self.policy.clone(),
             issuers: self.issuers.clone(),
@@ -395,7 +396,7 @@ impl CertManager {
             on_event: self.on_event.clone(),
             subject_transformer: self.subject_transformer.clone(),
             cert_selection: self.cert_selection.clone(),
-            job_queue: Arc::new(JobQueue::new(job_name)),
+            job_queue: Arc::clone(&self.job_queue),
         }
     }
 
@@ -610,6 +611,8 @@ impl CertManager {
     /// [`JobQueue`]. This method returns as soon as each domain's
     /// management task has been submitted -- certificates may not yet be
     /// ready when this method returns.
+    /// At most four jobs execute and 68 are admitted per manager family;
+    /// further submissions apply backpressure until capacity is available.
     pub async fn manage_in_background(&self, domains: &[String]) -> Result<()> {
         for domain in domains {
             let domain = domain.to_lowercase();
@@ -1735,6 +1738,91 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bulk_management_and_detached_managers_share_bounded_admission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use crate::async_jobs::{CERTIFICATE_JOB_CONCURRENCY, CERTIFICATE_JOB_PENDING};
+
+        struct SlowIssuer(Arc<AtomicUsize>);
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        #[async_trait::async_trait]
+        impl CertIssuer for SlowIssuer {
+            async fn issue(&self, _: &[u8], _: &[String]) -> Result<crate::IssuedCertificate> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let _active = Active(self.0.clone());
+                std::future::pending().await
+            }
+            fn issuer_key(&self) -> String {
+                "slow-test-ca".into()
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let manager = Arc::new(
+            CertManager::builder()
+                .storage(Arc::new(MemoryStorage::new()))
+                .issuers(vec![Arc::new(SlowIssuer(active.clone()))])
+                .build(),
+        );
+        let producer = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .manage_in_background(
+                        &(0..1000)
+                            .map(|i| format!("host-{i}.example.com"))
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let capacity = CERTIFICATE_JOB_CONCURRENCY + CERTIFICATE_JOB_PENDING;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.job_queue.len().await < capacity
+                || active.load(Ordering::SeqCst) < CERTIFICATE_JOB_CONCURRENCY
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(manager.job_queue.len().await, capacity);
+        assert_eq!(active.load(Ordering::SeqCst), CERTIFICATE_JOB_CONCURRENCY);
+        assert!(!producer.is_finished());
+        // Already-admitted names still deduplicate instead of waiting at cap.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.manage_in_background(&["host-0.example.com".into()]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let detached = manager.detached("another-manager");
+        assert!(Arc::ptr_eq(&manager.job_queue, &detached.job_queue));
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                detached.manage_in_background(&["other.example.com".into()])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(manager.job_queue.len().await, capacity);
+        producer.abort();
+        assert!(producer.await.unwrap_err().is_cancelled());
+        manager.job_queue.shutdown().await;
+        assert!(manager.job_queue.is_empty().await);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn test_config_builder_defaults() {
