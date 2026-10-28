@@ -4,7 +4,7 @@
 //! using Let's Encrypt with default settings. It demonstrates the simplest
 //! possible usage of certon: a single function call that handles everything.
 //!
-//! Usage: cargo run --example basic
+//! Usage after reviewing the CA terms: cargo run --example basic -- --agree-ca-terms
 
 use certon::Result;
 
@@ -14,13 +14,16 @@ async fn main() -> Result<()> {
 
     let domains = vec!["example.com".into(), "www.example.com".into()];
 
+    // Review the CA terms before running with --agree-ca-terms.
+    let agreed = std::env::args().any(|arg| arg == "--agree-ca-terms");
+
     // The simplest way: one function call.
     //
     // `certon::manage` will:
     //   1. Create a CertManager backed by the default FileStorage.
     //   2. Obtain (or load from storage) certificates for every domain.
     //   3. Return a rustls::ServerConfig wired up with a CertResolver.
-    let tls_config = certon::manage(&domains).await?;
+    let tls_config = certon::manage_with_agreement(&domains, agreed).await?;
 
     // Use tls_config with your TLS server.
     // For example, with tokio-rustls:
@@ -40,7 +43,8 @@ async fn main() -> Result<()> {
     println!("TLS config ready for domains: {:?}", domains);
     println!("ALPN protocols: {:?}", tls_config.alpn_protocols);
 
-    // Keep the process alive for certificate maintenance.
+    // Keep the process alive. For scheduled renewal, use CertManager with
+    // certon::start_maintenance and keep its handle/cache for shutdown.
     tokio::signal::ctrl_c().await.ok();
     Ok(())
 }

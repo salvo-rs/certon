@@ -124,7 +124,10 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 /// # Errors
 ///
 /// Returns an error if certificate management fails (e.g. no ACME issuers
-/// configured, network errors during issuance, storage errors).
+/// configured, network errors during issuance, storage errors). New default
+/// accounts require explicit consent via [`manage_with_agreement`].
+/// This function obtains/loads certificates; use a [`CertManager`] and
+/// [`start_maintenance`] for automatic periodic renewal.
 ///
 /// # Example
 ///
@@ -138,9 +141,18 @@ pub use zerossl_issuer::{ZeroSslApiIssuer, ZeroSslIssuer};
 /// }
 /// ```
 pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
+    manage_with_agreement(domains, false).await
+}
+
+/// Like [`manage`], with explicit consent to the CA's terms for a new account.
+/// Set `agreed` only after reviewing the CA's terms of service.
+pub async fn manage_with_agreement(
+    domains: &[String],
+    agreed: bool,
+) -> Result<rustls::ServerConfig> {
     install_default_crypto_provider();
-    let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = CertManager::builder().storage(storage).build();
+    let config = default_manager(agreed);
+    ensure_default_agreement(&config, domains, agreed).await?;
     config.manage(domains).await?;
 
     // Build a rustls ServerConfig with the CertResolver backed by the
@@ -154,19 +166,54 @@ pub async fn manage(domains: &[String]) -> Result<rustls::ServerConfig> {
 
 /// Obtain/load certificates for `domains` and bind a TLS listener on `addr`.
 ///
-/// Returns a [`tokio_rustls::TlsAcceptor`] that is ready to accept TLS
-/// connections. This is a convenience function that combines certificate
+/// Returns a [`BoundTlsListener`] that owns the bound TCP socket and TLS
+/// acceptor. This is a convenience function that combines certificate
 /// management with listener setup.
 ///
 /// # Errors
 ///
 /// Returns an error if certificate management or address binding fails.
-pub async fn listen(domains: &[String], addr: &str) -> Result<tokio_rustls::TlsAcceptor> {
-    let tls_cfg = manage(domains).await?;
-    let _listener = tokio::net::TcpListener::bind(addr)
+pub async fn listen(domains: &[String], addr: &str) -> Result<BoundTlsListener> {
+    listen_with_agreement(domains, addr, false).await
+}
+
+/// Like [`listen`], with explicit CA terms consent for a new account.
+pub async fn listen_with_agreement(
+    domains: &[String],
+    addr: &str,
+    agreed: bool,
+) -> Result<BoundTlsListener> {
+    let tls_cfg = manage_with_agreement(domains, agreed).await?;
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Other(format!("failed to bind listener on {addr}: {e}")))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)))
+    Ok(BoundTlsListener {
+        listener,
+        acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg)),
+    })
+}
+
+/// A bound socket and its TLS configuration, kept alive together.
+pub struct BoundTlsListener {
+    pub listener: tokio::net::TcpListener,
+    pub acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl BoundTlsListener {
+    /// Accept a TCP connection and complete its TLS handshake.
+    pub async fn accept(
+        &self,
+    ) -> std::io::Result<(
+        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+        std::net::SocketAddr,
+    )> {
+        let (stream, address) = self.listener.accept().await?;
+        Ok((self.acceptor.accept(stream).await?, address))
+    }
+
+    pub fn into_parts(self) -> (tokio::net::TcpListener, tokio_rustls::TlsAcceptor) {
+        (self.listener, self.acceptor)
+    }
 }
 
 /// Obtain or load certificates for `domains`, and wait for it.
@@ -179,9 +226,69 @@ pub async fn listen(domains: &[String], addr: &str) -> Result<tokio_rustls::TlsA
 ///
 /// Returns an error if certificate management fails.
 pub async fn obtain(domains: &[String]) -> Result<()> {
+    obtain_with_agreement(domains, false).await
+}
+
+/// Like [`obtain`], with explicit agreement to the CA's terms for a new account.
+pub async fn obtain_with_agreement(domains: &[String], agreed: bool) -> Result<()> {
+    let manager = default_manager(agreed);
+    ensure_default_agreement(&manager, domains, agreed).await?;
+    manager.manage(domains).await
+}
+
+async fn ensure_default_agreement(
+    manager: &CertManager,
+    domains: &[String],
+    agreed: bool,
+) -> Result<()> {
+    if agreed || domains.is_empty() {
+        return Ok(());
+    }
+    let issuer = storage::issuer_key(LETS_ENCRYPT_PRODUCTION);
+    let mut needs_account = false;
+    for domain in domains {
+        match manager
+            .certificates
+            .load(&issuer, &domain.to_lowercase())
+            .await?
+        {
+            None => {
+                needs_account = true;
+                break;
+            }
+            Some(resource) => {
+                let certificate =
+                    Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
+                if certificate.needs_renewal(manager.policy.renewal_window_ratio) {
+                    needs_account = true;
+                    break;
+                }
+            }
+        }
+    }
+    if needs_account
+        && account::get_account(manager.storage.as_ref(), LETS_ENCRYPT_PRODUCTION, "")
+            .await?
+            .is_none()
+    {
+        return Err(Error::Config("registering a new CA account requires explicit agreement to its terms: use manage_with_agreement/obtain_with_agreement after reviewing the terms, or configure AcmeIssuer::agreed(true)".into()));
+    }
+
+    Ok(())
+}
+
+fn default_manager(agreed: bool) -> CertManager {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
-    let config = CertManager::builder().storage(storage).build();
-    config.manage(domains).await
+    let issuer = AcmeIssuer::builder()
+        .storage(storage.clone())
+        .agreed(agreed)
+        .http01_solver(Arc::new(Http01Solver::default()))
+        .tlsalpn01_solver(Arc::new(TlsAlpn01Solver::default()))
+        .build();
+    CertManager::builder()
+        .storage(storage)
+        .issuers(vec![Arc::new(issuer)])
+        .build()
 }
 
 /// Obtain or load certificates for `domains` without waiting.
@@ -227,14 +334,24 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
 
     let renew_func = maintenance_renewal(config);
 
-    maintain::start_maintenance(cache, maint_config, renew_func)
+    maintain::start_maintenance_with_policy(
+        cache,
+        maint_config,
+        renew_func,
+        config.certificates.clone(),
+        config.policy.renewal_window_ratio,
+    )
 }
 
-fn maintenance_renewal(config: &CertManager) -> Arc<maintain::RenewFn> {
+fn maintenance_renewal(config: &CertManager) -> Arc<maintain::ReasonedRenewFn> {
     let manager = Arc::new(config.detached("maintenance"));
-    Arc::new(move |domain: String| {
+    Arc::new(move |domain: String, reason: maintain::RenewalReason| {
         let manager = Arc::clone(&manager);
-        Box::pin(async move { manager.renew(&domain, false).await })
+        Box::pin(async move {
+            manager
+                .renew(&domain, reason == maintain::RenewalReason::Revoked)
+                .await
+        })
     })
 }
 
@@ -277,12 +394,68 @@ mod maintenance_tests {
             .interactive(true)
             .renewal_window_ratio(1.0)
             .build();
-        let error = maintenance_renewal(&config)("example.com".into())
-            .await
-            .unwrap_err();
+        let error =
+            maintenance_renewal(&config)("example.com".into(), maintain::RenewalReason::Expiring)
+                .await
+                .unwrap_err();
         assert!(
             error.to_string().contains("configured issuer reached"),
             "{error}"
         );
+    }
+    #[tokio::test]
+    async fn revoked_maintenance_bypasses_the_regular_renewal_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::cert_store::tests::InMemory::default());
+        let certificate = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        store
+            .save(
+                "test",
+                &CertificateResource {
+                    sans: vec!["example.com".into()],
+                    certificate_pem: certificate.cert.pem().into_bytes(),
+                    private_key_pem: certificate.signing_key.serialize_pem().into_bytes(),
+                    issuer_key: "test".into(),
+                    issuer_data: None,
+                },
+            )
+            .await
+            .unwrap();
+        let manager = CertManager::builder()
+            .storage(Arc::new(FileStorage::new(directory.path())))
+            .certificates(store)
+            .issuers(vec![Arc::new(Issuer)])
+            .ocsp(OcspConfig {
+                disable_stapling: true,
+                ..Default::default()
+            })
+            .build();
+        assert!(
+            maintenance_renewal(&manager)("example.com".into(), maintain::RenewalReason::Expiring)
+                .await
+                .is_ok()
+        );
+        let error =
+            maintenance_renewal(&manager)("example.com".into(), maintain::RenewalReason::Revoked)
+                .await
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("configured issuer reached"),
+            "{error}"
+        );
+    }
+    #[tokio::test]
+    async fn new_default_accounts_require_explicit_consent_before_network_io() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = CertManager::builder()
+            .storage(Arc::new(FileStorage::new(directory.path())))
+            .build();
+        let error = ensure_default_agreement(&manager, &["example.com".into()], false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("manage_with_agreement"));
+        ensure_default_agreement(&manager, &["example.com".into()], true)
+            .await
+            .unwrap();
     }
 }

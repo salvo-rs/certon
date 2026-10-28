@@ -17,7 +17,7 @@ use certon::CertManager;
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let domains = vec!["example.com".into()];
-    let tls_config = certon::manage(&domains).await?;
+    let tls_config = certon::manage_with_agreement(&domains, true).await?;
     // 将 tls_config 用于 tokio-rustls、hyper、axum、salvo 等框架
     Ok(())
 }
@@ -118,7 +118,11 @@ certon = { version = "0.3", default-features = false, features = ["ring", "zeros
 
 ## 快速开始
 
-最简单的使用方式 -- 一个函数调用管理一切：
+调用 `manage_with_agreement(..., true)` 前请先阅读并同意 CA 的服务条款。
+原有 `manage()` / `obtain()` 不默认同意条款，新账户需要显式同意。
+需要自动续签时，请保留 `CertManager` 并调用下例中的 `start_maintenance`。
+
+最简单的使用方式 -- 一个函数调用获取或加载证书：
 
 ```rust
 use certon::CertManager;
@@ -129,7 +133,7 @@ async fn main() -> certon::Result<()> {
 
     // 获取（或从存储加载）证书，返回可直接使用的
     // rustls::ServerConfig，用于任何 TLS 服务器。
-    let tls_config = certon::manage(&domains).await?;
+    let tls_config = certon::manage_with_agreement(&domains, true).await?;
 
     // 将 tls_config 用于 tokio-rustls、hyper、axum、salvo 等框架
     Ok(())
@@ -152,8 +156,15 @@ use certon::{CertManager, FileStorage, Storage};
 #[tokio::main]
 async fn main() -> certon::Result<()> {
     let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
+    // 设置 agreed(true) 前，请先阅读并同意 CA 服务条款。
+    let issuer = certon::AcmeIssuer::builder()
+        .storage(storage.clone())
+        .agreed(true)
+        .http01_solver(Arc::new(certon::Http01Solver::default()))
+        .build();
     let manager = CertManager::builder()
         .storage(storage)
+        .issuers(vec![Arc::new(issuer)])
         .build();
 
     let domains = vec!["example.com".into(), "www.example.com".into()];
@@ -161,6 +172,8 @@ async fn main() -> certon::Result<()> {
 
     // 启动后台维护（续期 + OCSP 刷新）
     let _handle = certon::start_maintenance(&manager);
+    tokio::signal::ctrl_c().await.ok();
+    manager.cache.stop_and_wait().await;
 
     Ok(())
 }
