@@ -317,7 +317,7 @@ async fn maintenance_loop(
 pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
     let mut invalidated = 0;
     let mut first_error = None;
-    for cert in cache.get_managed_certificates().await {
+    for cert in cache.maintenance_snapshot(true) {
         let Some(hash) = crate::storage::certificate_leaf_hash(&cert) else {
             continue;
         };
@@ -359,7 +359,7 @@ async fn check_renewals_with_policy(
     policy: &RenewalPolicy,
     job_queue: &JobQueue,
 ) {
-    let managed_certs = cache.get_managed_certificates().await;
+    let managed_certs = cache.maintenance_snapshot(true);
 
     if managed_certs.is_empty() {
         debug!("maintenance: no managed certificates to check for renewal");
@@ -522,7 +522,7 @@ async fn update_ocsp_staples(
         return;
     }
 
-    let all_certs = cache.get_all().await;
+    let all_certs = cache.maintenance_snapshot(false);
 
     if all_certs.is_empty() {
         debug!("maintenance: no certificates to check for OCSP updates");
@@ -550,7 +550,7 @@ async fn update_ocsp_staples(
             "maintenance: refreshing OCSP staple",
         );
 
-        let mut updated_cert = cert.clone();
+        let mut updated_cert = Arc::unwrap_or_clone(cert);
         let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
         // Publish removal of an unusable staple as well as successful refreshes.
         // Otherwise a failed refresh keeps serving the expired response forever.

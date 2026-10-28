@@ -222,12 +222,15 @@ struct CacheState {
     certificates: HashMap<String, CachedCertificate>,
     index: HashMap<String, Vec<String>>,
     revoked_leaf_hashes: HashSet<String>,
+    /// Dense managed-only sampling pool; each entry stores its back-reference.
+    managed_hashes: Vec<String>,
 }
 
 struct CachedCertificate {
     leaf_hash: Option<String>,
-    certificate: Certificate,
+    certificate: Arc<Certificate>,
     key: Option<Arc<CertifiedKey>>,
+    managed_index: Option<usize>,
 }
 
 /// Renewal policy at the OCSP update's cache linearization point.
@@ -283,6 +286,15 @@ impl std::fmt::Debug for CertCache {
 impl CacheState {
     fn remove(&mut self, hash: &str) -> Option<CacheEvent> {
         let entry = self.certificates.remove(hash)?;
+        if let Some(index) = entry.managed_index {
+            self.managed_hashes.swap_remove(index);
+            if let Some(moved_hash) = self.managed_hashes.get(index) {
+                self.certificates
+                    .get_mut(moved_hash)
+                    .expect("managed sampling pool references a cached certificate")
+                    .managed_index = Some(index);
+            }
+        }
         for name in &entry.certificate.names {
             let lower = name.to_lowercase();
             if let Some(hashes) = self.index.get_mut(&lower) {
@@ -293,7 +305,7 @@ impl CacheState {
             }
         }
         Some(CacheEvent::Removed {
-            names: entry.certificate.names,
+            names: entry.certificate.names.clone(),
             hash: hash.to_owned(),
         })
     }
@@ -336,7 +348,9 @@ impl CacheState {
         if let Some(existing) = self.certificates.get_mut(&hash) {
             for tag in &cert.tags {
                 if !existing.certificate.tags.contains(tag) {
-                    existing.certificate.tags.push(tag.clone());
+                    Arc::make_mut(&mut existing.certificate)
+                        .tags
+                        .push(tag.clone());
                 }
             }
             events.push(CacheEvent::Updated {
@@ -345,18 +359,14 @@ impl CacheState {
             });
             return;
         }
-        if options.capacity > 0 && self.certificates.len() >= options.capacity {
-            let managed: Vec<_> = self
-                .certificates
-                .iter()
-                .filter(|(_, e)| e.certificate.managed)
-                .map(|(hash, _)| hash.clone())
-                .collect();
-            if !managed.is_empty() {
-                let hash = &managed[rand::rng().random_range(0..managed.len())];
-                if let Some(event) = self.remove(hash) {
-                    events.push(event);
-                }
+        if options.capacity > 0
+            && self.certificates.len() >= options.capacity
+            && !self.managed_hashes.is_empty()
+        {
+            let index = rand::rng().random_range(0..self.managed_hashes.len());
+            let hash = self.managed_hashes[index].clone();
+            if let Some(event) = self.remove(&hash) {
+                events.push(event);
             }
         }
         for name in &cert.names {
@@ -369,12 +379,18 @@ impl CacheState {
             names: cert.names.clone(),
             hash: hash.clone(),
         });
+        let managed_index = cert.managed.then(|| {
+            let index = self.managed_hashes.len();
+            self.managed_hashes.push(hash.clone());
+            index
+        });
         self.certificates.insert(
             hash,
             CachedCertificate {
                 leaf_hash,
-                certificate: cert,
+                certificate: Arc::new(cert),
                 key,
+                managed_index,
             },
         );
     }
@@ -509,22 +525,25 @@ impl CertCache {
             .clone();
         let events = {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-            let hashes: Vec<_> = state
-                .certificates
-                .iter()
-                .filter(|(_, e)| {
-                    e.certificate.managed
-                        && subjects.iter().any(|s| {
-                            e.certificate
-                                .names
-                                .iter()
-                                .any(|n| n.eq_ignore_ascii_case(&s.subject))
-                                && (s.issuer_key.is_empty()
-                                    || s.issuer_key == e.certificate.issuer_key)
-                        })
-                })
-                .map(|(hash, _)| hash.clone())
-                .collect();
+            let mut hashes = HashSet::new();
+            for subject in subjects {
+                if let Some(candidates) = state.index.get(&subject.subject.to_lowercase()) {
+                    for hash in candidates {
+                        if state.certificates.get(hash).is_some_and(|entry| {
+                            entry.certificate.managed
+                                && (subject.issuer_key.is_empty()
+                                    || subject.issuer_key == entry.certificate.issuer_key)
+                                && entry
+                                    .certificate
+                                    .names
+                                    .iter()
+                                    .any(|name| name.eq_ignore_ascii_case(&subject.subject))
+                        }) {
+                            hashes.insert(hash.clone());
+                        }
+                    }
+                }
+            }
             hashes
                 .iter()
                 .filter_map(|hash| state.remove(hash))
@@ -611,10 +630,11 @@ impl CertCache {
             if current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
                 && status != Some(crate::ocsp::OcspStatus::Revoked)
             {
-                return Some(OcspUpdateState::from(&current.certificate));
+                return Some(OcspUpdateState::from(current.certificate.as_ref()));
             }
-            current.certificate.ocsp_status = status;
-            current.certificate.ocsp_response = response.clone();
+            let certificate = Arc::make_mut(&mut current.certificate);
+            certificate.ocsp_status = status;
+            certificate.ocsp_response = response.clone();
             if let Some(key) = &mut current.key {
                 // Clone just the rustls container when an in-flight handshake
                 // shares it; retain the prepared signing key without crypto work.
@@ -625,7 +645,7 @@ impl CertCache {
                     names: current.certificate.names.clone(),
                     hash: hash.to_owned(),
                 },
-                OcspUpdateState::from(&current.certificate),
+                OcspUpdateState::from(current.certificate.as_ref()),
             )
         };
         dispatch_events(&options, vec![event]);
@@ -640,7 +660,7 @@ impl CertCache {
             .matching(name)
             .into_iter()
             .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))
-            .map(|entry| entry.certificate.clone())
+            .map(|entry| entry.certificate.as_ref().clone())
     }
 
     /// Synchronous hot path for rustls, independent of any async runtime.
@@ -667,7 +687,7 @@ impl CertCache {
             .unwrap_or_else(|e| e.into_inner())
             .certificates
             .get(hash)
-            .map(|e| e.certificate.clone())
+            .map(|e| e.certificate.as_ref().clone())
     }
 
     /// All exact and valid single leftmost-label wildcard matches.
@@ -677,7 +697,7 @@ impl CertCache {
             .unwrap_or_else(|e| e.into_inner())
             .matching(name)
             .into_iter()
-            .map(|e| e.certificate.clone())
+            .map(|e| e.certificate.as_ref().clone())
             .collect()
     }
 
@@ -697,7 +717,7 @@ impl CertCache {
             .unwrap_or_else(|e| e.into_inner())
             .certificates
             .values()
-            .map(|e| e.certificate.clone())
+            .map(|e| e.certificate.as_ref().clone())
             .collect()
     }
 
@@ -709,8 +729,28 @@ impl CertCache {
             .certificates
             .values()
             .filter(|e| e.certificate.managed)
-            .map(|e| e.certificate.clone())
+            .map(|e| e.certificate.as_ref().clone())
             .collect()
+    }
+
+    /// Immutable internal snapshots share certificate bytes. Updates use copy
+    /// on write, so a scan observes one version without cloning every key/chain.
+    pub(crate) fn maintenance_snapshot(&self, managed_only: bool) -> Vec<Arc<Certificate>> {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        if managed_only {
+            state
+                .managed_hashes
+                .iter()
+                .filter_map(|hash| state.certificates.get(hash))
+                .map(|entry| Arc::clone(&entry.certificate))
+                .collect()
+        } else {
+            state
+                .certificates
+                .values()
+                .map(|entry| Arc::clone(&entry.certificate))
+                .collect()
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1394,5 +1434,312 @@ mod tests {
             .await;
         cache.remove("new").await;
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    fn assert_cache_indices(cache: &CertCache) {
+        let state = cache.state.read().unwrap();
+        let expected: HashSet<_> = state
+            .certificates
+            .iter()
+            .filter(|(_, entry)| entry.certificate.managed)
+            .map(|(hash, _)| hash)
+            .collect();
+        let actual: HashSet<_> = state.managed_hashes.iter().collect();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), state.managed_hashes.len());
+        for (index, hash) in state.managed_hashes.iter().enumerate() {
+            assert_eq!(state.certificates[hash].managed_index, Some(index));
+        }
+        for (hash, entry) in &state.certificates {
+            assert_eq!(entry.managed_index.is_some(), entry.certificate.managed);
+            for name in &entry.certificate.names {
+                assert!(state.index[&name.to_lowercase()].contains(hash));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_removal_preserves_issuer_wildcard_and_unmanaged_semantics() {
+        let cache = CertCache::new(CacheOptions::default());
+        for (hash, names, managed, issuer) in [
+            ("a", vec!["Example.com", "www.example.com"], true, "ca-a"),
+            ("b", vec!["example.com"], true, "ca-b"),
+            ("wildcard", vec!["*.example.com"], true, "ca-a"),
+            ("unmanaged", vec!["example.com"], false, "ca-a"),
+        ] {
+            let mut cert = make_cert(&names, hash, managed);
+            cert.issuer_key = issuer.into();
+            cache.add(cert).await;
+        }
+        cache
+            .remove_managed(&[
+                SubjectIssuer {
+                    subject: "EXAMPLE.COM".into(),
+                    issuer_key: "ca-a".into(),
+                },
+                SubjectIssuer {
+                    subject: "WWW.EXAMPLE.COM".into(),
+                    issuer_key: "ca-a".into(),
+                },
+            ])
+            .await;
+        assert!(cache.get_by_hash("a").await.is_none());
+        assert!(cache.get_by_hash("b").await.is_some());
+        assert!(cache.get_by_hash("unmanaged").await.is_some());
+        cache
+            .remove_managed(&[SubjectIssuer {
+                subject: "sub.example.com".into(),
+                issuer_key: String::new(),
+            }])
+            .await;
+        assert!(
+            cache.get_by_hash("wildcard").await.is_some(),
+            "removal is exact, not wildcard-expanded"
+        );
+        cache
+            .remove_managed(&[SubjectIssuer {
+                subject: "*.EXAMPLE.COM".into(),
+                issuer_key: "ca-a".into(),
+            }])
+            .await;
+        assert!(cache.get_by_hash("wildcard").await.is_none());
+        cache
+            .remove_managed(&[SubjectIssuer {
+                subject: "example.com".into(),
+                issuer_key: String::new(),
+            }])
+            .await;
+        assert_eq!(cache.count().await, 1);
+        assert!(cache.get_by_hash("unmanaged").await.is_some());
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn sampling_pool_tracks_swap_removal_and_managed_flag_replacement() {
+        let cache = CertCache::new(CacheOptions {
+            capacity: 3,
+            ..Default::default()
+        });
+        for hash in ["a", "b", "c"] {
+            cache
+                .add(make_cert(&[&format!("{hash}.example.com")], hash, true))
+                .await;
+        }
+        cache.remove("b").await; // Move the final pool member into the middle slot.
+        assert_cache_indices(&cache);
+        cache.remove("c").await; // Its new back-reference must now remove slot 1.
+        assert_cache_indices(&cache);
+        cache
+            .replace("a", make_cert(&["a.example.com"], "a", false))
+            .await;
+        assert!(cache.maintenance_snapshot(true).is_empty());
+        assert_cache_indices(&cache);
+        for hash in ["d", "e"] {
+            cache
+                .add(make_cert(&[&format!("{hash}.example.com")], hash, false))
+                .await;
+        }
+        cache.add(make_cert(&["f.example.com"], "f", true)).await;
+        assert_eq!(
+            cache.count().await,
+            4,
+            "unmanaged entries retain their documented protection from eviction"
+        );
+        cache
+            .replace("a", make_cert(&["a.example.com"], "a", true))
+            .await;
+        assert!(
+            cache.get_by_hash("f").await.is_none(),
+            "only managed f can be evicted during promotion"
+        );
+        cache.add(make_cert(&["g.example.com"], "g", true)).await;
+        assert!(cache.get_by_hash("a").await.is_none());
+        assert!(cache.get_by_hash("d").await.is_some());
+        assert!(cache.get_by_hash("e").await.is_some());
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn shared_snapshots_only_copy_changed_metadata() {
+        let cache = CertCache::new(CacheOptions::default());
+        cache.add(make_cert(&["a.example.com"], "a", true)).await;
+        cache.add(make_cert(&["b.example.com"], "b", false)).await;
+        let old = cache.maintenance_snapshot(false);
+        let managed = cache.maintenance_snapshot(true);
+        assert_eq!(managed.len(), 1);
+        let previous_a = old.iter().find(|cert| cert.hash == "a").unwrap();
+        assert!(Arc::ptr_eq(previous_a, &managed[0]));
+        let mut update = make_cert(&["a.example.com"], "a", true);
+        update.tags = vec!["new-tag".into()];
+        cache.add(update).await;
+        let new = cache.maintenance_snapshot(false);
+        let current_a = new.iter().find(|cert| cert.hash == "a").unwrap();
+        assert!(!Arc::ptr_eq(previous_a, current_a));
+        assert!(previous_a.tags.is_empty());
+        assert_eq!(current_a.tags, vec!["new-tag"]);
+        let previous_b = old.iter().find(|cert| cert.hash == "b").unwrap();
+        let current_b = new.iter().find(|cert| cert.hash == "b").unwrap();
+        assert!(Arc::ptr_eq(previous_b, current_b));
+        let mut owned = cache.get_all().await;
+        owned
+            .iter_mut()
+            .find(|cert| cert.hash == "a")
+            .unwrap()
+            .tags
+            .clear();
+        assert_eq!(cache.get_by_hash("a").await.unwrap().tags, vec!["new-tag"]);
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn shared_snapshot_ocsp_updates_preserve_signing_key_and_old_view() {
+        let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let cert = Certificate::from_pem(
+            generated.cert.pem().as_bytes(),
+            generated.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let cache = CertCache::new(CacheOptions::default());
+        let hash = cert.hash.clone();
+        cache.add(cert).await;
+        let snapshot = cache.maintenance_snapshot(false);
+        let before = cache.resolve("example.com").unwrap().key;
+        cache
+            .update_ocsp_if_present(
+                &hash,
+                Some(crate::ocsp::OcspStatus::Good),
+                Some(vec![1, 2, 3]),
+            )
+            .await
+            .unwrap();
+        let after = cache.resolve("example.com").unwrap().key;
+        assert!(snapshot[0].ocsp_response.is_none());
+        assert!(before.ocsp.is_none());
+        assert_eq!(after.ocsp, Some(vec![1, 2, 3]));
+        assert!(
+            Arc::ptr_eq(&before.key, &after.key),
+            "OCSP mutation must not re-import the signing key"
+        );
+        assert_cache_indices(&cache);
+    }
+
+    /// Reproducible, in-memory debug-profile scaling probe. No network, disk,
+    /// signing-key parsing, or unrelated tests are included in timed regions.
+    /// Run with --ignored --exact --nocapture --test-threads=1. Each operation
+    /// has one warm-up and seven recorded rounds; population/restoration is not
+    /// timed. These synthetic certificates have a 6 KiB chain, 256-byte private
+    /// key and 1 KiB staple, with no supported signing-key kind. The snapshot
+    /// case calls the same shared snapshot path as maintenance; the baseline
+    /// used its former owned `get_all()` path with identical fixtures/rounds.
+    #[tokio::test]
+    #[ignore = "manual cache scaling benchmark"]
+    async fn cache_maintenance_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn payload(index: usize) -> Certificate {
+            let mut cert = make_cert(
+                &[
+                    &format!("host-{index}.example.com"),
+                    &format!("alt-{index}.example.com"),
+                ],
+                &format!("{index:064x}"),
+                true,
+            );
+            cert.issuer_key = "benchmark-ca".into();
+            cert.cert_chain = vec![
+                rustls::pki_types::CertificateDer::from(vec![0; 4096]),
+                rustls::pki_types::CertificateDer::from(vec![0; 2048]),
+            ];
+            cert.private_key_der = Some(vec![1; 256]);
+            cert.ocsp_response = Some(vec![2; 1024]);
+            cert
+        }
+
+        async fn populated(size: usize, capacity: usize) -> Arc<CertCache> {
+            let cache = CertCache::new(CacheOptions {
+                capacity,
+                ..Default::default()
+            });
+            for index in 0..size {
+                cache.add(payload(index)).await;
+            }
+            cache
+        }
+
+        fn report(size: usize, operation: &str, mut samples: Vec<u128>) {
+            samples.sort_unstable();
+            println!(
+                "CACHE_BENCH size={size} operation={operation} median_ns={} min_ns={} max_ns={} rounds={}",
+                samples[samples.len() / 2],
+                samples[0],
+                samples[samples.len() - 1],
+                samples.len()
+            );
+        }
+
+        println!(
+            "CACHE_BENCH profile=debug warmup=1 rounds=7 synthetic_payload_bytes=7424 timing_includes_result_drop=true"
+        );
+        for size in [1_000, 10_000] {
+            let cache = populated(size, 0).await;
+            let indices: Vec<_> = (0..128).map(|i| i * (size / 128)).collect();
+            let subjects: Vec<_> = indices
+                .iter()
+                .map(|i| SubjectIssuer {
+                    subject: format!("host-{i}.example.com"),
+                    issuer_key: "benchmark-ca".into(),
+                })
+                .collect();
+            let mut samples = Vec::new();
+            for round in 0..8 {
+                let start = Instant::now();
+                cache.remove_managed(black_box(&subjects)).await;
+                let elapsed = start.elapsed().as_nanos();
+                assert_eq!(cache.count().await, size - indices.len());
+                if round > 0 {
+                    samples.push(elapsed);
+                }
+                for index in &indices {
+                    cache.add(payload(*index)).await;
+                }
+            }
+            report(size, "remove_128", samples);
+            drop(cache);
+
+            let cache = populated(size, size).await;
+            let mut samples = Vec::new();
+            for round in 0..8 {
+                // Prepare inputs outside the timed critical sections.
+                let incoming: Vec<_> = (0..64).map(|i| payload(size + round * 64 + i)).collect();
+                let start = Instant::now();
+                for cert in incoming {
+                    cache.add(black_box(cert)).await;
+                }
+                let elapsed = start.elapsed().as_nanos();
+                assert_eq!(cache.count().await, size);
+                if round > 0 {
+                    samples.push(elapsed);
+                }
+            }
+            report(size, "evict_insert_64", samples);
+            drop(cache);
+
+            let cache = populated(size, 0).await;
+            let mut samples = Vec::new();
+            for round in 0..8 {
+                let start = Instant::now();
+                for _ in 0..4 {
+                    let snapshot = cache.maintenance_snapshot(false);
+                    assert_eq!(snapshot.len(), size);
+                    black_box(snapshot);
+                }
+                let elapsed = start.elapsed().as_nanos();
+                if round > 0 {
+                    samples.push(elapsed);
+                }
+            }
+            report(size, "maintenance_snapshot_4", samples);
+        }
     }
 }
