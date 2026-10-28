@@ -4,10 +4,10 @@
 //!
 //! * **Atomic writes** — data is first written to a temporary file in the same directory, then
 //!   renamed into place so that readers never see a partial write.
-//! * **Process locking** — OS advisory locks are held by open file handles. Process exit
-//!   releases ownership automatically. Lock files are never removed or replaced, avoiding
-//!   stale-owner unlink/renewal races. Shared filesystems must support cross-host OS locks;
-//!   this backend does not provide fencing tokens or time-based lease takeover.
+//! * **Process locking** — OS advisory locks are held by open file handles. Process exit releases
+//!   ownership automatically. Lock files are never removed or replaced, avoiding stale-owner
+//!   unlink/renewal races. Shared filesystems must support cross-host OS locks; this backend does
+//!   not provide fencing tokens or time-based lease takeover.
 //! * **Platform-aware defaults** — the default storage path follows OS conventions
 //!   (`~/.local/share/certon` on Linux, `~/Library/Application Support/certon` on macOS,
 //!   `%APPDATA%/certon` on Windows).
