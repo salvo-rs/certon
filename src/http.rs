@@ -1,30 +1,9 @@
-//! The one HTTP client.
+//! HTTP defaults, shared transports and bounded response reading.
 //!
-//! Every request certon makes goes through here: fetching an ACME directory,
-//! posting a signed order, asking an OCSP responder, calling the ZeroSSL API.
-//!
-//! It is one client rather than four because four had three consequences, and
-//! the first of them was a panic.
-//!
-//! `reqwest` built against rustls with no provider selected refuses to guess
-//! one — constructing a client with no process-wide provider installed aborts
-//! the process with a message telling you to install one. Two of the four
-//! places that built a client installed a provider first. The other two, the
-//! OCSP fetcher and the ZeroSSL API client, did not, and worked only when
-//! something else happened to have run before them. A program that reached
-//! OCSP without first building an [`AcmeClient`](crate::acme_client::AcmeClient)
-//! or a `Config` died.
-//!
-//! The second is that a client owns a connection pool, so four clients meant
-//! four pools and no reuse between them. The OCSP path built a fresh one for
-//! every request, which is a TLS stack and a pool per certificate checked.
-//!
-//! The third is that the user agent reached Let's Encrypt but not ZeroSSL and
-//! not any OCSP responder, so certon identified itself to one of the three
-//! parties it talks to.
-//!
-//! A caller wanting different transport behaviour has one place to look
-//! rather than three modules to search, which is the point.
+//! OCSP and ZeroSSL use a cached HTTP client. ACME uses the same defaults to
+//! build a client with a mandatory endpoint and redirect policy; its cached
+//! issuer client preserves connection reuse while preventing HTTPS downgrade.
+//! The shared OCSP transport continues to support ordinary HTTP responders.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -95,7 +74,7 @@ pub fn user_agent() -> &'static str {
         .unwrap_or(DEFAULT_USER_AGENT)
 }
 
-/// The client every module shares.
+/// The cached transport for callers such as OCSP and ZeroSSL.
 ///
 /// Built on first use and kept. `reqwest::Client` is a handle to a shared
 /// pool, so this hands back a reference rather than cloning: callers that want
@@ -108,7 +87,7 @@ pub fn client() -> Result<&'static reqwest::Client> {
         .map_err(|reason| Error::Other(format!("could not build the HTTP client: {reason}")))
 }
 
-fn build() -> std::result::Result<reqwest::Client, String> {
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()
         .user_agent(
@@ -117,8 +96,10 @@ fn build() -> std::result::Result<reqwest::Client, String> {
                 .as_str(),
         )
         .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())
+}
+
+fn build() -> std::result::Result<reqwest::Client, String> {
+    client_builder().build().map_err(|error| error.to_string())
 }
 
 /// Make sure rustls has a process-wide provider, because `reqwest` requires

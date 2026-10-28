@@ -707,20 +707,13 @@ impl AcmeIssuer {
             return Ok(Arc::clone(client));
         }
         info!(ca = %ca_url, "initialising ACME client");
-        let http = if let Some(roots) = &self.trusted_roots {
-            crate::http::install_crypto_provider();
+        let mut http = crate::http::client_builder();
+        if let Some(roots) = &self.trusted_roots {
             let root = reqwest::Certificate::from_der(roots)
                 .map_err(|e| Error::Config(format!("invalid custom CA root certificate: {e}")))?;
-            reqwest::Client::builder()
-                .user_agent(crate::http::user_agent())
-                .timeout(crate::http::REQUEST_TIMEOUT)
-                .add_root_certificate(root)
-                .build()
-                .map_err(|e| Error::Config(format!("failed to build custom CA transport: {e}")))?
-        } else {
-            crate::http::client()?.clone()
-        };
-        let client = Arc::new(AcmeClient::with_http_client(ca_url, http).await?);
+            http = http.add_root_certificate(root);
+        }
+        let client = Arc::new(AcmeClient::with_http_client_builder(ca_url, http).await?);
         *guard = Some(Arc::clone(&client));
         Ok(client)
     }

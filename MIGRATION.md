@@ -159,3 +159,29 @@ HTTP redirect listener resource limits:
 - Abort the `JoinHandle` returned by `.start()` and await it to stop the
   listener. Its owned connection tasks are cancelled on shutdown. Dropping
   that handle only detaches the server, following Tokio's normal semantics.
+
+
+## ACME transport policy
+
+`AcmeClient::with_http_client` has been replaced by
+`AcmeClient::with_http_client_builder(directory_url, builder)`. This is a
+breaking API change: calls passing an already-built client must be migrated.
+Pass a configured
+`reqwest::ClientBuilder` without calling `.build()`. Certon preserves its roots,
+proxies, resolver, headers and timeouts, then overrides its redirect policy
+before building. An opaque, already-built client cannot expose or replace its
+redirect policy, so that entry point was removed rather than permit a request
+to be sent before detecting a downgrade.
+
+ACME directory fields and all subsequent operation URLs are checked before
+sending. HTTPS directories require HTTPS endpoints, including for localhost.
+Each redirect hop is checked before following; an HTTPS-to-HTTP redirect is
+rejected even when its destination is local. A directory explicitly served
+over HTTP retains the existing localhost, 127.0.0.1, ::1, .localhost and
+.internal development exceptions. If that directory upgrades to HTTPS, its
+returned endpoints must also use HTTPS. Redirect chains are limited to ten
+hops. Custom CA roots configured on `AcmeIssuer` continue to work.
+
+ACME uses its own cached issuer transport with the common HTTP defaults.
+OCSP's shared transport still supports HTTP responders; no global HTTPS-only
+restriction is applied to it.
