@@ -38,6 +38,70 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Default lock acquisition timeout (5 minutes).
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// Own exactly one successfully created temporary file across blocking tasks.
+/// The file handle is closed before unlink/rename, including panic unwinding
+/// and a blocking task whose result is abandoned by a cancelled caller.
+struct TemporaryWrite {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    armed: bool,
+}
+
+impl TemporaryWrite {
+    fn write_with(
+        path: PathBuf,
+        _mode: u32,
+        write_and_sync: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(_mode);
+        }
+        // A collision must never arm cleanup for somebody else's file.
+        let file = options.open(&path)?;
+        let mut temporary = Self {
+            path,
+            file: Some(file),
+            armed: true,
+        };
+        write_and_sync(
+            temporary
+                .file
+                .as_mut()
+                .expect("new temporary owns its open file"),
+        )?;
+        temporary.close();
+        Ok(temporary)
+    }
+
+    fn close(&mut self) {
+        drop(self.file.take());
+    }
+
+    fn commit(mut self, destination: PathBuf) -> std::io::Result<()> {
+        self.close();
+        std::fs::rename(&self.path, &destination)?;
+        self.armed = false;
+        #[cfg(unix)]
+        if let Some(parent) = destination.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TemporaryWrite {
+    fn drop(&mut self) {
+        self.close();
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// A [`Storage`] implementation backed by the local file system.
 ///
 /// This is the default storage backend, suitable for single-server
@@ -73,6 +137,10 @@ const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 ///
 /// Data is first written to a temporary file in the same directory, then
 /// renamed into place. This ensures readers never see partial writes.
+/// Cancellation is not rollback: once the completed write is handed off for
+/// rename, that blocking commit can still publish the whole replacement.
+/// Until commit, the writer or its returned guard owns temporary-file cleanup,
+/// including when a cancelled caller never receives the blocking task result.
 pub struct FileStorage {
     /// Root directory for all stored data.
     pub path: PathBuf,
@@ -226,44 +294,22 @@ impl FileStorage {
         let temp_path = path.with_file_name(temp_name);
 
         let data = data.to_vec();
-        let temp_path_for_write = temp_path.clone();
-        let write_result = tokio::task::spawn_blocking(move || {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(_mode);
-            }
-
-            let mut file = options.open(&temp_path_for_write)?;
-            file.write_all(&data)?;
-            file.sync_all()?;
-            Ok::<(), std::io::Error>(())
+        let temporary = tokio::task::spawn_blocking(move || {
+            TemporaryWrite::write_with(temp_path, _mode, |file| {
+                file.write_all(&data)?;
+                file.sync_all()
+            })
         })
         .await
-        .map_err(std::io::Error::other);
+        .map_err(std::io::Error::other)??;
 
-        if let Err(e) = write_result.and_then(|inner| inner) {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-
-        // Rename into final location.
-        if let Err(e) = tokio::fs::rename(&temp_path, path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
-
-        #[cfg(unix)]
-        if let Some(parent) = path.parent() {
-            let parent = parent.to_owned();
-            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
-                .await
-                .map_err(std::io::Error::other)??;
-        }
-        Ok(())
+        // Commit owns the guard too: cancelling this await cannot delete a
+        // file that the blocking rename is still using. Successful rename
+        // disarms cleanup; a failed/abandoned commit cleans its own source.
+        let destination = path.to_owned();
+        tokio::task::spawn_blocking(move || temporary.commit(destination))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     #[cfg(unix)]
@@ -670,6 +716,189 @@ mod tests {
 
         fs.delete("test/key.txt").await.unwrap();
         assert!(!fs.exists("test/key.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn temporary_write_failure_and_panic_close_and_remove_the_owned_file() {
+        let directory = tempfile::tempdir().unwrap();
+        for stage in ["write", "fsync"] {
+            let path = directory.path().join(format!("{stage}.tmp"));
+            let error = TemporaryWrite::write_with(path.clone(), 0o600, |file| {
+                file.write_all(if stage == "write" {
+                    b"partial"
+                } else {
+                    b"complete"
+                })?;
+                Err(std::io::Error::other(format!("injected {stage} failure")))
+            })
+            .err()
+            .unwrap();
+            assert!(error.to_string().contains(stage));
+            assert!(
+                !path.exists(),
+                "failed {stage} left its temporary private bytes"
+            );
+        }
+        let path = directory.path().join("panic.tmp");
+        let result = std::panic::catch_unwind(|| {
+            TemporaryWrite::write_with(path.clone(), 0o600, |file| {
+                file.write_all(b"private bytes before panic")?;
+                panic!("injected temporary writer panic");
+            })
+        });
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_name_collision_never_deletes_or_changes_the_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collision.tmp");
+        std::fs::write(&path, b"another writer's private resource").unwrap();
+        let error = TemporaryWrite::write_with(path.clone(), 0o600, |_| {
+            panic!("a failed create_new must never invoke the writer")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"another writer's private resource"
+        );
+    }
+
+    #[test]
+    fn failed_rename_cleans_its_source_and_preserves_the_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("rename.tmp");
+        let destination = directory.path().join("existing-directory");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("old"), b"old resource").unwrap();
+        let temporary = TemporaryWrite::write_with(source.clone(), 0o600, |file| {
+            file.write_all(b"replacement")?;
+            file.sync_all()
+        })
+        .unwrap();
+        assert!(
+            temporary.file.is_none(),
+            "transfer must close the Windows file handle"
+        );
+        assert!(temporary.commit(destination.clone()).is_err());
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read(destination.join("old")).unwrap(),
+            b"old resource"
+        );
+    }
+
+    struct BlockingRelease(Option<std::sync::mpsc::Sender<()>>);
+    impl BlockingRelease {
+        fn signal(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+    impl Drop for BlockingRelease {
+        fn drop(&mut self) {
+            self.signal();
+        }
+    }
+
+    #[test]
+    fn cancellation_does_not_remove_a_temporary_file_while_its_writer_is_running() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("running.tmp");
+        let destination = directory.path().join("canonical");
+        std::fs::write(&destination, b"old").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut release = BlockingRelease(Some(release_tx));
+            let caller = tokio::spawn({
+                let source = source.clone();
+                let destination = destination.clone();
+                async move {
+                    let temporary = tokio::task::spawn_blocking(move || {
+                        TemporaryWrite::write_with(source, 0o600, |file| {
+                            file.write_all(b"partial")?;
+                            let _ = entered_tx.send(());
+                            let _ = release_rx.recv();
+                            file.write_all(b" complete")?;
+                            file.sync_all()
+                        })
+                    })
+                    .await
+                    .map_err(std::io::Error::other)??;
+                    tokio::task::spawn_blocking(move || temporary.commit(destination))
+                        .await
+                        .map_err(std::io::Error::other)?
+                }
+            });
+            entered_rx.await.unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                std::fs::read(&source).unwrap(),
+                b"partial",
+                "the cancelled awaiter must not delete a still-running writer's file"
+            );
+            release.signal();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!source.exists());
+            assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+        });
+    }
+
+    #[test]
+    fn an_abandoned_commit_still_publishes_one_complete_file_and_leaves_no_temporary() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("commit.tmp");
+        let destination = directory.path().join("canonical");
+        std::fs::write(&destination, b"old").unwrap();
+        let temporary = TemporaryWrite::write_with(source.clone(), 0o600, |file| {
+            file.write_all(b"complete new resource")?;
+            file.sync_all()
+        })
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let mut release = BlockingRelease(Some(release_tx));
+            let gate = tokio::task::spawn_blocking(move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            });
+            entered_rx.await.unwrap();
+            let commit = tokio::task::spawn_blocking({
+                let destination = destination.clone();
+                move || temporary.commit(destination)
+            });
+            drop(commit);
+            assert!(
+                source.exists(),
+                "commit worker must retain its source while queued"
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"old");
+            release.signal();
+            gate.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert!(!source.exists());
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"complete new resource"
+            );
+        });
     }
 
     #[tokio::test]
