@@ -2,6 +2,14 @@
 
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
+`CertManager::client_config(domain, roots)` now requires the server trust roots
+as its second argument (`rustls::RootCertStore` or `Arc<RootCertStore>`). Populate
+them with the CAs trusted by your application. Previously this convenience
+method constructed an empty trust store, causing normal TLS servers to fail
+with `UnknownIssuer`. The managed certificate still supplies the client's mTLS
+identity; it is not used to infer server trust. Use `client_credentials()` to
+build a custom rustls configuration when you need other verification policies.
+
 Replace `Config` / `ConfigBuilder` with `CertManager` / `CertManagerBuilder`.
 Settings such as `config.key_type` and `config.ocsp` now live under
 `manager.policy`. Builder setters remain available. Use `.policy(policy)`

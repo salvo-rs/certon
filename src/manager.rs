@@ -1615,19 +1615,26 @@ impl CertManager {
     /// Build a [`rustls::ClientConfig`] for mutual TLS (mTLS) using a
     /// managed certificate.
     ///
-    /// This is a convenience wrapper around [`Self::client_credentials`] that
-    /// produces a ready-to-use `ClientConfig`.
+    /// This is a convenience wrapper around [`Self::client_credentials`].
+    /// `roots` supplies the trust anchors used to authenticate the server;
+    /// client credentials do not establish trust in the server's certificate.
+    /// Pass a store (or a shared `Arc` of one) populated with your trusted CAs.
+    /// An empty store rejects servers whose certificates require a trust anchor.
     ///
     /// # Errors
     ///
     /// Returns an error if no suitable certificate is found or if TLS
     /// configuration fails.
-    pub async fn client_config(&self, domain: &str) -> Result<rustls::ClientConfig> {
+    pub async fn client_config(
+        &self,
+        domain: &str,
+        roots: impl Into<Arc<rustls::RootCertStore>>,
+    ) -> Result<rustls::ClientConfig> {
         let (cert_chain, pk_der) = self.client_credentials(domain).await?;
 
         crate::install_default_crypto_provider();
         let config = rustls::ClientConfig::builder()
-            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_root_certificates(roots)
             .with_client_auth_cert(cert_chain, pk_der)
             .map_err(|e| Error::Config(format!("failed to build client TLS config: {e}")))?;
 
