@@ -234,5 +234,9 @@ return a certificate that needs renewal and does not publish it.
 `manage` and `obtain` repair future/expired stored certificates through the
 normal renewal path, publishing only after the replacement is validated.
 A failed CA request returns an error without caching the unusable resource.
-Already-managed fast paths remove only time-invalid managed entries and keep
-valid cached siblings. Background management uses the same checks.
+Already-managed fast paths keep invalid-time entries as lifecycle metadata so
+maintenance retains their SAN coverage. TLS selection filters these entries,
+including custom certificate selectors, while metadata lookups still return
+them. Maintenance repairs future certificates as well as expiring ones.
+Valid cached siblings remain available during failed repairs. Background
+management uses the same checks.

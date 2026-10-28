@@ -654,24 +654,14 @@ impl CertManager {
         Ok(())
     }
 
-    /// Remove only time-invalid managed entries before taking the fast path.
-    /// A valid sibling remains available even when another cached leaf is stale.
+    /// Time-invalid managed entries still track their SANs for maintenance and
+    /// renewal. TLS selection excludes them without discarding that metadata.
     async fn has_current_managed_certificate(&self, domain: &str) -> bool {
-        let mut current = false;
-        let mut stale = Vec::new();
-        for cert in self.cache.all_matching_certificates(domain).await {
-            if cert.managed {
-                if Self::validate_certificate_time(&cert, domain).is_ok() {
-                    current = true;
-                } else {
-                    stale.push(cert.hash);
-                }
-            }
-        }
-        if !stale.is_empty() {
-            self.cache.remove_many(&stale).await;
-        }
-        current
+        self.cache
+            .all_matching_certificates(domain)
+            .await
+            .iter()
+            .any(|cert| cert.managed && Self::validate_certificate_time(cert, domain).is_ok())
     }
 
     /// Manage a single domain name.
@@ -946,10 +936,6 @@ impl CertManager {
                 "domain '{domain}' does not qualify for a certificate"
             )));
         }
-
-        // A failed repair must not leave a known-invalid managed leaf hiding
-        // a valid cached sibling. Obtain still checks storage after this scan.
-        self.has_current_managed_certificate(domain).await;
 
         // Existing valid storage is a no-op; invalid-time credentials need
         // renewal before they can safely enter the serving cache.

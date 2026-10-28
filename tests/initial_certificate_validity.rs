@@ -24,6 +24,7 @@ struct Issuer {
     root: rustls::pki_types::CertificateDer<'static>,
     fail: AtomicBool,
     calls: AtomicUsize,
+    requests: std::sync::Mutex<Vec<Vec<String>>>,
 }
 impl Issuer {
     fn new() -> Self {
@@ -36,16 +37,22 @@ impl Issuer {
             root,
             fail: AtomicBool::new(true),
             calls: AtomicUsize::new(0),
+            requests: std::sync::Mutex::new(Vec::new()),
         }
     }
     fn resource(&self, before: i32, after: i32) -> CertificateResource {
-        let mut params = CertificateParams::new(vec!["example.com".into()]).unwrap();
+        self.resource_with_names(before, after, &["example.com"])
+    }
+    fn resource_with_names(&self, before: i32, after: i32, names: &[&str]) -> CertificateResource {
+        let mut params =
+            CertificateParams::new(names.iter().map(|name| (*name).into()).collect::<Vec<_>>())
+                .unwrap();
         params.not_before = rcgen::date_time_ymd(before, 1, 1);
         params.not_after = rcgen::date_time_ymd(after, 1, 1);
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &self.ca).unwrap();
         CertificateResource {
-            sans: vec!["example.com".into()],
+            sans: vec![names[0].into()],
             certificate_pem: cert.pem().into_bytes(),
             private_key_pem: key.serialize_pem().into_bytes(),
             issuer_key: self.issuer_key(),
@@ -57,6 +64,7 @@ impl Issuer {
 impl CertIssuer for Issuer {
     async fn issue(&self, csr: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(domains.to_vec());
         if self.fail.load(Ordering::SeqCst) {
             return Err(certon::Error::Config("test CA is unavailable".into()));
         }
@@ -162,6 +170,9 @@ impl Fixture {
         self.try_handshake().await.unwrap()
     }
     async fn try_handshake(&self) -> std::result::Result<Vec<u8>, String> {
+        self.try_handshake_for("example.com").await
+    }
+    async fn try_handshake_for(&self, domain: &str) -> std::result::Result<Vec<u8>, String> {
         certon::install_default_crypto_provider();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(self.issuer.root.clone()).unwrap();
@@ -173,7 +184,7 @@ impl Fixture {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
         let (server, client) = tokio::join!(
             acceptor.accept(server_io),
-            connector.connect("example.com".try_into().unwrap(), client_io)
+            connector.connect(domain.to_owned().try_into().unwrap(), client_io)
         );
         server.map_err(|error| error.to_string())?;
         Ok(client
@@ -370,7 +381,7 @@ async fn already_managed_invalid_leaves_do_not_skip_foreground_or_background_rep
 }
 
 #[tokio::test]
-async fn invalid_managed_siblings_are_removed_without_deleting_a_valid_cached_leaf() {
+async fn invalid_managed_siblings_remain_tracked_without_hiding_a_valid_cached_leaf() {
     for background in [false, true] {
         for future in [true, false] {
             let fixture = Fixture::new().await;
@@ -391,7 +402,7 @@ async fn invalid_managed_siblings_are_removed_without_deleting_a_valid_cached_le
                     .cache
                     .get_by_hash(&invalid.hash)
                     .await
-                    .is_none()
+                    .is_some()
             );
             assert!(
                 fixture
@@ -498,7 +509,7 @@ async fn obtain_repairs_invalid_storage_appearing_at_the_locked_recheck() {
 }
 
 #[tokio::test]
-async fn failed_obtain_repair_removes_only_invalid_managed_cache_entries() {
+async fn failed_obtain_repair_keeps_managed_metadata_and_a_valid_serving_leaf() {
     for future in [true, false] {
         let fixture = Fixture::new().await;
         let invalid = fixture.store_invalid(future).await;
@@ -510,7 +521,7 @@ async fn failed_obtain_repair_removes_only_invalid_managed_cache_entries() {
                 .cache
                 .get_by_hash(&invalid.hash)
                 .await
-                .is_none()
+                .is_some()
         );
         assert!(
             fixture
@@ -529,6 +540,124 @@ async fn failed_obtain_repair_removes_only_invalid_managed_cache_entries() {
         assert_ne!(
             fixture.handshake().await,
             fixture.old.cert_chain[0].as_ref()
+        );
+    }
+}
+
+#[tokio::test]
+async fn invalid_overlapping_managed_leaf_keeps_its_coverage_for_maintenance() {
+    for future in [true, false] {
+        let fixture = Fixture::new().await;
+        fixture.manager.cache.remove(&fixture.old.hash).await;
+        let year = chrono::Utc::now().year();
+        let ab = fixture.issuer.resource_with_names(
+            if future { year + 1 } else { year - 3 },
+            if future { year + 5 } else { year - 1 },
+            &["a.example.com", "b.example.com"],
+        );
+        fixture
+            .store
+            .save(&fixture.issuer.issuer_key(), &ab)
+            .await
+            .unwrap();
+        let invalid = fixture
+            .manager
+            .load_certificate("a.example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.manager.cache.add(invalid.clone()).await;
+        let ac = fixture.issuer.resource_with_names(
+            year - 1,
+            year + 5,
+            &["a.example.com", "c.example.com"],
+        );
+        let mut valid =
+            certon::Certificate::from_pem(&ac.certificate_pem, &ac.private_key_pem).unwrap();
+        valid.managed = true;
+        valid.issuer_key = fixture.issuer.issuer_key();
+        valid.names = vec!["a.example.com".into(), "c.example.com".into()];
+        fixture.manager.cache.add(valid.clone()).await;
+        fixture
+            .manager
+            .manage(&["a.example.com".into()])
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .manager
+                .cache
+                .get_by_hash(&invalid.hash)
+                .await
+                .is_some(),
+            "manage forgot the only certificate tracking b.example.com"
+        );
+        assert_eq!(
+            fixture.try_handshake_for("a.example.com").await.unwrap(),
+            valid.cert_chain[0].as_ref()
+        );
+        assert!(fixture.try_handshake_for("b.example.com").await.is_err());
+        let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let manager = fixture.manager.clone();
+        let recorded = outcomes.clone();
+        let renew: Arc<certon::maintain::ReasonedRenewFn> = Arc::new(move |domain, reason| {
+            let manager = manager.clone();
+            let recorded = recorded.clone();
+            Box::pin(async move {
+                let result = manager
+                    .renew(&domain, reason == certon::maintain::RenewalReason::Revoked)
+                    .await;
+                recorded.lock().unwrap().push(result.is_ok());
+                result
+            })
+        });
+        let task = certon::maintain::start_maintenance_with_policy(
+            fixture.manager.cache.clone(),
+            certon::maintain::MaintenanceConfig {
+                renew_check_interval: Duration::from_millis(5),
+                ocsp_check_interval: Duration::from_secs(3600),
+                storage: fixture.storage.clone(),
+                ocsp: fixture.manager.policy.ocsp.clone(),
+            },
+            renew,
+            fixture.store.clone(),
+            fixture.manager.policy.renewal_window_ratio,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while outcomes.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("maintenance forgot the invalid managed SAN coverage");
+        assert!(!outcomes.lock().unwrap()[0]);
+        assert_eq!(
+            fixture.try_handshake_for("a.example.com").await.unwrap(),
+            valid.cert_chain[0].as_ref()
+        );
+        fixture.issuer.fail.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !outcomes.lock().unwrap().contains(&true) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("maintenance did not repair the invalid managed SAN coverage");
+        fixture.manager.cache.stop_and_wait().await;
+        task.await.unwrap();
+        assert!(fixture.issuer.requests.lock().unwrap().iter().all(|names| {
+            ["a.example.com", "b.example.com", "c.example.com"]
+                .iter()
+                .all(|name| names.iter().any(|actual| actual == name))
+        }));
+        let replacement = fixture.try_handshake_for("b.example.com").await.unwrap();
+        assert_eq!(
+            replacement,
+            fixture.try_handshake_for("a.example.com").await.unwrap()
+        );
+        assert_eq!(
+            replacement,
+            fixture.try_handshake_for("c.example.com").await.unwrap()
         );
     }
 }
