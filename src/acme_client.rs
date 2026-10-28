@@ -34,6 +34,7 @@ use crate::error::{AcmeError, Result};
 // ---------------------------------------------------------------------------
 /// Set the user agent shared by all certon HTTP requests.
 pub use crate::http::set_user_agent;
+use crate::http::{MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES, read_body_limited};
 
 // ---------------------------------------------------------------------------
 // Well-known CA directory URLs
@@ -798,9 +799,10 @@ impl AcmeClient {
             );
         }
 
-        let directory: AcmeDirectory = resp
-            .json()
+        let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME directory")
             .await
+            .map_err(|e| AcmeError::Directory(e.to_string()))?;
+        let directory: AcmeDirectory = serde_json::from_slice(&body)
             .map_err(|e| AcmeError::Directory(format!("failed to parse directory JSON: {e}")))?;
 
         debug!(
@@ -900,10 +902,9 @@ impl AcmeClient {
             // Check for badNonce and retry once.
             if resp.status().as_u16() == 400 && attempt == 0 {
                 // Peek at the body to see if it's a badNonce error.
-                let resp_bytes = resp
-                    .bytes()
+                let resp_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
                     .await
-                    .map_err(|e| AcmeError::Nonce(format!("failed to read response body: {e}")))?;
+                    .map_err(|e| AcmeError::Nonce(e.to_string()))?;
 
                 if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&resp_bytes)
                     && problem.problem_type.contains("badNonce")
@@ -950,7 +951,9 @@ impl AcmeClient {
             .map(|s| s.to_owned());
 
         if !status.is_success() {
-            let body = resp.bytes().await.unwrap_or_default();
+            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
+                .await
+                .map_err(|e| AcmeError::Order(e.to_string()))?;
             let detail = match serde_json::from_slice::<AcmeProblem>(&body) {
                 Ok(p) => format!("{p}"),
                 Err(_) => String::from_utf8_lossy(&body).into_owned(),
@@ -960,10 +963,9 @@ impl AcmeClient {
             );
         }
 
-        let body = resp
-            .bytes()
+        let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME JSON")
             .await
-            .map_err(|e| AcmeError::Order(format!("failed to read response body: {e}")))?;
+            .map_err(|e| AcmeError::Order(e.to_string()))?;
 
         let parsed: T = serde_json::from_slice(&body)
             .map_err(|e| AcmeError::Order(format!("failed to parse response JSON: {e}")))?;
@@ -1082,7 +1084,9 @@ impl AcmeClient {
 
         // 400 with accountDoesNotExist means no account for this key.
         if resp.status().as_u16() == 400 {
-            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME account error")
+                .await
+                .map_err(|e| AcmeError::Account(e.to_string()))?;
             if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&body_bytes)
                 && problem.problem_type.contains("accountDoesNotExist")
             {
@@ -1109,10 +1113,9 @@ impl AcmeClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
 
-        let body_bytes = resp
-            .bytes()
+        let body_bytes = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME account")
             .await
-            .map_err(|e| AcmeError::Account(format!("failed to read response: {e}")))?;
+            .map_err(|e| AcmeError::Account(e.to_string()))?;
 
         let acct_resp: AccountResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| AcmeError::Account(format!("failed to parse account response: {e}")))?;
@@ -1596,7 +1599,9 @@ impl AcmeClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.bytes().await.unwrap_or_default();
+            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME revocation error")
+                .await
+                .map_err(|e| AcmeError::Certificate(e.to_string()))?;
             let detail = match serde_json::from_slice::<AcmeProblem>(&body) {
                 Ok(p) => format!("{p}"),
                 Err(_) => String::from_utf8_lossy(&body).into_owned(),
@@ -1650,7 +1655,9 @@ impl AcmeClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.bytes().await.unwrap_or_default();
+            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME ARI error")
+                .await
+                .map_err(|e| AcmeError::Certificate(e.to_string()))?;
             let detail = String::from_utf8_lossy(&body);
             warn!(
                 status = %status,
@@ -1673,9 +1680,9 @@ impl AcmeClient {
                         })
                 })
             });
-        let body = resp.bytes().await.map_err(|e| {
-            AcmeError::Certificate(format!("failed to read ARI response body: {e}"))
-        })?;
+        let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME ARI")
+            .await
+            .map_err(|e| AcmeError::Certificate(e.to_string()))?;
 
         let mut info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
             AcmeError::Certificate(format!("failed to parse ARI response JSON: {e}"))
