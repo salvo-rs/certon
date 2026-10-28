@@ -25,6 +25,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use rustls::SignatureScheme;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -296,7 +297,16 @@ impl CertResolver {
     ///
     /// Returns `Some(CertifiedKey)` if a suitable certificate was found or
     /// `None` if no certificate is available.
+    #[cfg(test)]
     fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        self.resolve_name_with_schemes(server_name, None)
+    }
+
+    fn resolve_name_with_schemes(
+        &self,
+        server_name: Option<&str>,
+        schemes: Option<&[SignatureScheme]>,
+    ) -> Option<Arc<CertifiedKey>> {
         let name = match server_name {
             Some(n) if !n.is_empty() => n.to_lowercase(),
             _ => {
@@ -309,7 +319,7 @@ impl CertResolver {
                     default_name.clone()
                 } else {
                     debug!("no SNI in ClientHello; returning default cert");
-                    return self.try_default_cert();
+                    return self.try_default_cert(schemes);
                 }
             }
         };
@@ -317,7 +327,7 @@ impl CertResolver {
         debug!(sni = %name, "resolving certificate for TLS handshake");
 
         // Step 1: Look up the exact name in the certificate cache.
-        if let Some(result) = self.try_resolve_from_cache_with_ocsp_check(&name) {
+        if let Some(result) = self.try_resolve_from_cache_with_ocsp_check(&name, schemes) {
             return Some(result);
         }
 
@@ -347,22 +357,44 @@ impl CertResolver {
                 fallback = %fallback,
                 "trying fallback_server_name",
             );
-            if let Some(result) = self.try_resolve_from_cache(fallback) {
+            if let Some(result) = self.try_resolve_from_cache(fallback, schemes) {
                 return Some(result);
             }
         }
 
         // Step 4: Return the default certificate.
-        self.try_default_cert()
+        self.try_default_cert(schemes)
     }
 
     /// The cache owns the prebuilt signing key; a handshake only clones its Arc.
-    fn try_resolve_from_cache(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        self.cache.resolve(name).map(|cached| cached.key)
+    fn try_resolve_from_cache(
+        &self,
+        name: &str,
+        schemes: Option<&[SignatureScheme]>,
+    ) -> Option<Arc<CertifiedKey>> {
+        self.resolve_cached_key(name, schemes)
+            .map(|cached| cached.key)
     }
 
-    fn try_resolve_from_cache_with_ocsp_check(&self, name: &str) -> Option<Arc<CertifiedKey>> {
-        let cached = self.cache.resolve(name)?;
+    fn resolve_cached_key(
+        &self,
+        name: &str,
+        schemes: Option<&[SignatureScheme]>,
+    ) -> Option<crate::cache::CachedKey> {
+        match schemes {
+            Some(schemes) => self
+                .cache
+                .resolve_with_filter(name, |key| key.key.choose_scheme(schemes).is_some()),
+            None => self.cache.resolve(name),
+        }
+    }
+
+    fn try_resolve_from_cache_with_ocsp_check(
+        &self,
+        name: &str,
+        schemes: Option<&[SignatureScheme]>,
+    ) -> Option<Arc<CertifiedKey>> {
+        let cached = self.resolve_cached_key(name, schemes)?;
         if cached.needs_ocsp
             && let Some(refresh_fn) = &self.ocsp_refresh_func
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -424,11 +456,13 @@ impl CertResolver {
     }
 
     /// Short synchronous reads do not turn contention into a false cache miss.
-    fn try_default_cert(&self) -> Option<Arc<CertifiedKey>> {
-        self.default_cert
+    fn try_default_cert(&self, schemes: Option<&[SignatureScheme]>) -> Option<Arc<CertifiedKey>> {
+        let key = self
+            .default_cert
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .clone()?;
+        accepts_schemes(&key, schemes).then_some(key)
     }
 }
 
@@ -444,7 +478,11 @@ impl ResolvesServerCert for CertResolver {
                 debug!(sni = %sni, "TLS-ALPN-01 challenge request detected");
                 if let Some(challenge_cert) = self.try_challenge_lookup(sni) {
                     debug!(sni = %sni, "serving TLS-ALPN-01 challenge certificate");
-                    return Some(challenge_cert);
+                    return accepts_schemes(
+                        &challenge_cert,
+                        Some(client_hello.signature_schemes()),
+                    )
+                    .then_some(challenge_cert);
                 }
                 warn!(
                     sni = %sni,
@@ -456,8 +494,15 @@ impl ResolvesServerCert for CertResolver {
             return None;
         }
 
-        self.resolve_name(client_hello.server_name())
+        self.resolve_name_with_schemes(
+            client_hello.server_name(),
+            Some(client_hello.signature_schemes()),
+        )
     }
+}
+
+fn accepts_schemes(key: &CertifiedKey, schemes: Option<&[SignatureScheme]>) -> bool {
+    schemes.is_none_or(|schemes| key.key.choose_scheme(schemes).is_some())
 }
 
 impl CertResolver {

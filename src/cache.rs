@@ -665,12 +665,21 @@ impl CertCache {
 
     /// Synchronous hot path for rustls, independent of any async runtime.
     pub(crate) fn resolve(&self, name: &str) -> Option<CachedKey> {
+        self.resolve_with_filter(name, |_| true)
+    }
+
+    /// Filter client-incompatible keys before applying certificate preferences.
+    pub(crate) fn resolve_with_filter(
+        &self,
+        name: &str,
+        accepts: impl Fn(&CertifiedKey) -> bool,
+    ) -> Option<CachedKey> {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         let entry = state
             .matching(name)
             .into_iter()
-            .filter(|e| e.key.is_some())
+            .filter(|e| e.key.as_ref().is_some_and(|key| accepts(key)))
             .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))?;
         Some(CachedKey {
             key: Arc::clone(entry.key.as_ref()?),
