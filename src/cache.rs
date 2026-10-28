@@ -257,6 +257,12 @@ pub(crate) struct CachedKey {
     pub needs_ocsp: bool,
 }
 
+/// Keep a true cache miss distinct from cached, client-incompatible keys.
+pub(crate) struct CachedKeyLookup {
+    pub matched: bool,
+    pub selected: Option<CachedKey>,
+}
+
 /// Registered before spawning maintenance, so immediate shutdown cannot race
 /// task startup. Dropping an unpolled or aborted task releases its registration.
 pub(crate) struct MaintenanceGuard {
@@ -665,19 +671,32 @@ impl CertCache {
 
     /// Synchronous hot path for rustls, independent of any async runtime.
     pub(crate) fn resolve(&self, name: &str) -> Option<CachedKey> {
+        self.resolve_with_filter(name, |_| true).selected
+    }
+
+    /// Filter client-incompatible keys before applying certificate preferences.
+    pub(crate) fn resolve_with_filter(
+        &self,
+        name: &str,
+        accepts: impl Fn(&CertifiedKey) -> bool,
+    ) -> CachedKeyLookup {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
-        let entry = state
-            .matching(name)
+        let candidates = state.matching(name);
+        let matched = !candidates.is_empty();
+        let selected = candidates
             .into_iter()
-            .filter(|e| e.key.is_some())
-            .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))?;
-        Some(CachedKey {
-            key: Arc::clone(entry.key.as_ref()?),
-            hash: entry.certificate.hash.clone(),
-            needs_ocsp: entry.certificate.ocsp_status.is_none()
-                || entry.certificate.ocsp_response.is_none(),
-        })
+            .filter(|e| e.key.as_ref().is_some_and(|key| accepts(key)))
+            .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))
+            .and_then(|entry| {
+                Some(CachedKey {
+                    key: Arc::clone(entry.key.as_ref()?),
+                    hash: entry.certificate.hash.clone(),
+                    needs_ocsp: entry.certificate.ocsp_status.is_none()
+                        || entry.certificate.ocsp_response.is_none(),
+                })
+            });
+        CachedKeyLookup { matched, selected }
     }
 
     /// Look up metadata by content hash.
