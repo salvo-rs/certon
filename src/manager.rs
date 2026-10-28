@@ -1162,6 +1162,7 @@ impl CertManager {
                     // Backend failures must abort the transaction, even when
                     // another issuer could return a different certificate.
                     let cert = self.validate_certificate_status(cert, domain).await?;
+                    crate::ocsp::ensure_required_staple(&cert).await?;
                     self.certificates.save(&ik, &cert_res).await?;
                     self.publish_certificate(cert, domain).await?;
 
@@ -1457,6 +1458,7 @@ impl CertManager {
                         }
                     };
                     let cert = self.validate_certificate_status(cert, domain).await?;
+                    crate::ocsp::ensure_required_staple(&cert).await?;
                     self.certificates.save(&ik, &new_cert_res).await?;
                     self.publish_certificate(cert, domain).await?;
 
@@ -1880,6 +1882,182 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn actual_must_staple_requires_good_ocsp_before_saving_or_publishing() {
+        use x509_parser::prelude::FromDer;
+        struct CsrKey(Vec<u8>);
+        impl rcgen::PublicKeyData for CsrKey {
+            fn der_bytes(&self) -> &[u8] {
+                &self.0
+            }
+            fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+                &rcgen::PKCS_ECDSA_P256_SHA256
+            }
+        }
+        struct Issuer {
+            ca: rcgen::Issuer<'static, rcgen::KeyPair>,
+            root: rustls::pki_types::CertificateDer<'static>,
+            storage: Arc<dyn Storage>,
+            feature: bool,
+            status: Option<u8>,
+        }
+        #[async_trait::async_trait]
+        impl CertIssuer for Issuer {
+            async fn issue(
+                &self,
+                csr: &[u8],
+                names: &[String],
+            ) -> Result<crate::IssuedCertificate> {
+                let (_, csr) =
+                    x509_parser::certification_request::X509CertificationRequest::from_der(csr)
+                        .unwrap();
+                let public = CsrKey(
+                    csr.certification_request_info
+                        .subject_pki
+                        .subject_public_key
+                        .data
+                        .to_vec(),
+                );
+                let mut params = rcgen::CertificateParams::new(names.to_vec()).unwrap();
+                params.not_before = rcgen::date_time_ymd(1970, 1, 1)
+                    + std::time::Duration::from_secs(
+                        (Utc::now().timestamp() - 60).try_into().unwrap(),
+                    );
+                params.not_after =
+                    params.not_before + std::time::Duration::from_secs(2 * 24 * 60 * 60);
+                params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+                if self.feature {
+                    params
+                        .custom_extensions
+                        .push(rcgen::CustomExtension::from_oid_content(
+                            &[1, 3, 6, 1, 5, 5, 7, 1, 24],
+                            vec![0x30, 0x03, 0x02, 0x01, 0x05],
+                        ));
+                }
+                let leaf = params.signed_by(&public, &self.ca).unwrap();
+                let chain = vec![leaf.der().clone(), self.root.clone()];
+                if let Some(status) = self.status {
+                    let raw = crate::ocsp::tests::signed_response(
+                        &chain,
+                        self.ca.key(),
+                        status,
+                        Utc::now(),
+                        Utc::now() + chrono::Duration::hours(4),
+                    );
+                    self.storage
+                        .store(
+                            &crate::storage::ocsp_key(
+                                &names[0],
+                                &crate::certificates::hash_certificate_chain(&chain),
+                            ),
+                            &raw,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let certificate_pem: String = chain
+                    .iter()
+                    .map(|der| ::pem::encode(&::pem::Pem::new("CERTIFICATE", der.as_ref())))
+                    .collect();
+                Ok(crate::IssuedCertificate {
+                    certificate_pem: certificate_pem.into_bytes(),
+                    private_key_pem: Vec::new(),
+                    metadata: serde_json::Value::Null,
+                })
+            }
+            fn issuer_key(&self) -> String {
+                "must-staple-test".into()
+            }
+        }
+        for renew in [false, true] {
+            for (feature, status, disabled, expected) in [
+                (true, None, false, false),
+                (true, Some(2), false, false),
+                (true, Some(0), true, false),
+                (true, Some(0), false, true),
+                // A requested CSR feature is not proof that the CA included it.
+                (false, None, false, true),
+            ] {
+                let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+                let store = Arc::new(crate::cert_store::tests::InMemory::default());
+                let key = rcgen::KeyPair::generate().unwrap();
+                let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+                params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+                params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+                let root = params.self_signed(&key).unwrap().der().clone();
+                let issuer = Arc::new(Issuer {
+                    ca: rcgen::Issuer::new(params, key),
+                    root,
+                    storage: storage.clone(),
+                    feature,
+                    status,
+                });
+                let manager = CertManager::builder()
+                    .storage(storage)
+                    .certificates(store.clone())
+                    .issuers(vec![issuer])
+                    .must_staple(!feature)
+                    .ocsp(OcspConfig {
+                        disable_stapling: disabled,
+                        ..Default::default()
+                    })
+                    .build();
+                let old = if renew {
+                    let old = rcgen::generate_simple_self_signed(vec!["ocsp.example.com".into()])
+                        .unwrap();
+                    let resource = CertificateResource {
+                        sans: vec!["ocsp.example.com".into()],
+                        certificate_pem: old.cert.pem().into_bytes(),
+                        private_key_pem: old.signing_key.serialize_pem().into_bytes(),
+                        issuer_key: "must-staple-test".into(),
+                        issuer_data: None,
+                    };
+                    store.save("must-staple-test", &resource).await.unwrap();
+                    manager.cache_certificate("ocsp.example.com").await.unwrap();
+                    Some(resource)
+                } else {
+                    None
+                };
+                let result = if renew {
+                    manager.renew("ocsp.example.com", true).await
+                } else {
+                    manager.obtain("ocsp.example.com").await
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "renew={renew}, feature={feature}, status={status:?}, disabled={disabled}: {result:?}"
+                );
+                let stored = store
+                    .load("must-staple-test", "ocsp.example.com")
+                    .await
+                    .unwrap();
+                if !expected {
+                    assert!(matches!(result, Err(Error::Cert(CertError::OcspFailed(_)))));
+                    assert_eq!(
+                        stored.as_ref().map(|r| &r.certificate_pem),
+                        old.as_ref().map(|r| &r.certificate_pem)
+                    );
+                    if let Some(old) = old {
+                        let previous =
+                            Certificate::from_pem(&old.certificate_pem, &old.private_key_pem)
+                                .unwrap();
+                        assert_eq!(
+                            manager.cache.resolve("ocsp.example.com").unwrap().key.cert[0],
+                            previous.cert_chain[0]
+                        );
+                    } else {
+                        assert!(manager.cache.resolve("ocsp.example.com").is_none());
+                    }
+                } else {
+                    let serving = manager.cache.resolve("ocsp.example.com").unwrap();
+                    assert_eq!(serving.key.ocsp.is_some(), feature);
+                    assert!(stored.is_some());
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn bulk_management_and_detached_managers_share_bounded_admission() {

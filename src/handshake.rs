@@ -435,13 +435,20 @@ impl CertResolver {
         hello: Option<&ClientHello<'_>>,
     ) -> (bool, Option<Arc<CertifiedKey>>) {
         let lookup = self.resolve_cached_key(name, hello);
-        let Some(cached) = lookup.selected else {
-            return (lookup.matched, None);
+        let refresh_hash = if self.ocsp_refresh_func.is_some() {
+            match lookup.selected.as_ref() {
+                Some(key) => key.needs_ocsp.then(|| key.hash.clone()),
+                None => self.cache.ocsp_refresh_candidate(name, |key| {
+                    accepts_schemes(key, hello.map(ClientHello::signature_schemes))
+                }),
+            }
+        } else {
+            None
         };
-        if cached.needs_ocsp
+        if let Some(hash) = refresh_hash
             && let Some(refresh_fn) = &self.ocsp_refresh_func
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
-            && let Some(work) = BackgroundWork::try_start(&self.pending_ocsp, cached.hash)
+            && let Some(work) = BackgroundWork::try_start(&self.pending_ocsp, hash)
         {
             let refresh = Arc::clone(refresh_fn);
             let domain = name.to_owned();
@@ -450,7 +457,7 @@ impl CertResolver {
                 refresh(domain).await;
             });
         }
-        (lookup.matched, Some(cached.key))
+        (lookup.matched, lookup.selected.map(|cached| cached.key))
     }
 
     fn trigger_on_demand_obtain(&self, on_demand: &Arc<OnDemandConfig>, name: &str) {
@@ -1000,6 +1007,148 @@ mod tests {
         assert!(resolver.resolve_name(Some(&name)).unwrap().ocsp.is_none());
         tokio::task::yield_now().await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_must_staple_yields_to_usable_siblings_and_recovers_only_for_compatible_clients()
+     {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Selector {
+            expected: String,
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::policy::CertificateSelector for Selector {
+            fn select_certificate(
+                &self,
+                _: &ClientHello<'_>,
+                choices: &[&Certificate],
+            ) -> Option<usize> {
+                assert_eq!(choices.len(), 1);
+                assert_eq!(choices[0].hash, self.expected);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Some(0)
+            }
+        }
+        async fn connect(
+            resolver: CertResolver,
+            root: rustls::pki_types::CertificateDer<'static>,
+            scheme: SignatureScheme,
+        ) -> Option<Vec<u8>> {
+            crate::install_default_crypto_provider();
+            let mut provider = rustls::crypto::CryptoProvider::get_default()
+                .unwrap()
+                .as_ref()
+                .clone();
+            provider.signature_verification_algorithms.mapping = std::slice::from_ref(
+                provider
+                    .signature_verification_algorithms
+                    .mapping
+                    .iter()
+                    .find(|(supported, _)| *supported == scheme)
+                    .unwrap(),
+            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(root).unwrap();
+            let client = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let server = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver));
+            let (server_io, client_io) = tokio::io::duplex(16384);
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+            let (server, client) = tokio::join!(
+                acceptor.accept(server_io),
+                connector.connect("ocsp.example.com".try_into().unwrap(), client_io)
+            );
+            match (server, client) {
+                (Ok(_), Ok(client)) => {
+                    Some(client.get_ref().1.peer_certificates().unwrap()[0].to_vec())
+                }
+                _ => None,
+            }
+        }
+        let (mut must, issuer) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        must.managed = true; // Prefer this leaf while its staple is usable.
+        must.ocsp_status = Some(crate::ocsp::OcspStatus::Good);
+        must.ocsp_response = Some(crate::cache::tests::signed_staple(&must, &issuer, 3));
+        let must_hash = must.hash.clone();
+        let (ordinary, _) = crate::ocsp::tests::short_lived_certificate(None);
+        let root = ordinary.cert_chain[1].clone();
+        let leaf = ordinary.cert_chain[0].to_vec();
+        let cache = CertCache::new(CacheOptions::default());
+        cache.add(ordinary.clone()).await;
+        cache.add(must).await;
+        assert_eq!(cache.resolve("ocsp.example.com").unwrap().hash, must_hash);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            cache.resolve("ocsp.example.com").unwrap().hash,
+            ordinary.hash
+        );
+        for custom in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut resolver = CertResolver::new(cache.clone());
+            if custom {
+                resolver.set_certificate_selector(Arc::new(Selector {
+                    expected: ordinary.hash.clone(),
+                    calls: calls.clone(),
+                }));
+            }
+            assert_eq!(
+                connect(
+                    resolver,
+                    root.clone(),
+                    SignatureScheme::ECDSA_NISTP256_SHA256
+                )
+                .await,
+                Some(leaf.clone())
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(custom));
+        }
+        cache.remove(&ordinary.hash).await;
+        for (scheme, refreshed) in [
+            (SignatureScheme::RSA_PSS_SHA256, 0),
+            (SignatureScheme::ECDSA_NISTP256_SHA256, 1),
+        ] {
+            let obtains = Arc::new(AtomicUsize::new(0));
+            let refreshes = Arc::new(AtomicUsize::new(0));
+            let config = Arc::new(OnDemandConfig {
+                decision_func: Some(Arc::new(|_| true)),
+                host_allowlist: None,
+                rate_limit: None,
+                obtain_func: Some(Arc::new({
+                    let obtains = obtains.clone();
+                    move |_| {
+                        let obtains = obtains.clone();
+                        Box::pin(async move {
+                            obtains.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                    }
+                })),
+            });
+            let mut resolver = CertResolver::with_on_demand(cache.clone(), config);
+            resolver.ocsp_refresh_func = Some(Arc::new({
+                let refreshes = refreshes.clone();
+                move |_| {
+                    let refreshes = refreshes.clone();
+                    Box::pin(async move {
+                        refreshes.fetch_add(1, Ordering::SeqCst);
+                    })
+                }
+            }));
+            assert!(connect(resolver, root.clone(), scheme).await.is_none());
+            tokio::task::yield_now().await;
+            assert_eq!(refreshes.load(Ordering::SeqCst), refreshed);
+            assert_eq!(
+                obtains.load(Ordering::SeqCst),
+                0,
+                "missing Must-Staple response must not trigger duplicate issuance"
+            );
+        }
     }
 
     #[tokio::test]
