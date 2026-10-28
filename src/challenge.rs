@@ -116,6 +116,10 @@ pub(crate) fn key(prefix: &str, domain: &str, token: &str) -> String {
     format!("{}/v2/{}/{}.json", base(prefix), hash(domain), hash(token))
 }
 
+pub(crate) fn legacy_compatible(domain: &str) -> bool {
+    safe_key(domain) == domain
+}
+
 pub(crate) fn legacy_key(prefix: &str, domain: &str) -> String {
     format!("{}/{}.json", base(prefix), safe_key(domain))
 }
@@ -167,7 +171,7 @@ pub(crate) async fn load(
         }
         Err(Error::Storage(StorageError::NotFound(_))) => {
             // Legacy sanitization is ambiguous for IPv6: do not accept aliases.
-            if safe_key(domain) != domain {
+            if !legacy_compatible(domain) {
                 return Ok(None);
             }
             match storage.load(&legacy_key(prefix, domain)).await {

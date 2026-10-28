@@ -985,9 +985,15 @@ impl Solver for DistributedSolver {
             // Retire legacy entries under a separate shared domain lock. New writers
             // never update the old map, so different v2 tokens remain independent.
             let legacy = crate::challenge::legacy_key(&self.storage_key_issuer_prefix, &canonical);
-            let _legacy_guard =
-                crate::storage::acquire(self.storage.clone(), &format!("challenge/{legacy}"))
-                    .await?;
+            let legacy_compatible = crate::challenge::legacy_compatible(&canonical);
+            let _legacy_guard = if legacy_compatible {
+                Some(
+                    crate::storage::acquire(self.storage.clone(), &format!("challenge/{legacy}"))
+                        .await?,
+                )
+            } else {
+                None
+            };
             let current = crate::challenge::load(
                 self.storage.as_ref(),
                 &self.storage_key_issuer_prefix,
@@ -995,28 +1001,30 @@ impl Solver for DistributedSolver {
                 token,
             )
             .await?;
-            match self.storage.load(&legacy).await {
-                Ok(data) => {
-                    let mut map = crate::challenge::legacy_map(&data)?;
-                    if current.as_deref() == Some(key_auth)
-                        || map.get(token).is_some_and(|auth| auth == key_auth)
-                    {
-                        map.remove(token);
-                        if map.is_empty() {
-                            self.storage.delete(&legacy).await?;
-                        } else {
-                            self.storage
-                                .store(
-                                    &legacy,
-                                    &serde_json::to_vec(&map)
-                                        .map_err(|e| Error::Other(e.to_string()))?,
-                                )
-                                .await?;
+            if legacy_compatible {
+                match self.storage.load(&legacy).await {
+                    Ok(data) => {
+                        let mut map = crate::challenge::legacy_map(&data)?;
+                        if current.as_deref() == Some(key_auth)
+                            || map.get(token).is_some_and(|auth| auth == key_auth)
+                        {
+                            map.remove(token);
+                            if map.is_empty() {
+                                self.storage.delete(&legacy).await?;
+                            } else {
+                                self.storage
+                                    .store(
+                                        &legacy,
+                                        &serde_json::to_vec(&map)
+                                            .map_err(|e| Error::Other(e.to_string()))?,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
+                    Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                    Err(e) => return Err(e),
                 }
-                Err(Error::Storage(crate::error::StorageError::NotFound(_))) => {}
-                Err(e) => return Err(e),
             }
             if current.as_deref() == Some(key_auth) {
                 match self.storage.delete(&key).await {

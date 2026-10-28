@@ -479,3 +479,38 @@ async fn delete_failure_is_retryable_and_still_cleans_the_inner_solver() {
         Some((404, String::new()))
     );
 }
+
+#[tokio::test]
+async fn ambiguous_legacy_alias_is_neither_read_nor_removed() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+    let solver = DistributedSolver::new(Box::new(Noop), storage.clone());
+    let handler = HttpChallengeHandler::new(Arc::default(), Some(storage.clone()));
+    let old = br#"{"Token":"Token.other"}"#;
+    for (domain, alias) in [
+        ("2001:db8::1", "2001-db8--1"),
+        ("*.example.com", "wildcard_.example.com"),
+    ] {
+        let legacy = format!("challenge_tokens/{alias}.json");
+        storage.store(&legacy, old).await.unwrap();
+        if domain == "2001:db8::1" {
+            assert_eq!(
+                handler
+                    .handle_http_request(
+                        "GET",
+                        "[2001:db8::1]",
+                        "/.well-known/acme-challenge/Token"
+                    )
+                    .await,
+                Some((404, String::new()))
+            );
+        }
+        solver.present(domain, "Token", "Token.new").await.unwrap();
+        solver.cleanup(domain, "Token", "Token.new").await.unwrap();
+        assert_eq!(
+            storage.load(&legacy).await.unwrap(),
+            old,
+            "legacy alias for {domain} must survive"
+        );
+    }
+}
