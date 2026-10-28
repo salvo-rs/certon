@@ -62,6 +62,13 @@ that function clears the non-Good response bytes.
 
 Version 0.3.0 introduces the following breaking API changes from 0.2.x.
 
+For external configuration, use `CertManagerBuilder::try_build()` to receive
+missing-storage and invalid-policy errors. `build()` remains a convenience
+wrapper that panics on invalid configuration. Renewal ratios must be finite
+and no greater than one; finite non-positive values keep selecting the default.
+Low-level renewal-window checks safely use the default for non-finite or
+out-of-range input, so malformed ratios cannot panic maintenance tasks.
+
 Construct `BoundTlsListener` with `BoundTlsListener::new(listener, acceptor)`
 instead of a struct literal. It now owns bounded handshake state. Its public
 `listener` and `acceptor` fields and `into_parts()` remain available for custom

@@ -68,6 +68,8 @@ pub trait CertificateSelector: Send + Sync {
 pub struct Policy {
     /// The fraction of a certificate's lifetime that must remain before it is
     /// left alone. `1.0 / 3.0` means "renew when a third of the life is left".
+    /// Non-positive values select the default. Values must be finite and no
+    /// greater than one; [`Self::validate`] checks external configuration.
     pub renewal_window_ratio: f64,
 
     /// The kind of private key generated for a new certificate.
@@ -135,6 +137,21 @@ impl Default for Policy {
             disable_storage_check: true,
             interactive: false,
         }
+    }
+}
+
+impl Policy {
+    /// Validate settings before starting certificate operations.
+    ///
+    /// A non-positive renewal ratio selects the default. Positive ratios must
+    /// be at most one, and all ratios must be finite.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.renewal_window_ratio.is_finite() || self.renewal_window_ratio > 1.0 {
+            return Err(crate::error::Error::Config(
+                "renewal_window_ratio must be finite and at most 1; non-positive values select the default".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

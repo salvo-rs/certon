@@ -519,7 +519,7 @@ pub async fn managed_cert_in_storage_needs_renewal(
 /// of the certificate's total lifetime. For example, with a ratio of `1/3`,
 /// a 90-day certificate would enter the renewal window at day 60.
 ///
-/// If `renewal_window_ratio` is `0.0` (or negative), the
+/// If `renewal_window_ratio` is non-positive, non-finite, or greater than one, the
 /// [`DEFAULT_RENEWAL_WINDOW_RATIO`] is used.
 pub fn currently_in_renewal_window(
     not_before: DateTime<Utc>,
@@ -531,7 +531,10 @@ pub fn currently_in_renewal_window(
         return false;
     }
 
-    let ratio = if renewal_window_ratio <= 0.0 {
+    let ratio = if !renewal_window_ratio.is_finite()
+        || renewal_window_ratio <= 0.0
+        || renewal_window_ratio > 1.0
+    {
         DEFAULT_RENEWAL_WINDOW_RATIO
     } else {
         renewal_window_ratio
