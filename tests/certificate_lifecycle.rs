@@ -612,7 +612,14 @@ async fn maintenance_repairs_fresh_partial_storage_and_keeps_the_lookup_key_on_r
         .save(&issuer.issuer_key(), &ac)
         .await
         .unwrap();
-    let old_ab = manager.cache_certificate("a.example.com").await.unwrap();
+    // Simulate an already-cached certificate reaching expiry. The public
+    // cache loader now rejects expired storage resources before publication.
+    let old_ab = manager
+        .load_certificate("a.example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    manager.cache.add(old_ab.clone()).await;
     let old_ac = manager.cache_certificate("c.example.com").await.unwrap();
     assert!(old_ab.needs_renewal(manager.policy.renewal_window_ratio));
     assert!(!old_ac.needs_renewal(manager.policy.renewal_window_ratio));

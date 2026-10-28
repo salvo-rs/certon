@@ -38,7 +38,7 @@ use crate::crypto::{
     KeyType, decode_private_key_pem, encode_private_key_pem, generate_csr,
     generate_private_key_async,
 };
-use crate::error::{Error, Result, StorageError};
+use crate::error::{CertError, Error, Result, StorageError};
 use crate::handshake::{CertResolver, OnDemandConfig};
 use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
@@ -590,8 +590,8 @@ impl CertManager {
     /// This is the primary entry point for certificate management. For each
     /// domain:
     ///
-    /// 1. Check if already managed in cache -- skip if so.
-    /// 2. Try loading from storage -- add to cache if found.
+    /// 1. Skip currently valid managed entries, removing stale managed entries.
+    /// 2. Load storage resources and cache only certificates currently valid.
     /// 3. If not found in storage -- obtain a new certificate from the configured issuers.
     /// 4. If loaded from storage, check if renewal is needed and renew if so.
     ///
@@ -617,10 +617,7 @@ impl CertManager {
         for domain in domains {
             let domain = domain.to_lowercase();
 
-            // Check if already managed in cache.
-            let cached_certs = self.cache.all_matching_certificates(&domain).await;
-            let already_managed = cached_certs.iter().any(|c| c.managed);
-            if already_managed {
+            if self.has_current_managed_certificate(&domain).await {
                 continue;
             }
 
@@ -657,59 +654,59 @@ impl CertManager {
         Ok(())
     }
 
-    /// Manage a single domain name.
-    async fn manage_one(&self, domain: &str, r#async: bool) -> Result<()> {
-        // If the certificate is already managed in cache, nothing to do.
-        let cached_certs = self.cache.all_matching_certificates(domain).await;
-        for cert in &cached_certs {
+    /// Remove only time-invalid managed entries before taking the fast path.
+    /// A valid sibling remains available even when another cached leaf is stale.
+    async fn has_current_managed_certificate(&self, domain: &str) -> bool {
+        let mut current = false;
+        let mut stale = Vec::new();
+        for cert in self.cache.all_matching_certificates(domain).await {
             if cert.managed {
-                return Ok(());
+                if Self::validate_certificate_time(&cert, domain).is_ok() {
+                    current = true;
+                } else {
+                    stale.push(cert.hash);
+                }
             }
         }
+        if !stale.is_empty() {
+            self.cache.remove_many(&stale).await;
+        }
+        current
+    }
 
-        // Try loading from storage.
-        match self.cache_certificate(domain).await {
+    /// Manage a single domain name.
+    async fn manage_one(&self, domain: &str, r#async: bool) -> Result<()> {
+        if self.has_current_managed_certificate(domain).await {
+            return Ok(());
+        }
+
+        // Planning may read an expired/future resource for its SANs and issuer,
+        // but those credentials must not be published before renewal succeeds.
+        match self.load_stored_certificate(domain).await {
             Ok(cert) => {
-                // Certificate was loaded from storage and cached.
-                let mut needs_action = cert.needs_renewal(self.policy.renewal_window_ratio);
-
-                // Task 7: Check OCSP revocation status. If the certificate
-                // has been revoked, trigger a renewal.
-                if !needs_action && let Some(OcspStatus::Revoked) = cert.ocsp_status {
-                    warn!(
-                        domain = %domain,
-                        "certificate OCSP status is Revoked; triggering renewal"
-                    );
-                    needs_action = true;
+                let current = Self::validate_certificate_time(&cert, domain).is_ok();
+                let revoked = matches!(cert.ocsp_status, Some(OcspStatus::Revoked));
+                let needs_action =
+                    !current || cert.needs_renewal(self.policy.renewal_window_ratio) || revoked;
+                if current {
+                    self.cache_loaded_certificate(cert, domain).await?;
                 }
-
                 if needs_action {
                     if r#async {
-                        self.renew_in_background(
-                            domain,
-                            matches!(cert.ocsp_status, Some(OcspStatus::Revoked)),
-                        )
-                        .await?;
+                        self.renew_in_background(domain, revoked).await?;
                     } else {
-                        self.renew(
-                            domain,
-                            matches!(cert.ocsp_status, Some(OcspStatus::Revoked)),
-                        )
-                        .await?;
+                        self.renew(domain, revoked).await?;
                     }
-                    // Reload the renewed certificate into cache.
-                    let _ = self.cache_certificate(domain).await;
+                    // renew publishes its validated replacement before return.
                 }
                 Ok(())
             }
-            Err(e) => {
-                // Check if it is a "not found" error.
-                let is_not_found = matches!(&e, Error::Storage(StorageError::NotFound(_)));
-                if !is_not_found {
-                    return Err(Error::Other(format!("{domain}: caching certificate: {e}")));
+            Err(error) => {
+                if !matches!(&error, Error::Storage(StorageError::NotFound(_))) {
+                    return Err(Error::Other(format!(
+                        "{domain}: loading certificate: {error}"
+                    )));
                 }
-
-                // Not in storage -- obtain a new certificate.
                 if r#async {
                     self.obtain_in_background(domain).await
                 } else {
@@ -720,9 +717,19 @@ impl CertManager {
     }
 
     /// Load a managed certificate from storage and add it to the in-memory
-    /// cache.
+    /// cache. A future or expired certificate returns a validity error without
+    /// replacing any working certificate already in the cache.
     pub async fn cache_certificate(&self, domain: &str) -> Result<Certificate> {
-        let cert = self.load_managed_certificate(domain).await?;
+        let cert = self.load_stored_certificate(domain).await?;
+        self.cache_loaded_certificate(cert, domain).await
+    }
+
+    async fn cache_loaded_certificate(
+        &self,
+        cert: Certificate,
+        domain: &str,
+    ) -> Result<Certificate> {
+        Self::validate_certificate_time(&cert, domain)?;
         self.cache.add(cert.clone()).await;
         let _ = self.emit(
             EVENT_CACHED_MANAGED_CERT,
@@ -731,9 +738,19 @@ impl CertManager {
         Ok(cert)
     }
 
-    /// Load a managed certificate from storage without adding it to the
-    /// cache.
-    async fn load_managed_certificate(&self, domain: &str) -> Result<Certificate> {
+    fn validate_certificate_time(cert: &Certificate, domain: &str) -> Result<()> {
+        if cert.not_before > chrono::Utc::now() {
+            return Err(CertError::NotYetValid(domain.to_owned()).into());
+        }
+        if cert.expired() {
+            return Err(CertError::Expired(domain.to_owned()).into());
+        }
+        Ok(())
+    }
+
+    /// Read metadata for lifecycle planning without publishing. Time-invalid
+    /// resources remain usable as renewal inputs; revocation checks still apply.
+    async fn load_stored_certificate(&self, domain: &str) -> Result<Certificate> {
         let cert_res = self.load_cert_resource_any_issuer(domain).await?;
         let mut cert = self.validated_certificate(&cert_res, domain).await?;
         cert.managed = true;
@@ -871,10 +888,11 @@ impl CertManager {
 
     /// Load a certificate from storage for the given domain.
     ///
-    /// Tries all configured issuers and returns the newest valid certificate. Returns
-    /// `Some(Certificate)` if found, `None` if not in storage for any issuer.
+    /// Tries all configured issuers, preferring currently valid certificates.
+    /// Returns the best stored resource even if it needs renewal; this method
+    /// does not publish it to the serving cache. Returns `None` when absent.
     pub async fn load_certificate(&self, domain: &str) -> Result<Option<Certificate>> {
-        match self.load_managed_certificate(domain).await {
+        match self.load_stored_certificate(domain).await {
             Ok(cert) => Ok(Some(cert)),
             Err(Error::Storage(StorageError::NotFound(_))) => Ok(None),
             Err(e) => Err(e),
@@ -929,11 +947,20 @@ impl CertManager {
             )));
         }
 
-        // If storage already has all resources, this is a no-op.
+        // A failed repair must not leave a known-invalid managed leaf hiding
+        // a valid cached sibling. Obtain still checks storage after this scan.
+        self.has_current_managed_certificate(domain).await;
+
+        // Existing valid storage is a no-op; invalid-time credentials need
+        // renewal before they can safely enter the serving cache.
         if self.storage_has_cert_resources_any_issuer(domain).await? {
-            debug!(domain = %domain, "certificate already exists in storage; skipping obtain");
-            self.cache_certificate(domain).await?;
-            return Ok(());
+            return match self.cache_certificate(domain).await {
+                Ok(_) => Ok(()),
+                Err(Error::Cert(CertError::Expired(_) | CertError::NotYetValid(_))) => {
+                    self.renew_cert(domain, false, interactive).await
+                }
+                Err(error) => Err(error),
+            };
         }
 
         info!(domain = %domain, "acquiring lock for certificate obtain");
@@ -972,9 +999,15 @@ impl CertManager {
         // Re-check storage: another instance may have obtained the cert
         // while we were waiting for the lock.
         if self.storage_has_cert_resources_any_issuer(domain).await? {
-            info!(domain = %domain, "certificate already exists in storage (obtained by another instance)");
-            self.cache_certificate(domain).await?;
-            return Ok(());
+            return match self.cache_certificate(domain).await {
+                Ok(_) => Ok(()),
+                Err(Error::Cert(CertError::Expired(_) | CertError::NotYetValid(_))) => {
+                    // The obtain caller owns the domain lock and retry loop.
+                    // Reuse the leaf lock without reacquiring the domain lock.
+                    self.renew_with_domain_lock(domain, false, true).await
+                }
+                Err(error) => Err(error),
+            };
         }
 
         info!(domain = %domain, "obtaining certificate");
@@ -1157,6 +1190,18 @@ impl CertManager {
         let lock_key = Self::lock_key(CERT_ISSUE_LOCK_OP, domain);
         let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
 
+        self.renew_with_domain_lock(domain, force, interactive)
+            .await
+    }
+
+    /// The caller already owns the domain lifecycle lock. Keep the same leaf
+    /// lock and post-lock identity recheck for initial-load repair and renewal.
+    async fn renew_with_domain_lock(
+        &self,
+        domain: &str,
+        force: bool,
+        interactive: bool,
+    ) -> Result<()> {
         loop {
             let resource = self.load_cert_resource_for_operation(domain, force).await?;
             let leaf_hash = crate::storage::resource_leaf_hash(&resource)?;
