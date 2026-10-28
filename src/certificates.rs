@@ -428,7 +428,8 @@ impl Certificate {
 /// # Errors
 ///
 /// Returns an error if the certificate or key cannot be loaded from storage,
-/// or if the PEM data is invalid.
+/// if the PEM data is invalid, or if the certificate is outside its validity
+/// period. Invalid replacements leave the existing cached certificate intact.
 pub async fn reload_managed_certificate(
     cache: &crate::cache::CertCache,
     storage: &dyn crate::storage::Storage,
@@ -447,6 +448,12 @@ pub async fn reload_managed_certificate(
             "{domain}: persisted revocation intent"
         ))
         .into());
+    }
+    if cert.not_before > Utc::now() {
+        return Err(crate::error::CertError::NotYetValid(domain.to_owned()).into());
+    }
+    if cert.expired() {
+        return Err(crate::error::CertError::Expired(domain.to_owned()).into());
     }
     cert.managed = true;
     cert.issuer_key = issuer_key.to_owned();
