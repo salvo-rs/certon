@@ -1845,6 +1845,15 @@ impl CertManager {
     /// Loads the certificate and private key for `domain` from the cache (or
     /// storage) and returns them as a pair suitable for constructing a
     /// [`rustls::ClientConfig`] for mutual TLS (mTLS) authentication.
+    /// Candidates must be time-valid and not locally known to be revoked.
+    /// Each call reads persisted revocation intent even for a warm cache;
+    /// backend errors are propagated. An unusable leaf does not hide a usable
+    /// sibling. Server Must-Staple policy is not applied to client identities,
+    /// and this method does not query an OCSP responder.
+    ///
+    /// Returned credentials are an immutable validated snapshot. A later
+    /// revocation or expiry does not invalidate previously exported keys or
+    /// configurations; construct fresh credentials to check current state.
     ///
     /// # Returns
     ///
@@ -1854,8 +1863,8 @@ impl CertManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if no certificate is found for `domain` in the cache
-    /// or storage, or if the certificate has no private key.
+    /// Returns an error if no usable certificate is found for `domain`, or if
+    /// persisted revocation intent cannot be read.
     pub async fn client_credentials(
         &self,
         domain: &str,
@@ -1863,14 +1872,7 @@ impl CertManager {
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
     )> {
-        // Try cache first.
-        let cert = match self.cache.get_by_name(domain).await {
-            Some(c) => c,
-            None => {
-                let resource = self.load_cert_resource_any_issuer(domain).await?;
-                Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?
-            }
-        };
+        let cert = self.select_client_certificate(domain).await?;
 
         let cert_chain = cert.cert_chain.clone();
 
@@ -1906,6 +1908,117 @@ impl CertManager {
         };
 
         Ok((cert_chain, pk_der))
+    }
+
+    async fn select_client_certificate(&self, domain: &str) -> Result<Arc<Certificate>> {
+        let mut rejected = None;
+        if let Some(cert) = self
+            .select_client_candidate(
+                self.cache.client_certificate_candidates(domain),
+                domain,
+                &mut rejected,
+            )
+            .await?
+        {
+            return Ok(cert);
+        }
+
+        // Storage selection must consider every issuer rather than returning
+        // an unusable first/best leaf and overlooking a healthy fallback.
+        let mut candidates = Vec::new();
+        for issuer in &self.issuers {
+            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
+                match Self::parse_managed_certificate(&resource, domain) {
+                    Ok(cert) => candidates.push(Arc::new(cert)),
+                    Err(error) => {
+                        rejected.get_or_insert(error);
+                    }
+                }
+            }
+        }
+        if let Some(cert) = self
+            .select_client_candidate(candidates, domain, &mut rejected)
+            .await?
+        {
+            return Ok(cert);
+        }
+        Err(rejected.unwrap_or_else(|| {
+            StorageError::NotFound(format!("no client certificate found for '{domain}'")).into()
+        }))
+    }
+
+    async fn select_client_candidate(
+        &self,
+        mut candidates: Vec<Arc<Certificate>>,
+        domain: &str,
+        rejected: &mut Option<Error>,
+    ) -> Result<Option<Arc<Certificate>>> {
+        // Retain the cache's existing preference among usable identities.
+        candidates.sort_by(|a, b| {
+            b.managed
+                .cmp(&a.managed)
+                .then_with(|| b.not_after.cmp(&a.not_after))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        let mut usable = Vec::new();
+        for cert in candidates {
+            if let Err(error) = Self::validate_client_certificate(&cert, domain) {
+                rejected.get_or_insert(error);
+                continue;
+            }
+            let leaf_hash = crate::storage::certificate_leaf_hash(&cert)
+                .expect("validated client certificate has a leaf");
+            if cert.ocsp_status == Some(OcspStatus::Revoked)
+                || self.cache.client_leaf_is_revoked(domain, &leaf_hash)
+            {
+                rejected.get_or_insert_with(|| CertError::Revoked(domain.to_owned()).into());
+                continue;
+            }
+            // Marker I/O failures are not invalid candidate contents: never
+            // swallow one while falling back to a cached or stored sibling.
+            if crate::storage::load_revocation(self.storage.as_ref(), &leaf_hash)
+                .await?
+                .is_some()
+            {
+                self.cache.deny_revoked_certificate(&leaf_hash).await;
+                rejected.get_or_insert_with(|| CertError::Revoked(domain.to_owned()).into());
+                continue;
+            }
+            usable.push((cert, leaf_hash));
+        }
+        for (cert, leaf_hash) in usable {
+            // A different candidate's marker read may have awaited a backend
+            // while this candidate expired or acquired local revocation state.
+            if let Err(error) = Self::validate_client_time(&cert, domain) {
+                rejected.get_or_insert(error);
+                continue;
+            }
+            if self.cache.client_leaf_is_revoked(domain, &leaf_hash) {
+                rejected.get_or_insert_with(|| CertError::Revoked(domain.to_owned()).into());
+                continue;
+            }
+            return Ok(Some(cert));
+        }
+        Ok(None)
+    }
+
+    fn validate_client_time(cert: &Certificate, domain: &str) -> Result<()> {
+        let now = chrono::Utc::now();
+        if cert.not_before > now {
+            return Err(CertError::NotYetValid(domain.to_owned()).into());
+        }
+        if now >= cert.not_after {
+            return Err(CertError::Expired(domain.to_owned()).into());
+        }
+        Ok(())
+    }
+
+    fn validate_client_certificate(cert: &Certificate, domain: &str) -> Result<()> {
+        Self::validate_client_time(cert, domain)?;
+        crate::handshake::cert_to_certified_key(cert)?
+            .keys_match()
+            .map_err(|error| Error::Config(format!("certificate/private key mismatch: {error}")))?;
+        Ok(())
     }
 
     /// Build a [`rustls::ClientConfig`] for mutual TLS (mTLS) using a
@@ -2729,6 +2842,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn client_credentials_reject_a_verified_local_ocsp_revocation() {
+        let (mut cert, issuer_key) = crate::cache::tests::signed_certificate();
+        let domain = cert.names[0].clone();
+        let hash = cert.hash.clone();
+        cert.ocsp_response = Some(crate::ocsp::tests::signed_response(
+            &cert.cert_chain,
+            &issuer_key,
+            1,
+            Utc::now(),
+            Utc::now() + chrono::Duration::hours(1),
+        ));
+        assert!(cert.ocsp_status.is_none());
+        let manager = CertManager::builder()
+            .storage(Arc::new(MemoryStorage::new()))
+            .build();
+        manager.cache.add(cert).await;
+        assert_eq!(
+            manager.cache.get_by_hash(&hash).await.unwrap().ocsp_status,
+            Some(OcspStatus::Revoked)
+        );
+        assert!(matches!(
+            manager.client_credentials(&domain).await,
+            Err(Error::Cert(CertError::Revoked(_)))
+        ));
+        assert!(
+            manager
+                .client_config(&domain, rustls::RootCertStore::empty())
+                .await
+                .is_err()
+        );
+        // The management metadata is retained even when mTLS rejects the leaf.
+        assert!(manager.cache.get_by_hash(&hash).await.is_some());
     }
 
     #[tokio::test]

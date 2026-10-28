@@ -1142,6 +1142,27 @@ impl CertCache {
             .has_ocsp_revoked_leaf(name, leaf_hash)
     }
 
+    /// Client authentication uses the certificate metadata, independently of
+    /// the server's Must-Staple serving policy. Share bytes while callers check
+    /// persisted revocation intent without holding the cache lock.
+    pub(crate) fn client_certificate_candidates(&self, name: &str) -> Vec<Arc<Certificate>> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .matching(name)
+            .into_iter()
+            .map(|entry| Arc::clone(&entry.certificate))
+            .collect()
+    }
+
+    /// Recheck after asynchronous marker reads, including a quarantine that
+    /// already removed its metadata and OCSP evidence on an alternate chain.
+    pub(crate) fn client_leaf_is_revoked(&self, name: &str, leaf_hash: &str) -> bool {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        state.revoked_leaf_hashes.contains(leaf_hash)
+            || state.has_ocsp_revoked_leaf(name, leaf_hash)
+    }
+
     /// Lifecycle shortcuts must not treat an unusable Must-Staple or revoked
     /// entry as already managed successfully. Keep the same serving boundary
     /// without parsing DER or cloning private keys.

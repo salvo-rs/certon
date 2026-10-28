@@ -1,5 +1,15 @@
 # Migrating to CertManager and Policy
 
+`client_credentials` and `client_config` now select a time-valid client identity
+that is not locally known to be revoked, falling back to usable cached or
+stored siblings. Every construction reads persisted revocation intent, including
+with a warm cache; marker backend errors propagate. These methods do not query
+OCSP responders or require a server Must-Staple response for client authentication.
+Client-auth-only certificates remain supported, and `client_config` still uses
+the explicitly supplied roots to authenticate the server. Returned keys and
+configurations are snapshots: later revocation or expiry requires constructing
+fresh credentials; existing connections/configurations are not invalidated.
+
 Short-lived certificates containing the actual TLS Feature `status_request`
 (Must-Staple, feature 5) now receive OCSP staples even below seven days of
 validity. Other short-lived certificates retain the existing skip optimization.
