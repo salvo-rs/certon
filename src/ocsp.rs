@@ -207,6 +207,10 @@ const OCSP_RESPONSE_CONTENT_TYPE: &str = "application/ocsp-response";
 /// long after `thisUpdate`.
 const DEFAULT_OCSP_LIFETIME_HOURS: i64 = 24;
 
+/// Tolerate a small amount of clock skew without accepting future-dated status.
+const OCSP_CLOCK_SKEW_SECONDS: i64 = 300;
+const MAX_ISSUER_CERT_SIZE: usize = 1024 * 1024;
+
 /// SHA-1 algorithm OID for OCSP request hashing: 1.3.14.3.2.26
 const OID_SHA1: &[u8] = &[0x06, 0x05, 0x2B, 0x0E, 0x03, 0x02, 0x1A];
 
@@ -233,6 +237,9 @@ const CERT_STATUS_REVOKED: u8 = 1;
 // Public API: high-level OCSP stapling
 // ---------------------------------------------------------------------------
 
+/// Skip OCSP for certificates with a total lifetime shorter than seven days.
+const SHORT_LIVED_CERT_DAYS: i64 = 7;
+
 /// Attempt to staple an OCSP response to `cert`.
 ///
 /// This is the main entry point for OCSP stapling. The function:
@@ -243,19 +250,30 @@ const CERT_STATUS_REVOKED: u8 = 1;
 /// 3. Caches the response in `storage` for future use.
 /// 4. Staples the response to `cert` (sets [`Certificate::ocsp_response`]).
 ///
-/// Returns `Ok(true)` if a staple was successfully attached, `Ok(false)`
-/// if OCSP stapling is not available for this certificate (e.g. no OCSP
-/// responder URL in the certificate, or the leaf is self-signed with no
-/// issuer).
-/// Certificates with a total lifetime shorter than this are considered
-/// short-lived and OCSP stapling is skipped for them.
-const SHORT_LIVED_CERT_DAYS: i64 = 7;
-
+/// Returns `Ok(true)` only when a current, signed Good response was attached.
+/// `Ok(false)` means no usable staple is available. A verified revocation is
+/// recorded in [`Certificate::ocsp_status`], never inferred from this boolean.
+///
+/// A verified `Revoked` status is retained on this certificate until it is
+/// replaced. Refresh errors, Unknown responses and older Good responses cannot
+/// undo it. Revoked certificates never receive staple bytes.
 pub async fn staple_ocsp(
     storage: &dyn Storage,
     cert: &mut Certificate,
     _config: &OcspConfig,
 ) -> Result<bool> {
+    // A failed refresh must never leave a stale response attached. A verified
+    // revocation is sticky for this certificate: an outage, Unknown response or
+    // replay of an older, still-fresh Good response cannot make it usable again.
+    // Replacing the certificate creates a new Certificate with no OCSP status.
+    cert.ocsp_response = None;
+    if cert.ocsp_status == Some(OcspStatus::Revoked) {
+        return Ok(false);
+    }
+    cert.ocsp_status = None;
+    if _config.disable_stapling {
+        return Ok(false);
+    }
     // Skip OCSP stapling for short-lived certificates (< 7 days total
     // lifetime). These certificates expire before OCSP responses would
     // typically need refreshing, so stapling adds overhead with little
@@ -289,8 +307,10 @@ pub async fn staple_ocsp(
                         "using cached OCSP staple"
                     );
                     cert.ocsp_status = Some(parsed.status);
-                    cert.ocsp_response = Some(cached_bytes);
-                    return Ok(parsed.status != OcspStatus::Revoked);
+                    if parsed.status == OcspStatus::Good {
+                        cert.ocsp_response = Some(cached_bytes);
+                    }
+                    return Ok(parsed.status == OcspStatus::Good);
                 }
                 Ok(parsed) => {
                     debug!(
@@ -354,8 +374,10 @@ pub async fn staple_ocsp(
     );
 
     cert.ocsp_status = Some(parsed.status);
-    cert.ocsp_response = Some(raw_response);
-    Ok(parsed.status != OcspStatus::Revoked)
+    if parsed.status == OcspStatus::Good {
+        cert.ocsp_response = Some(raw_response);
+    }
+    Ok(parsed.status == OcspStatus::Good)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,9 +392,13 @@ pub async fn staple_ocsp(
 ///   `this_update`.
 pub fn is_ocsp_fresh(response: &OcspResponse) -> bool {
     let now = Utc::now();
+    let latest = now + ChronoDuration::seconds(OCSP_CLOCK_SKEW_SECONDS);
+    if response.this_update > latest || response.produced_at > latest {
+        return false;
+    }
 
     if let Some(next_update) = response.next_update {
-        now < next_update
+        response.this_update < next_update && now < next_update
     } else {
         // No nextUpdate; consider fresh for DEFAULT_OCSP_LIFETIME_HOURS.
         let expires = response.this_update + ChronoDuration::hours(DEFAULT_OCSP_LIFETIME_HOURS);
@@ -498,11 +524,7 @@ async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
         .into());
     }
 
-    let body = response.bytes().await.map_err(|e| {
-        CertError::OcspFailed(format!(
-            "failed to read issuer certificate response body: {e}"
-        ))
-    })?;
+    let body = read_limited_response(response, MAX_ISSUER_CERT_SIZE).await?;
 
     if body.is_empty() {
         return Err(
@@ -579,6 +601,8 @@ async fn parse_ocsp_response_for_cert_chain(
         CryptoError::InvalidCertificate(format!("failed to parse issuer certificate: {e}"))
     })?;
 
+    validate_certificate_issuer(&leaf, &issuer)?;
+
     parse_and_validate_ocsp_response_raw(data, &leaf, &issuer)
 }
 
@@ -652,6 +676,8 @@ async fn get_ocsp_for_cert_chain(
     let (_, issuer) = X509Certificate::from_der(issuer_der_ref).map_err(|e| {
         CryptoError::InvalidCertificate(format!("failed to parse issuer certificate: {e}"))
     })?;
+
+    validate_certificate_issuer(&leaf, &issuer)?;
 
     // Check for a responder override matching any SAN on the leaf.
     let override_url = if !responder_overrides.is_empty() {
@@ -853,21 +879,54 @@ async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
         .into());
     }
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| CertError::OcspFailed(format!("failed to read OCSP response body: {e}")))?;
+    read_limited_response(response, MAX_OCSP_RESPONSE_SIZE).await
+}
 
-    if body.len() > MAX_OCSP_RESPONSE_SIZE {
-        return Err(CertError::OcspFailed(format!(
-            "OCSP response too large: {} bytes (max {})",
-            body.len(),
-            MAX_OCSP_RESPONSE_SIZE
-        ))
-        .into());
+async fn read_limited_response(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > limit as u64)
+    {
+        return Err(CertError::OcspFailed(format!("response exceeds {limit} byte limit")).into());
     }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| CertError::OcspFailed(format!("failed to read response body: {e}")))?
+    {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(
+                CertError::OcspFailed(format!("response exceeds {limit} byte limit")).into(),
+            );
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
 
-    Ok(body.to_vec())
+fn validate_certificate_issuer(
+    leaf: &X509Certificate<'_>,
+    issuer: &X509Certificate<'_>,
+) -> Result<()> {
+    if leaf.issuer() != issuer.subject()
+        || !issuer
+            .basic_constraints()
+            .ok()
+            .flatten()
+            .is_some_and(|bc| bc.value.ca)
+        || issuer
+            .key_usage()
+            .ok()
+            .flatten()
+            .is_some_and(|ku| !ku.value.key_cert_sign())
+        || leaf.verify_signature(Some(issuer.public_key())).is_err()
+    {
+        return Err(
+            CertError::OcspFailed("OCSP issuer did not issue the leaf certificate".into()).into(),
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +987,12 @@ fn parse_and_validate_ocsp_response_raw(
     } else {
         return Err(CertError::OcspFailed(
             "OCSP responder did not return a successful BasicOCSPResponse".into(),
+        )
+        .into());
+    }
+    if !is_ocsp_fresh(&parsed.response) {
+        return Err(CertError::OcspFailed(
+            "OCSP response is stale or has invalid update times".into(),
         )
         .into());
     }
@@ -1108,7 +1173,8 @@ fn parse_tbs_response_data(
     if idx >= tbs.len() {
         return Err(CertError::OcspFailed("ResponseData missing producedAt".into()).into());
     }
-    let produced_at = parse_generalized_time_from_obj(&tbs[idx]).unwrap_or_else(Utc::now);
+    let produced_at = parse_generalized_time_from_obj(&tbs[idx])
+        .ok_or_else(|| CertError::OcspFailed("failed to parse producedAt".into()))?;
     idx += 1;
 
     // responses: SEQUENCE OF SingleResponse
@@ -1173,8 +1239,11 @@ fn parse_single_response(
     // seq[3] = nextUpdate (optional, context-tagged [0])
     let next_update = if seq.len() > 3 && is_context_tagged(&seq[3], 0) {
         // Unwrap the context tag to get the GeneralizedTime inside.
-        let content = get_context_content(&seq[3]);
-        content.and_then(parse_generalized_time_from_bytes)
+        Some(
+            get_context_content(&seq[3])
+                .and_then(parse_generalized_time_from_bytes)
+                .ok_or_else(|| CertError::OcspFailed("failed to parse nextUpdate".into()))?,
+        )
     } else {
         None
     };
@@ -1303,6 +1372,7 @@ fn validate_basic_ocsp_response(
     leaf: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
 ) -> Result<()> {
+    validate_certificate_issuer(leaf, issuer)?;
     validate_ocsp_cert_id(&basic.cert_id, leaf, issuer)?;
 
     if responder_matches_cert(&basic.responder_id, issuer)
@@ -1591,65 +1661,35 @@ fn get_context_content<'a>(
 fn parse_generalized_time_from_obj(
     obj: &x509_parser::der_parser::ber::BerObject<'_>,
 ) -> Option<DateTime<Utc>> {
-    // If this object is a GeneralizedTime (tag 24 / 0x18), its content
-    // bytes are the ASCII time string.
-    if let Ok(bytes) = obj.content.as_slice()
-        && let Some(dt) = parse_time_string(bytes)
-    {
-        return Some(dt);
+    use x509_parser::der_parser::ber::BerObjectContent;
+    let BerObjectContent::GeneralizedTime(value) = &obj.content else {
+        return None;
+    };
+    if value.tz != x509_parser::asn1_rs::ASN1TimeZone::Z {
+        return None;
     }
-
-    None
+    let date = chrono::NaiveDate::from_ymd_opt(
+        value.year.try_into().ok()?,
+        value.month.into(),
+        value.day.into(),
+    )?;
+    let time = date.and_hms_milli_opt(
+        value.hour.into(),
+        value.minute.into(),
+        value.second.into(),
+        value.millisecond.unwrap_or(0).into(),
+    )?;
+    Some(DateTime::from_naive_utc_and_offset(time, Utc))
 }
 
 /// Parse a GeneralizedTime from raw DER bytes (the content of an
 /// explicitly tagged wrapper that contains a GeneralizedTime).
 fn parse_generalized_time_from_bytes(bytes: &[u8]) -> Option<DateTime<Utc>> {
     use x509_parser::der_parser::parse_der;
-    if let Ok((_, obj)) = parse_der(bytes) {
+    if let Ok(([], obj)) = parse_der(bytes) {
         return parse_generalized_time_from_obj(&obj);
     }
     None
-}
-
-/// Parse an ASN.1 time string (GeneralizedTime or UTCTime) into a
-/// `DateTime<Utc>`.
-///
-/// Handles formats:
-/// - `YYYYMMDDHHMMSSZ` (GeneralizedTime)
-/// - `YYMMDDHHMMSSZ` (UTCTime)
-fn parse_time_string(bytes: &[u8]) -> Option<DateTime<Utc>> {
-    let s = std::str::from_utf8(bytes).ok()?;
-    let s = s.trim_end_matches('Z');
-
-    if s.len() >= 14 {
-        // GeneralizedTime: YYYYMMDDHHMMSS
-        let year: i32 = s[0..4].parse().ok()?;
-        let month: u32 = s[4..6].parse().ok()?;
-        let day: u32 = s[6..8].parse().ok()?;
-        let hour: u32 = s[8..10].parse().ok()?;
-        let min: u32 = s[10..12].parse().ok()?;
-        let sec: u32 = s[12..14].parse().ok()?;
-
-        use chrono::NaiveDate;
-        let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
-        Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-    } else if s.len() >= 12 {
-        // UTCTime: YYMMDDHHMMSS
-        let year: i32 = s[0..2].parse().ok()?;
-        let year = if year >= 50 { 1900 + year } else { 2000 + year };
-        let month: u32 = s[2..4].parse().ok()?;
-        let day: u32 = s[4..6].parse().ok()?;
-        let hour: u32 = s[6..8].parse().ok()?;
-        let min: u32 = s[8..10].parse().ok()?;
-        let sec: u32 = s[10..12].parse().ok()?;
-
-        use chrono::NaiveDate;
-        let naive = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(hour, min, sec)?;
-        Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,8 +1697,265 @@ fn parse_time_string(bytes: &[u8]) -> Option<DateTime<Utc>> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) fn signed_chain() -> (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rcgen::KeyPair,
+        String,
+    ) {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca = params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(params, &ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["ocsp.example.com".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        (
+            vec![leaf.der().clone(), ca.der().clone()],
+            ca_key,
+            leaf_key.serialize_pem(),
+        )
+    }
+
+    pub(crate) fn signed_response(
+        chain: &[rustls::pki_types::CertificateDer<'static>],
+        key: &rcgen::KeyPair,
+        status: u8,
+        this_update: DateTime<Utc>,
+        next_update: DateTime<Utc>,
+    ) -> Vec<u8> {
+        use rcgen::SigningKey;
+        let (_, leaf) = X509Certificate::from_der(chain[0].as_ref()).unwrap();
+        let (_, issuer) = X509Certificate::from_der(chain[1].as_ref()).unwrap();
+        let time = |value: DateTime<Utc>| {
+            der_wrap(0x18, value.format("%Y%m%d%H%M%SZ").to_string().as_bytes())
+        };
+        let id = der_wrap(
+            0x30,
+            &build_cert_id(
+                &sha1_hash(issuer.subject().as_raw()),
+                &hash_issuer_public_key(&issuer).unwrap(),
+                leaf.raw_serial(),
+            ),
+        );
+        let status = match status {
+            0 => der_wrap(0x80, &[]),
+            1 => der_wrap(0xa1, &time(this_update)),
+            _ => der_wrap(0x82, &[]),
+        };
+        let single = der_wrap(
+            0x30,
+            &[
+                id,
+                status,
+                time(this_update),
+                der_wrap(0xa0, &time(next_update)),
+            ]
+            .concat(),
+        );
+        let tbs = der_wrap(
+            0x30,
+            &[
+                der_wrap(0xa1, issuer.subject().as_raw()),
+                time(Utc::now()),
+                der_wrap(0x30, &single),
+            ]
+            .concat(),
+        );
+        let algorithm = der_wrap(
+            0x30,
+            &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02],
+        );
+        let signature = key.sign(&tbs).unwrap();
+        let signature = der_wrap(0x03, &[vec![0], signature].concat());
+        let basic = der_wrap(0x30, &[tbs, algorithm, signature].concat());
+        let bytes = der_wrap(
+            0x30,
+            &[
+                der_wrap(0x06, OID_OCSP_BASIC_CONTENT),
+                der_wrap(0x04, &basic),
+            ]
+            .concat(),
+        );
+        der_wrap(
+            0x30,
+            &[vec![0x0a, 0x01, 0], der_wrap(0xa0, &bytes)].concat(),
+        )
+    }
+
+    #[test]
+    fn rejects_stale_and_future_signed_responses() {
+        let (chain, key, _) = signed_chain();
+        let (_, leaf) = X509Certificate::from_der(chain[0].as_ref()).unwrap();
+        let (_, issuer) = X509Certificate::from_der(chain[1].as_ref()).unwrap();
+        let now = Utc::now();
+        for (start, end, accepted) in [
+            (
+                now - ChronoDuration::hours(1),
+                now + ChronoDuration::hours(1),
+                true,
+            ),
+            (
+                now - ChronoDuration::hours(2),
+                now - ChronoDuration::hours(1),
+                false,
+            ),
+            (
+                now + ChronoDuration::hours(1),
+                now + ChronoDuration::hours(2),
+                false,
+            ),
+            (now, now - ChronoDuration::seconds(1), false),
+        ] {
+            let raw = signed_response(&chain, &key, 0, start, end);
+            let result = parse_and_validate_ocsp_response_raw(&raw, &leaf, &issuer);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_self_consistent_response_from_wrong_issuer() {
+        let (chain, ..) = signed_chain();
+        let (attacker_chain, attacker_key, _) = signed_chain();
+        let forged = vec![chain[0].clone(), attacker_chain[1].clone()];
+        let raw = signed_response(
+            &forged,
+            &attacker_key,
+            0,
+            Utc::now() - ChronoDuration::hours(1),
+            Utc::now() + ChronoDuration::hours(1),
+        );
+        let (_, leaf) = X509Certificate::from_der(forged[0].as_ref()).unwrap();
+        let (_, attacker) = X509Certificate::from_der(forged[1].as_ref()).unwrap();
+        assert!(
+            parse_and_validate_ocsp_response_raw(&raw, &leaf, &attacker)
+                .unwrap_err()
+                .to_string()
+                .contains("did not issue")
+        );
+    }
+
+    #[tokio::test]
+    async fn staples_only_good_and_preserves_verified_revocation_status() {
+        let (chain, key, leaf_key_pem) = signed_chain();
+        let leaf_pem = ::pem::encode(&::pem::Pem::new("CERTIFICATE", chain[0].as_ref()));
+        let mut cert = Certificate::from_pem(leaf_pem.as_bytes(), leaf_key_pem.as_bytes()).unwrap();
+        cert.cert_chain = chain.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let cache_key = storage::ocsp_key(&cert.names[0], &cert.hash);
+        for (wire_status, expected) in [
+            (0, OcspStatus::Good),
+            (1, OcspStatus::Revoked),
+            (2, OcspStatus::Unknown),
+        ] {
+            // Each status is independently observed on a newly loaded certificate.
+            cert.ocsp_status = None;
+            let raw = signed_response(
+                &chain,
+                &key,
+                wire_status,
+                Utc::now() - ChronoDuration::hours(1),
+                Utc::now() + ChronoDuration::hours(1),
+            );
+            storage.store(&cache_key, &raw).await.unwrap();
+            assert_eq!(
+                staple_ocsp(&storage, &mut cert, &OcspConfig::default())
+                    .await
+                    .unwrap(),
+                expected == OcspStatus::Good
+            );
+            assert_eq!(cert.ocsp_status, Some(expected));
+            assert_eq!(cert.ocsp_response.is_some(), expected == OcspStatus::Good);
+        }
+        storage.delete(&cache_key).await.unwrap();
+        cert.ocsp_response = Some(vec![1, 2, 3]);
+        cert.ocsp_status = Some(OcspStatus::Good);
+        assert!(
+            !staple_ocsp(&storage, &mut cert, &OcspConfig::default())
+                .await
+                .unwrap()
+        );
+        assert!(cert.ocsp_response.is_none());
+        assert!(cert.ocsp_status.is_none());
+    }
+
+    async fn response_server(body: Vec<u8>, chunked: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let message = if chunked {
+                [
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                        .to_vec(),
+                    format!("{:x}\r\n", body.len()).into_bytes(),
+                    body,
+                    b"\r\n0\r\n\r\n".to_vec(),
+                ]
+                .concat()
+            } else {
+                [
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes(),
+                    body,
+                ]
+                .concat()
+            };
+            let _ = socket.write_all(&message).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_chunked_and_content_length_bodies() {
+        for chunked in [true, false] {
+            let url = response_server(vec![0; 256], chunked).await;
+            let response = crate::http::client()
+                .unwrap()
+                .get(url)
+                .send()
+                .await
+                .unwrap();
+            assert!(read_limited_response(response, 128).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_response_downloaded_from_responder() {
+        let (chain, key, _) = signed_chain();
+        let raw = signed_response(
+            &chain,
+            &key,
+            0,
+            Utc::now() - ChronoDuration::hours(2),
+            Utc::now() - ChronoDuration::hours(1),
+        );
+        let url = response_server(raw, false).await;
+        let overrides = HashMap::from([("ocsp.example.com".to_string(), url)]);
+        assert!(
+            get_ocsp_for_cert_chain(&chain, &overrides)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+    }
 
     #[test]
     fn test_ocsp_config_default() {

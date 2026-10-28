@@ -228,6 +228,23 @@ struct CachedCertificate {
     key: Option<Arc<CertifiedKey>>,
 }
 
+/// Renewal policy at the OCSP update's cache linearization point.
+pub(crate) struct OcspUpdateState {
+    pub managed: bool,
+    pub first_name: String,
+    pub ocsp_status: Option<crate::ocsp::OcspStatus>,
+}
+
+impl From<&Certificate> for OcspUpdateState {
+    fn from(cert: &Certificate) -> Self {
+        Self {
+            managed: cert.managed,
+            first_name: cert.names.first().cloned().unwrap_or_default(),
+            ocsp_status: cert.ocsp_status,
+        }
+    }
+}
+
 /// A serving lookup contains no raw private-key copy.
 pub(crate) struct CachedKey {
     pub key: Arc<CertifiedKey>,
@@ -518,6 +535,51 @@ impl CertCache {
             state.add(new_cert, key, &options, &mut events);
         }
         dispatch_events(&options, events);
+    }
+
+    /// Publish only OCSP fields, preserving the current certificate metadata.
+    /// Membership and revocation checks share the same write lock as the update:
+    /// stale refreshes cannot resurrect removed certificates or undo revocation.
+    /// A new certificate hash is installed through the ordinary `replace` API.
+    /// Returns the current policy/status at that same linearization point,
+    /// including when an older response cannot replace sticky revocation.
+    /// Later metadata changes are not serialized with the renewal callback.
+    pub(crate) async fn update_ocsp_if_present(
+        &self,
+        hash: &str,
+        status: Option<crate::ocsp::OcspStatus>,
+        response: Option<Vec<u8>>,
+    ) -> Option<OcspUpdateState> {
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (event, published) = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let current = state.certificates.get_mut(hash)?;
+            if current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                && status != Some(crate::ocsp::OcspStatus::Revoked)
+            {
+                return Some(OcspUpdateState::from(&current.certificate));
+            }
+            current.certificate.ocsp_status = status;
+            current.certificate.ocsp_response = response.clone();
+            if let Some(key) = &mut current.key {
+                // Clone just the rustls container when an in-flight handshake
+                // shares it; retain the prepared signing key without crypto work.
+                Arc::make_mut(key).ocsp = response;
+            }
+            (
+                CacheEvent::Updated {
+                    names: current.certificate.names.clone(),
+                    hash: hash.to_owned(),
+                },
+                OcspUpdateState::from(&current.certificate),
+            )
+        };
+        dispatch_events(&options, vec![event]);
+        Some(published)
     }
 
     /// Get the best exact or single leftmost-label wildcard match.

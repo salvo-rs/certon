@@ -502,57 +502,47 @@ async fn update_ocsp_staples(
         );
 
         let mut updated_cert = cert.clone();
-        match ocsp::staple_ocsp(storage, &mut updated_cert, config).await {
-            Ok(not_revoked) => {
-                if not_revoked {
-                    debug!(
-                        name = %first_name,
-                        "maintenance: OCSP staple refreshed successfully",
-                    );
-                    // Replace the certificate in the cache with the updated one
-                    // that has the fresh OCSP staple.
-                    cache.replace(&old_hash, updated_cert).await;
-                } else {
-                    // A missing staple also returns false. Only an explicit
-                    // Revoked status authorizes forced replacement.
-                    if updated_cert.ocsp_status == Some(ocsp::OcspStatus::Revoked)
-                        && config.replace_revoked
-                        && cert.managed
-                    {
-                        warn!(
-                            name = %first_name,
-                            hash = %old_hash,
-                            "maintenance: OCSP status is Revoked; triggering force-renewal",
-                        );
-                        match renew_func(first_name.clone(), RenewalReason::Revoked).await {
-                            Ok(()) => {
-                                info!(
-                                    name = %first_name,
-                                    "maintenance: revoked certificate force-renewed successfully",
-                                );
-                            }
-                            Err(e) => {
-                                error!(
-                                    name = %first_name,
-                                    error = %e,
-                                    "maintenance: revoked certificate force-renewal failed",
-                                );
-                            }
-                        }
-                    } else {
-                        debug!(
-                            name = %first_name,
-                            "maintenance: OCSP stapling not available for this certificate",
-                        );
-                    }
-                }
+        let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
+        // Publish removal of an unusable staple as well as successful refreshes.
+        // Otherwise a failed refresh keeps serving the expired response forever.
+        let Some(current) = cache
+            .update_ocsp_if_present(
+                &old_hash,
+                updated_cert.ocsp_status,
+                updated_cert.ocsp_response.clone(),
+            )
+            .await
+        else {
+            // Renewal or removal won while this response was in flight.
+            continue;
+        };
+        let first_name = current.first_name;
+        match outcome {
+            Ok(true) if current.ocsp_status == Some(ocsp::OcspStatus::Good) => {
+                debug!(name = %first_name, "maintenance: OCSP staple refreshed successfully");
+            }
+            Ok(_) => {
+                debug!(name = %first_name, "maintenance: no usable OCSP staple is available");
             }
             Err(e) => {
-                warn!(
-                    name = %first_name,
-                    error = %e,
-                    "maintenance: failed to refresh OCSP staple",
-                );
+                warn!(name = %first_name, error = %e, "maintenance: failed to refresh OCSP staple");
+            }
+        }
+        // Use policy and sticky status captured in the cache update, not the
+        // scan's earlier snapshot. This does not serialize later policy changes
+        // with the asynchronous renewal callback.
+        if current.ocsp_status == Some(ocsp::OcspStatus::Revoked)
+            && config.replace_revoked
+            && current.managed
+        {
+            warn!(name = %first_name, hash = %old_hash, "maintenance: OCSP status is Revoked; triggering force-renewal");
+            match renew_func(first_name.clone(), RenewalReason::Revoked).await {
+                Ok(()) => {
+                    info!(name = %first_name, "maintenance: revoked certificate force-renewed successfully");
+                }
+                Err(e) => {
+                    error!(name = %first_name, error = %e, "maintenance: revoked certificate force-renewal failed");
+                }
             }
         }
     }
@@ -873,13 +863,371 @@ fn normalize_interval(interval: Duration, default: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use chrono::{Duration as ChronoDuration, Utc};
 
     use super::*;
     use crate::cache::CacheOptions;
     use crate::certificates::{Certificate, PrivateKeyKind};
+
+    /// Pause the actual OCSP cache read while another lifecycle operation runs.
+    struct GatedOcspStorage {
+        files: crate::FileStorage,
+        block_next_load: AtomicBool,
+        offline: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedOcspStorage {
+        fn new(path: &std::path::Path) -> Self {
+            Self {
+                files: crate::FileStorage::new(path),
+                block_next_load: AtomicBool::new(false),
+                offline: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for GatedOcspStorage {
+        async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            if self.block_next_load.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            if self.offline.load(Ordering::SeqCst) {
+                return Err(crate::Error::Other("OCSP storage is offline".into()));
+            }
+            self.files.load(key).await
+        }
+        async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.files.store(key, value).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.files.delete(key).await
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            self.files.exists(key).await
+        }
+        async fn list(&self, path: &str, recursive: bool) -> Result<Vec<String>> {
+            self.files.list(path, recursive).await
+        }
+        async fn stat(&self, key: &str) -> Result<crate::storage::KeyInfo> {
+            self.files.stat(key).await
+        }
+        async fn lock(&self, name: &str) -> Result<()> {
+            self.files.lock(name).await
+        }
+        async fn unlock(&self, name: &str) -> Result<()> {
+            self.files.unlock(name).await
+        }
+    }
+
+    fn signed_certificate() -> (Certificate, rcgen::KeyPair) {
+        let (chain, issuer_key, leaf_key) = crate::ocsp::tests::signed_chain();
+        let pem: String = chain
+            .iter()
+            .map(|der| ::pem::encode(&::pem::Pem::new("CERTIFICATE", der.as_ref())))
+            .collect();
+        let mut cert = Certificate::from_pem(pem.as_bytes(), leaf_key.as_bytes()).unwrap();
+        cert.managed = true;
+        (cert, issuer_key)
+    }
+
+    fn signed_status(cert: &Certificate, issuer: &rcgen::KeyPair, status: u8) -> Vec<u8> {
+        crate::ocsp::tests::signed_response(
+            &cert.cert_chain,
+            issuer,
+            status,
+            Utc::now() - ChronoDuration::hours(1),
+            Utc::now() + ChronoDuration::hours(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn ocsp_refresh_does_not_resurrect_removed_or_renewed_serving_keys() {
+        for successful_refresh in [false, true] {
+            // Also keep a control case to prove both genuine refresh outcomes
+            // update the prebuilt TLS key when no lifecycle operation intervenes.
+            for mutation in ["keep", "remove", "renew", "revoke", "retag"] {
+                let cache = CertCache::new(CacheOptions::default());
+                let (mut cert, issuer) = signed_certificate();
+                cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+                cert.ocsp_response = Some(vec![0, 1, 2]);
+                let hash = cert.hash.clone();
+                let domain = cert.names[0].clone();
+                let fresh_response = signed_status(&cert, &issuer, 0);
+                let directory = tempfile::tempdir().unwrap();
+                let storage = Arc::new(GatedOcspStorage::new(directory.path()));
+                if successful_refresh {
+                    storage
+                        .store(&crate::storage::ocsp_key(&domain, &hash), &fresh_response)
+                        .await
+                        .unwrap();
+                }
+                cache.add(cert).await;
+                assert_eq!(
+                    cache.resolve(&domain).unwrap().key.ocsp,
+                    Some(vec![0, 1, 2])
+                );
+                storage.block_next_load.store(true, Ordering::SeqCst);
+                let worker_cache = Arc::clone(&cache);
+                let worker_storage = Arc::clone(&storage);
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let called = Arc::clone(&attempts);
+                let worker = tokio::spawn(async move {
+                    let renew: Arc<ReasonedRenewFn> = Arc::new(move |_, reason| {
+                        assert!(matches!(reason, RenewalReason::Revoked));
+                        called.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(()) })
+                    });
+                    update_ocsp_staples(
+                        &worker_cache,
+                        worker_storage.as_ref(),
+                        &OcspConfig::default(),
+                        renew.as_ref(),
+                    )
+                    .await;
+                });
+                tokio::time::timeout(Duration::from_secs(2), storage.entered.notified())
+                    .await
+                    .unwrap();
+                let replacement = match mutation {
+                    "remove" => {
+                        cache.remove(&hash).await;
+                        None
+                    }
+                    "renew" => {
+                        let (replacement, _) = signed_certificate();
+                        cache.replace(&hash, replacement.clone()).await;
+                        Some(replacement)
+                    }
+                    "retag" => {
+                        let mut current = cache.get_by_hash(&hash).await.unwrap();
+                        current.tags = vec!["updated-tag".into()];
+                        current.managed = false;
+                        current.issuer_key = "updated-issuer".into();
+                        cache.replace(&hash, current).await;
+                        None
+                    }
+                    "revoke" => {
+                        let mut revoked = cache.get_by_hash(&hash).await.unwrap();
+                        let newer = crate::FileStorage::new(directory.path().join("newer"));
+                        newer
+                            .store(
+                                &crate::storage::ocsp_key(&domain, &hash),
+                                &signed_status(&revoked, &issuer, 1),
+                            )
+                            .await
+                            .unwrap();
+                        assert!(
+                            !ocsp::staple_ocsp(&newer, &mut revoked, &OcspConfig::default())
+                                .await
+                                .unwrap()
+                        );
+                        assert_eq!(revoked.ocsp_status, Some(ocsp::OcspStatus::Revoked));
+                        cache.replace(&hash, revoked).await;
+                        None
+                    }
+                    _ => None,
+                };
+                storage.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(2), worker)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    attempts.load(Ordering::SeqCst),
+                    usize::from(mutation == "revoke")
+                );
+                match mutation {
+                    "remove" => {
+                        assert!(cache.get_by_hash(&hash).await.is_none());
+                        assert!(cache.resolve(&domain).is_none());
+                    }
+                    "renew" => {
+                        let replacement = replacement.unwrap();
+                        assert!(cache.get_by_hash(&hash).await.is_none());
+                        let serving = cache.resolve(&domain).unwrap();
+                        assert_eq!(serving.hash, replacement.hash);
+                        assert_eq!(serving.key.cert, replacement.cert_chain);
+                        assert_eq!(cache.count().await, 1);
+                    }
+                    "revoke" => {
+                        let actual = cache.get_by_hash(&hash).await.unwrap();
+                        assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
+                        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+                    }
+                    "retag" => {
+                        let actual = cache.get_by_hash(&hash).await.unwrap();
+                        assert_eq!(actual.tags, vec!["updated-tag"]);
+                        assert!(!actual.managed);
+                        assert_eq!(actual.issuer_key, "updated-issuer");
+                        assert_eq!(
+                            cache.resolve(&domain).unwrap().key.ocsp,
+                            successful_refresh.then_some(fresh_response)
+                        );
+                    }
+                    _ => {
+                        let serving = cache.resolve(&domain).unwrap();
+                        assert_eq!(serving.hash, hash);
+                        assert_eq!(
+                            serving.key.ocsp,
+                            successful_refresh.then_some(fresh_response)
+                        );
+                        let actual = cache.get_by_hash(&hash).await.unwrap();
+                        assert_eq!(
+                            actual.ocsp_status,
+                            successful_refresh.then_some(ocsp::OcspStatus::Good)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_flight_revocation_respects_current_unmanaged_policy() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut cert, issuer) = signed_certificate();
+        let hash = cert.hash.clone();
+        let domain = cert.names[0].clone();
+        cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(vec![0, 1, 2]);
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(GatedOcspStorage::new(directory.path()));
+        storage
+            .store(
+                &crate::storage::ocsp_key(&domain, &hash),
+                &signed_status(&cert, &issuer, 1),
+            )
+            .await
+            .unwrap();
+        cache.add(cert).await;
+        storage.block_next_load.store(true, Ordering::SeqCst);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&attempts);
+        let worker_cache = Arc::clone(&cache);
+        let worker_storage = Arc::clone(&storage);
+        let worker = tokio::spawn(async move {
+            let renew: Arc<ReasonedRenewFn> = Arc::new(move |_, _| {
+                called.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            });
+            update_ocsp_staples(
+                &worker_cache,
+                worker_storage.as_ref(),
+                &OcspConfig::default(),
+                renew.as_ref(),
+            )
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), storage.entered.notified())
+            .await
+            .unwrap();
+        let mut current = cache.get_by_hash(&hash).await.unwrap();
+        current.managed = false;
+        current.tags = vec!["manual".into()];
+        current.issuer_key = "manual-issuer".into();
+        cache.replace(&hash, current).await;
+        storage.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            0,
+            "an OCSP refresh must not restart management disabled while it was waiting"
+        );
+        let current = cache.get_by_hash(&hash).await.unwrap();
+        assert!(!current.managed);
+        assert_eq!(current.tags, vec!["manual"]);
+        assert_eq!(current.issuer_key, "manual-issuer");
+        assert_eq!(current.ocsp_status, Some(ocsp::OcspStatus::Revoked));
+        assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+    }
+
+    #[tokio::test]
+    async fn verified_revocation_remains_sticky_and_retries_failed_replacement() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut cert, issuer) = signed_certificate();
+        let hash = cert.hash.clone();
+        let domain = cert.names[0].clone();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = GatedOcspStorage::new(directory.path());
+        let key = crate::storage::ocsp_key(&domain, &hash);
+        storage
+            .store(&key, &signed_status(&cert, &issuer, 1))
+            .await
+            .unwrap();
+        // Start with a serving key that has an old staple, then discover a
+        // correctly signed revocation through the production refresh path.
+        cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(vec![0, 1, 2]);
+        cache.add(cert.clone()).await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let called = Arc::clone(&attempts);
+        let renew: Arc<ReasonedRenewFn> = Arc::new(move |_, reason| {
+            assert!(matches!(reason, RenewalReason::Revoked));
+            called.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(crate::Error::Other("CA is unavailable".into())) })
+        });
+        for step in 0..4 {
+            if step == 1 {
+                storage.offline.store(true, Ordering::SeqCst);
+            } else if step >= 2 {
+                storage.offline.store(false, Ordering::SeqCst);
+                // Neither Unknown nor a still-fresh older Good response may
+                // undo a revocation already verified for this certificate.
+                let status = if step == 2 { 2 } else { 0 };
+                storage
+                    .store(&key, &signed_status(&cert, &issuer, status))
+                    .await
+                    .unwrap();
+            }
+            update_ocsp_staples(&cache, &storage, &OcspConfig::default(), renew.as_ref()).await;
+            let actual = cache.get_by_hash(&hash).await.unwrap();
+            assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
+            assert!(actual.ocsp_response.is_none());
+            assert!(cache.resolve(&domain).unwrap().key.ocsp.is_none());
+            assert_eq!(attempts.load(Ordering::SeqCst), step + 1);
+        }
+        let (replacement, _) = signed_certificate();
+        cache.replace(&hash, replacement.clone()).await;
+        assert_eq!(
+            cache
+                .get_by_hash(&replacement.hash)
+                .await
+                .unwrap()
+                .ocsp_status,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_ocsp_clears_cached_staple_without_requesting_renewal() {
+        let cache = CertCache::new(CacheOptions::default());
+        let mut cert = make_managed_cert(&["unavailable.example.com"], "stale-staple", 60);
+        cert.ocsp_status = Some(ocsp::OcspStatus::Good);
+        cert.ocsp_response = Some(vec![0, 1, 2]);
+        cache.add(cert).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let renew: Arc<ReasonedRenewFn> = Arc::new(|_, _| {
+            Box::pin(async {
+                panic!("an unavailable OCSP responder must not be interpreted as revocation")
+            })
+        });
+        update_ocsp_staples(&cache, &storage, &OcspConfig::default(), renew.as_ref()).await;
+        let cached = cache.get_by_name("unavailable.example.com").await.unwrap();
+        assert!(cached.ocsp_response.is_none());
+        assert!(cached.ocsp_status.is_none());
+    }
 
     /// Helper: build a minimal managed test certificate.
     fn make_managed_cert(names: &[&str], hash: &str, days_remaining: i64) -> Certificate {
