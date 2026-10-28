@@ -1,7 +1,10 @@
+#[path = "common/challenge_tls.rs"]
+mod challenge_tls;
 use std::sync::Arc;
 use std::time::Duration;
 
 use certon::solvers::{Http01Solver, Solver, TlsAlpn01Solver};
+use challenge_tls::peer_certificate as tls_peer_certificate;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -75,63 +78,10 @@ async fn dropping_each_solver_cancels_its_idle_workers() {
     }
 }
 
-#[derive(Debug)]
-struct ChallengeVerifier;
-impl rustls::client::danger::ServerCertVerifier for ChallengeVerifier {
-    // Availability-only test: ACME leaves have a specialized critical
-    // extension. This verifier does not assert certificate/signature safety.
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::CryptoProvider::get_default()
-            .unwrap()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
 async fn normal_request(port: u16, kind: &str) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     if kind == "tls" {
-        let mut config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ChallengeVerifier))
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"acme-tls/1".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tls = connector
-            .connect("second-bounds.example".try_into().unwrap(), stream)
-            .await
-            .unwrap();
-        assert_eq!(
-            tls.get_ref().1.alpn_protocol(),
-            Some(b"acme-tls/1".as_slice())
-        );
-        assert!(!tls.get_ref().1.peer_certificates().unwrap().is_empty());
+        let _ = tls_peer_certificate(stream, "second-bounds.example").await;
     } else {
         stream.write_all(b"GET /.well-known/acme-challenge/second HTTP/1.1\r\nHost: second-bounds.example\r\n\r\n").await.unwrap();
         let mut reply = String::new();
@@ -255,4 +205,48 @@ fn invalid_connection_limits_are_rejected() {
         assert!(Http01Solver::with_limits(0, max, timeout).is_err());
         assert!(TlsAlpn01Solver::with_limits(0, max, timeout).is_err());
     }
+}
+
+#[tokio::test]
+async fn stale_tls_cleanup_preserves_the_current_certificate_on_real_handshakes() {
+    certon::install_default_crypto_provider();
+    let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = reserved.local_addr().unwrap().port();
+    drop(reserved);
+    let solver = TlsAlpn01Solver::new(port);
+    let domain = "network-owner.example";
+    solver.present(domain, "old", "old.thumb").await.unwrap();
+    let old = tls_peer_certificate(
+        TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+        domain,
+    )
+    .await;
+    solver.present(domain, "new", "new.thumb").await.unwrap();
+    let new = tls_peer_certificate(
+        TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+        domain,
+    )
+    .await;
+    assert_ne!(old, new);
+    for (token, auth) in [
+        ("old", "old.thumb"),
+        ("old", "new.thumb"),
+        ("new", "old.thumb"),
+    ] {
+        solver.cleanup(domain, token, auth).await.unwrap();
+        let current = tokio::time::timeout(Duration::from_secs(5), async {
+            tls_peer_certificate(
+                TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
+                domain,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            current, new,
+            "stale token={token} auth={auth} changed the serving certificate"
+        );
+    }
+    solver.cleanup(domain, "new", "new.thumb").await.unwrap();
 }
