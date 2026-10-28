@@ -43,7 +43,7 @@ use tracing::{debug, error, warn};
 #[cfg(feature = "dns-01")]
 use crate::dns_util::{
     DEFAULT_PROPAGATION_INTERVAL, DEFAULT_PROPAGATION_TIMEOUT, challenge_record_name,
-    challenge_record_value, check_dns_propagation, find_zone_by_fqdn, from_fqdn,
+    challenge_record_value, check_dns_propagation_with_resolvers, find_zone_by_fqdn, from_fqdn,
 };
 use crate::error::{Error, Result};
 use crate::storage::{Storage, safe_key};
@@ -866,11 +866,12 @@ impl Solver for Dns01Solver {
             "waiting for DNS propagation of challenge TXT record"
         );
 
-        check_dns_propagation(
+        check_dns_propagation_with_resolvers(
             &fqdn,
             &txt_value,
             self.propagation_timeout,
             self.propagation_check_interval,
+            self.resolvers.as_deref(),
         )
         .await?;
 

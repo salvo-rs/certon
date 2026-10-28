@@ -347,12 +347,32 @@ pub struct AccountResponse {
 /// ACME account registration. The binding ties the ACME account to an
 /// existing account on the CA's system using a key identifier and an
 /// HMAC key provided out-of-band by the CA.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ExternalAccountBinding {
     /// The key ID provided by the CA.
     pub kid: String,
     /// The HMAC key (raw bytes) provided by the CA.
     pub hmac_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for ExternalAccountBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalAccountBinding")
+            .field("kid", &self.kid)
+            .field("hmac_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Optional parameters sent to the CA when creating an order.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OrderOptions {
+    #[serde(rename = "notBefore", skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+    #[serde(rename = "notAfter", skip_serializing_if = "Option::is_none")]
+    pub not_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +605,11 @@ impl AcmeClient {
     /// The CA URL must use HTTPS. HTTP is only allowed for localhost,
     /// `127.0.0.1`, `[::1]`, and `.internal` hosts (for testing/development).
     pub async fn new(directory_url: &str) -> Result<Self> {
+        Self::with_http_client(directory_url, crate::http::client()?.clone()).await
+    }
+
+    /// Create a client using a caller-configured transport, including custom CA roots.
+    pub async fn with_http_client(directory_url: &str, http: reqwest::Client) -> Result<Self> {
         // Validate that the directory URL uses HTTPS, unless it is a local
         // or internal address.
         if let Ok(parsed) = url::Url::parse(directory_url)
@@ -607,8 +632,6 @@ impl AcmeClient {
         }
 
         debug!(directory_url, "fetching ACME directory");
-
-        let http = crate::http::client()?.clone();
 
         // Fetch directory.
         let resp = http
@@ -963,11 +986,25 @@ impl AcmeClient {
         account_url: &str,
         domains: &[String],
     ) -> Result<(AcmeOrder, String)> {
+        self.new_order_with_options(account_key, account_url, domains, &OrderOptions::default())
+            .await
+    }
+
+    /// Create an order including a profile and requested validity bounds.
+    pub async fn new_order_with_options(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        domains: &[String],
+        options: &OrderOptions,
+    ) -> Result<(AcmeOrder, String)> {
         debug!(?domains, "creating new ACME order");
 
         #[derive(Serialize)]
         struct NewOrderRequest {
             identifiers: Vec<AcmeIdentifier>,
+            #[serde(flatten)]
+            options: OrderOptions,
         }
 
         let identifiers: Vec<AcmeIdentifier> = domains
@@ -978,7 +1015,10 @@ impl AcmeClient {
             })
             .collect();
 
-        let req = NewOrderRequest { identifiers };
+        let req = NewOrderRequest {
+            identifiers,
+            options: options.clone(),
+        };
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Order(format!("failed to serialize order request: {e}")))?;
 
@@ -1309,13 +1349,13 @@ impl AcmeClient {
     /// as a base64url-encoded string: `base64url(AKI).base64url(serial)`.
     /// See [`ari_cert_id`] for computing this value.
     ///
-    /// Performs a POST-as-GET to `{directory.renewalInfo}/{cert_id}`. If the
+    /// Performs an unauthenticated GET to `{directory.renewalInfo}/{cert_id}`. If the
     /// directory does not advertise a `renewalInfo` endpoint, returns a
     /// default (empty) [`RenewalInfo`].
     pub async fn get_renewal_info(
         &self,
-        account_key: &PrivateKey,
-        account_url: &str,
+        _account_key: &PrivateKey,
+        _account_url: &str,
         cert_id: &str,
     ) -> Result<RenewalInfo> {
         let renewal_info_base = match &self.directory.renewal_info {
@@ -1330,8 +1370,11 @@ impl AcmeClient {
         debug!(url = %url, "fetching ACME Renewal Information (ARI)");
 
         let resp = self
-            .acme_post(account_key, Some(account_url), &url, None)
-            .await?;
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| AcmeError::Certificate(format!("ARI request failed: {e}")))?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1345,13 +1388,34 @@ impl AcmeClient {
             return Ok(RenewalInfo::default());
         }
 
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|value| {
+                value.parse::<u64>().ok().or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|date| {
+                            (date.with_timezone(&Utc) - Utc::now()).num_seconds().max(0) as u64
+                        })
+                })
+            });
         let body = resp.bytes().await.map_err(|e| {
             AcmeError::Certificate(format!("failed to read ARI response body: {e}"))
         })?;
 
-        let info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
+        let mut info: RenewalInfo = serde_json::from_slice(&body).map_err(|e| {
             AcmeError::Certificate(format!("failed to parse ARI response JSON: {e}"))
         })?;
+        info.retry_after = retry_after;
+        if let Some(window) = &info.suggested_window {
+            let start = DateTime::parse_from_rfc3339(&window.start).ok();
+            let end = DateTime::parse_from_rfc3339(&window.end).ok();
+            if !matches!((start, end), (Some(start), Some(end)) if start < end) {
+                return Err(AcmeError::Certificate("ARI renewal window is invalid".into()).into());
+            }
+        }
 
         debug!(?info, "ACME Renewal Information fetched");
 
@@ -1373,9 +1437,8 @@ impl AcmeClient {
 /// ```
 ///
 /// where AKI is the Authority Key Identifier extension's `keyIdentifier`
-/// value and serial is the certificate's serial number (DER integer bytes,
-/// with leading zero-padding stripped per the spec — the raw big-endian
-/// unsigned representation).
+/// value and serial is the certificate's DER INTEGER content, including any
+/// leading zero byte required to keep the integer positive.
 ///
 /// # Errors
 ///
@@ -1407,28 +1470,13 @@ pub fn ari_cert_id(cert_der: &[u8]) -> Result<String> {
         )
     })?;
 
-    // Extract serial number bytes. `x509_parser` gives us the serial as a
-    // BigUint; we want the raw unsigned big-endian bytes.
+    // RFC 9773 encodes the DER INTEGER content, including its sign padding.
     let serial_bytes = cert.raw_serial();
-
-    // Strip leading zero byte(s) that serve as sign padding in the DER
-    // INTEGER encoding. RFC 9773 requires the unsigned representation.
-    let serial_bytes = strip_leading_zeros(serial_bytes);
 
     let aki_b64 = URL_SAFE_NO_PAD.encode(&aki_bytes);
     let serial_b64 = URL_SAFE_NO_PAD.encode(serial_bytes);
 
     Ok(format!("{aki_b64}.{serial_b64}"))
-}
-
-/// Strip leading zero bytes from a byte slice (used for DER INTEGER
-/// sign-padding removal).
-fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
-    let mut b = bytes;
-    while b.len() > 1 && b[0] == 0 {
-        b = &b[1..];
-    }
-    b
 }
 
 // ---------------------------------------------------------------------------

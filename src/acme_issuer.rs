@@ -50,6 +50,39 @@ use crate::storage::{Storage, acquire, issuer_key};
 /// Callback invoked on newly created accounts before CA registration.
 type NewAccountFunc = Arc<dyn Fn(&mut AcmeAccount) + Send + Sync>;
 
+/// Challenge cleanup must also run when the obtain timeout cancels this future.
+struct PresentedChallenge {
+    solver: Arc<dyn Solver>,
+    domain: String,
+    token: String,
+    key_auth: String,
+    armed: bool,
+}
+
+impl PresentedChallenge {
+    async fn cleanup(mut self) -> Result<()> {
+        let result = self.solver.cleanup(&self.domain, &self.token, &self.key_auth).await;
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for PresentedChallenge {
+    fn drop(&mut self) {
+        if self.armed && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let solver = Arc::clone(&self.solver);
+            let domain = self.domain.clone();
+            let token = self.token.clone();
+            let key_auth = self.key_auth.clone();
+            runtime.spawn(async move {
+                if let Err(error) = solver.cleanup(&domain, &token, &key_auth).await {
+                    warn!(%domain, %error, "failed to clean up cancelled challenge");
+                }
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Well-known CA constants (re-exported for convenience)
 // ---------------------------------------------------------------------------
@@ -332,9 +365,9 @@ pub struct AcmeIssuer {
     pub storage: Arc<dyn Storage>,
 
     /// Lazily-initialised ACME client (for the production CA).
-    client: Mutex<Option<AcmeClient>>,
+    client: Mutex<Option<Arc<AcmeClient>>>,
     /// Lazily-initialised ACME client (for the test CA, if different).
-    test_client: Mutex<Option<AcmeClient>>,
+    test_client: Mutex<Option<Arc<AcmeClient>>>,
     /// Lazily-initialised ACME account (for the production CA).
     account: Mutex<Option<AcmeAccount>>,
     /// Lazily-initialised ACME account (for the test CA).
@@ -639,7 +672,7 @@ impl AcmeIssuer {
     // -----------------------------------------------------------------------
 
     /// Get or lazily initialise the ACME client for the given CA URL.
-    async fn get_client(&self, use_test: bool) -> Result<AcmeClient> {
+    async fn get_client(&self, use_test: bool) -> Result<Arc<AcmeClient>> {
         let ca_url = if use_test { &self.test_ca } else { &self.ca };
         let mutex = if use_test {
             &self.test_client
@@ -647,33 +680,26 @@ impl AcmeIssuer {
             &self.client
         };
 
-        {
-            let guard = mutex.lock().await;
-            if let Some(ref client) = *guard {
-                // AcmeClient is not Clone, but we can re-create from same URL
-                // since directory is cached. For simplicity, we re-create on
-                // each call. A production implementation would Arc-wrap the
-                // client. Here we just create a new one if not cached.
-                let _ = client;
-            }
-        }
-
-        // Always check the cache first.
-        {
-            let guard = mutex.lock().await;
-            if guard.is_some() {
-                // Client exists — drop guard and re-create from same URL.
-                // Since AcmeClient is not Clone, we create a fresh one. This
-                // is a simplification; the real overhead is negligible because
-                // the directory and nonce are cached server-side.
-                drop(guard);
-            }
-        }
-
-        info!(ca = %ca_url, "initialising ACME client");
-        let client = AcmeClient::new(ca_url).await?;
         let mut guard = mutex.lock().await;
-        *guard = Some(AcmeClient::new(ca_url).await?);
+        if let Some(client) = guard.as_ref() {
+            return Ok(Arc::clone(client));
+        }
+        info!(ca = %ca_url, "initialising ACME client");
+        let http = if let Some(roots) = &self.trusted_roots {
+            crate::http::install_crypto_provider();
+            let root = reqwest::Certificate::from_der(roots)
+                .map_err(|e| Error::Config(format!("invalid custom CA root certificate: {e}")))?;
+            reqwest::Client::builder()
+                .user_agent(crate::http::user_agent())
+                .timeout(crate::http::REQUEST_TIMEOUT)
+                .add_root_certificate(root)
+                .build()
+                .map_err(|e| Error::Config(format!("failed to build custom CA transport: {e}")))?
+        } else {
+            crate::http::client()?.clone()
+        };
+        let client = Arc::new(AcmeClient::with_http_client(ca_url, http).await?);
+        *guard = Some(Arc::clone(&client));
         Ok(client)
     }
 
@@ -729,6 +755,16 @@ impl AcmeIssuer {
         .await?;
 
         if is_new {
+            if let Some(key) = &self.account_key_pem {
+                let private_key = crate::crypto::decode_private_key_pem(key)?;
+                if private_key.key_type() != KeyType::EcdsaP256 {
+                    return Err(Error::Config(
+                        "ACME account keys must use ECDSA P-256".into(),
+                    ));
+                }
+                acct.private_key_pem = key.clone();
+                acct.key_type = private_key.key_type();
+            }
             // Invoke the new-account callback (if configured) before
             // registering with the CA, allowing the caller to modify
             // the account (e.g. set EAB, change contacts).
@@ -891,9 +927,9 @@ impl AcmeIssuer {
         let client = self.get_client(use_test_ca).await?;
 
         // Step 2: get ACME account.
-        let acct = self.get_account(&client, use_test_ca).await?;
+        let mut acct = self.get_account(&client, use_test_ca).await?;
 
-        let account_key = crate::crypto::decode_private_key_pem(&acct.private_key_pem)
+        let mut account_key = crate::crypto::decode_private_key_pem(&acct.private_key_pem)
             .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
         info!(
@@ -904,8 +940,21 @@ impl AcmeIssuer {
         );
 
         // Step 3: create order (with account-does-not-exist recovery).
+        let now = chrono::Utc::now();
+        let offset = |duration: Duration| -> Result<String> {
+            chrono::Duration::from_std(duration)
+                .ok()
+                .and_then(|delta| now.checked_add_signed(delta))
+                .map(|date| date.to_rfc3339())
+                .ok_or_else(|| Error::Config("certificate validity offset is out of range".into()))
+        };
+        let options = crate::acme_client::OrderOptions {
+            profile: self.profile.clone(),
+            not_before: self.not_before.map(offset).transpose()?,
+            not_after: self.not_after.map(offset).transpose()?,
+        };
         let order_result = client
-            .new_order(&account_key, &acct.location, domains)
+            .new_order_with_options(&account_key, &acct.location, domains, &options)
             .await;
 
         let (order, order_url) = match order_result {
@@ -926,9 +975,12 @@ impl AcmeIssuer {
                 .map_err(|e| AcmeError::Account(format!("failed to decode account key: {e}")))?;
 
                 // Retry order creation with the new account.
-                client
-                    .new_order(&new_account_key, &new_acct.location, domains)
-                    .await?
+                let order = client
+                    .new_order_with_options(&new_account_key, &new_acct.location, domains, &options)
+                    .await?;
+                acct = new_acct;
+                account_key = new_account_key;
+                order
             }
             Err(e) => return Err(e),
         };
@@ -980,6 +1032,14 @@ impl AcmeIssuer {
                 solver
             };
 
+            let presented = PresentedChallenge {
+                solver: Arc::clone(&solver),
+                domain: authz.identifier.value.clone(),
+                token: challenge.token.clone(),
+                key_auth: key_auth.clone(),
+                armed: true,
+            };
+
             // Present the challenge.
             solver
                 .present(&authz.identifier.value, &challenge.token, &key_auth)
@@ -995,9 +1055,7 @@ impl AcmeIssuer {
                 .await
             {
                 // Cleanup on wait failure.
-                let _ = solver
-                    .cleanup(&authz.identifier.value, &challenge.token, &key_auth)
-                    .await;
+                let _ = presented.cleanup().await;
                 return Err(AcmeError::Challenge {
                     challenge_type: challenge.challenge_type.clone(),
                     message: format!("solver wait failed: {e}"),
@@ -1006,24 +1064,23 @@ impl AcmeIssuer {
             }
 
             // Tell the CA we are ready.
-            client
-                .accept_challenge(&account_key, &acct.location, &challenge.url)
-                .await?;
-
-            // Poll authorization until valid.
-            let poll_result = client
-                .poll_authorization(
-                    &account_key,
-                    &acct.location,
-                    authz_url,
-                    DEFAULT_AUTHZ_POLL_TIMEOUT,
-                )
-                .await;
+            let poll_result = async {
+                client
+                    .accept_challenge(&account_key, &acct.location, &challenge.url)
+                    .await?;
+                client
+                    .poll_authorization(
+                        &account_key,
+                        &acct.location,
+                        authz_url,
+                        DEFAULT_AUTHZ_POLL_TIMEOUT,
+                    )
+                    .await
+            }
+            .await;
 
             // Cleanup the challenge regardless of poll result.
-            if let Err(cleanup_err) = solver
-                .cleanup(&authz.identifier.value, &challenge.token, &key_auth)
-                .await
+            if let Err(cleanup_err) = presented.cleanup().await
             {
                 warn!(
                     identifier = %authz.identifier.value,
@@ -1257,9 +1314,11 @@ impl AcmeIssuer {
 // CertIssuer trait implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl CertIssuer for AcmeIssuer {
-    async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+impl AcmeIssuer {
+    async fn issue_inner(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+        if self.resolver.is_some() {
+            return Err(Error::Config("AcmeIssuer.resolver is not supported by arbitrary solvers; configure DNS resolution on Dns01Solver instead".into()));
+        }
         let mut attempt: usize = 0;
 
         // First attempt: production CA.
@@ -1305,6 +1364,20 @@ impl CertIssuer for AcmeIssuer {
                 return Err(first_err);
             }
         }
+    }
+}
+
+#[async_trait]
+impl CertIssuer for AcmeIssuer {
+    async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
+        tokio::time::timeout(self.cert_obtain_timeout, self.issue_inner(csr_der, domains))
+            .await
+            .map_err(|_| {
+                Error::Timeout(format!(
+                    "certificate issuance exceeded {:?}",
+                    self.cert_obtain_timeout
+                ))
+            })?
     }
 
     fn issuer_key(&self) -> String {
