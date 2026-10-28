@@ -84,7 +84,7 @@ const EMERGENCY_RENEWAL_HOURS: i64 = 24;
 ///
 /// Construct via [`Certificate::from_pem`] (for PEM-encoded data) or
 /// [`Certificate::from_der`] (for pre-parsed DER chains).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Certificate {
     /// The certificate chain as DER-encoded certificates.
     /// The first entry is the leaf certificate.
@@ -137,6 +137,26 @@ pub struct Certificate {
     /// from ARI take precedence over the standard time-based renewal
     /// check.
     pub ari: Option<RenewalInfo>,
+}
+
+impl std::fmt::Debug for Certificate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Certificate")
+            .field("names", &self.names)
+            .field("hash", &self.hash)
+            .field("managed", &self.managed)
+            .field("issuer_key", &self.issuer_key)
+            .field("tags", &self.tags)
+            .field("not_before", &self.not_before)
+            .field("not_after", &self.not_after)
+            .field(
+                "private_key_der",
+                &self.private_key_der.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("private_key_kind", &self.private_key_kind)
+            .field("ocsp_status", &self.ocsp_status)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Certificate {
@@ -415,17 +435,8 @@ pub async fn reload_managed_certificate(
     domain: &str,
     issuer_key: &str,
 ) -> Result<()> {
-    use crate::storage::{site_cert_key, site_private_key};
-
-    // Load certificate and key PEM from storage.
-    let cert_key = site_cert_key(issuer_key, domain);
-    let key_key = site_private_key(issuer_key, domain);
-
-    let cert_pem = storage.load(&cert_key).await?;
-    let key_pem = storage.load(&key_key).await?;
-
-    // Parse into a Certificate.
-    let mut cert = Certificate::from_pem(&cert_pem, &key_pem)?;
+    let resource = crate::storage::load_certificate(storage, issuer_key, domain).await?;
+    let mut cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
     cert.managed = true;
     cert.issuer_key = issuer_key.to_owned();
 
@@ -450,8 +461,8 @@ pub async fn reload_managed_certificate(
 
 /// Check whether a managed certificate stored in `storage` needs renewal.
 ///
-/// Loads the certificate PEM from storage using the standard key paths for
-/// the given `issuer_key` and `domain`, parses the leaf, and delegates to
+/// Loads the complete resource through the storage format adapter for the
+/// given `issuer_key` and `domain`, parses the leaf, and delegates to
 /// [`Certificate::needs_renewal`].
 ///
 /// Returns `Ok(true)` if the certificate needs renewal (or if it cannot be
@@ -464,24 +475,13 @@ pub async fn managed_cert_in_storage_needs_renewal(
     issuer_key: &str,
     renewal_window_ratio: f64,
 ) -> Result<bool> {
-    use crate::storage::{site_cert_key, site_private_key};
-
-    let cert_key = site_cert_key(issuer_key, domain);
-    let key_key = site_private_key(issuer_key, domain);
-
-    let cert_pem = match storage.load(&cert_key).await {
-        Ok(data) => data,
-        Err(_) => return Ok(true), // cannot load -> needs issuance
+    let resource = match crate::storage::load_certificate(storage, issuer_key, domain).await {
+        Ok(resource) => resource,
+        Err(_) => return Ok(true), // preserve the helper's documented retry policy
     };
-
-    let key_pem = match storage.load(&key_key).await {
-        Ok(data) => data,
+    let cert = match Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem) {
+        Ok(cert) => cert,
         Err(_) => return Ok(true),
-    };
-
-    let cert = match Certificate::from_pem(&cert_pem, &key_pem) {
-        Ok(c) => c,
-        Err(_) => return Ok(true), // cannot parse -> needs re-issuance
     };
 
     Ok(cert.needs_renewal(renewal_window_ratio))
@@ -698,24 +698,15 @@ pub fn match_wildcard(subject: &str, wildcard: &str) -> bool {
         return true;
     }
 
-    if !wildcard.contains('*') {
+    let Some(suffix) = wildcard.strip_prefix("*.") else {
+        return false;
+    };
+    if suffix.contains('*') || suffix.split('.').any(str::is_empty) {
         return false;
     }
-
-    let labels: Vec<&str> = subject.split('.').collect();
-    for i in 0..labels.len() {
-        if labels[i].is_empty() {
-            continue;
-        }
-        let mut candidate: Vec<&str> = labels.clone();
-        candidate[i] = "*";
-        let joined = candidate.join(".");
-        if joined == wildcard {
-            return true;
-        }
-    }
-
-    false
+    subject
+        .split_once('.')
+        .is_some_and(|(label, rest)| !label.is_empty() && !label.contains('*') && rest == suffix)
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,5 +1180,65 @@ mod tests {
         let t = Utc::now().with_nanosecond(0).unwrap();
         let exp = expires_at(t);
         assert_eq!(exp - t, ChronoDuration::seconds(1));
+    }
+
+    #[test]
+    fn wildcard_is_only_an_entire_leftmost_label() {
+        assert!(!match_wildcard("a.b.com", "a.*.com"));
+        assert!(!match_wildcard("a.b.com", "a.b.*"));
+        assert!(!match_wildcard("a.b.com", "*.*.com"));
+        assert!(!match_wildcard(".example.com", "*.example.com"));
+        assert!(!match_wildcard("deep.a.example.com", "*.example.com"));
+        assert!(match_wildcard("a.example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn certificate_debug_redacts_private_key_bytes() {
+        let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let mut cert = Certificate::from_pem(
+            generated.cert.pem().as_bytes(),
+            generated.signing_key.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        cert.private_key_der = Some(vec![222, 173, 190, 239, 222, 173]);
+        let debug = format!("{cert:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("[222, 173, 190, 239, 222, 173]"));
+    }
+
+    #[tokio::test]
+    async fn public_storage_helpers_read_the_published_resource_format() {
+        use crate::storage::{CertificateResource, store_certificate};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let generated = rcgen::generate_simple_self_signed(vec!["example.com".into()]).unwrap();
+        let resource = CertificateResource {
+            sans: vec!["example.com".into()],
+            certificate_pem: generated.cert.pem().into_bytes(),
+            private_key_pem: generated.signing_key.serialize_pem().into_bytes(),
+            issuer_key: "test-ca".into(),
+            issuer_data: None,
+        };
+        store_certificate(&storage, "test-ca", &resource)
+            .await
+            .unwrap();
+        let cache = crate::CertCache::new(crate::CacheOptions::default());
+        reload_managed_certificate(&cache, &storage, "example.com", "test-ca")
+            .await
+            .unwrap();
+        let cert = cache.get_by_name("example.com").await.unwrap();
+        assert!(cert.managed);
+        assert_eq!(cert.issuer_key, "test-ca");
+        assert!(cache.resolve("example.com").is_some());
+        assert!(
+            !managed_cert_in_storage_needs_renewal(
+                &storage,
+                "example.com",
+                "test-ca",
+                DEFAULT_RENEWAL_WINDOW_RATIO
+            )
+            .await
+            .unwrap()
+        );
     }
 }

@@ -10,11 +10,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::error::{AcmeError, Error, Result};
@@ -265,154 +265,173 @@ where
 /// multiple connections trigger a certificate renewal for the same domain at
 /// the same time.
 ///
-/// Finished tasks are automatically reaped when new jobs are submitted or
-/// when the queue length is queried.
+/// Completion guards remove tasks on success, panic, and cancellation.
 pub struct JobQueue {
-    /// Active jobs indexed by name.
-    jobs: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    /// Human-readable label for log messages.
+    jobs: Arc<Mutex<HashMap<String, Job>>>,
     name: String,
-    /// Optional concurrency limiter. When set, at most `max_concurrent` jobs
-    /// may run simultaneously. Additional submissions block until a permit
-    /// becomes available.
     semaphore: Option<Arc<Semaphore>>,
 }
 
-impl JobQueue {
-    /// Create a new, empty `JobQueue` with the given descriptive `name`.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            jobs: Arc::new(Mutex::new(HashMap::new())),
-            name: name.into(),
-            semaphore: None,
+struct Job {
+    abort: Option<AbortHandle>,
+    cancelled: bool,
+    completion: watch::Receiver<bool>,
+    identity: Arc<()>,
+}
+
+/// Cleanup runs on success, panic, or cancellation, including before first poll.
+struct JobCompletion {
+    jobs: Weak<Mutex<HashMap<String, Job>>>,
+    name: String,
+    identity: Arc<()>,
+    done: watch::Sender<bool>,
+}
+
+impl Drop for JobCompletion {
+    fn drop(&mut self) {
+        if let Some(jobs) = self.jobs.upgrade() {
+            let mut jobs = jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if jobs
+                .get(&self.name)
+                .is_some_and(|job| Arc::ptr_eq(&job.identity, &self.identity))
+            {
+                jobs.remove(&self.name);
+            }
         }
+        self.done.send_replace(true);
+    }
+}
+
+impl JobQueue {
+    /// An unbounded-concurrency queue, deduplicated by name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self::with_max_concurrent(name, 0)
     }
 
-    /// Create a new `JobQueue` with a maximum number of concurrently running
-    /// jobs.
-    ///
-    /// When the limit is reached, [`submit`](JobQueue::submit) will still
-    /// accept the job but the spawned task will wait for a semaphore permit
-    /// before executing the closure.
+    /// Limit concurrent execution. Submissions wait in the spawned tasks;
+    /// zero means unlimited concurrency.
     pub fn with_max_concurrent(name: impl Into<String>, max_concurrent: usize) -> Self {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             name: name.into(),
-            semaphore: if max_concurrent > 0 {
-                Some(Arc::new(Semaphore::new(max_concurrent)))
-            } else {
-                None
-            },
+            semaphore: (max_concurrent > 0).then(|| Arc::new(Semaphore::new(max_concurrent))),
         }
     }
 
-    /// Submit a background job.
-    ///
-    /// If a job with the same `name` is already running, this call is a no-op
-    /// and the closure is **not** spawned.
-    ///
-    /// The closure receives no arguments; any required state should be moved
-    /// into it via `move ||`.
+    /// Submit work unless a task of the same name is still registered.
     pub async fn submit<F, Fut>(&self, name: String, f: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let mut jobs = self.jobs.lock().await;
-
-        // Reap finished tasks while we hold the lock.
-        jobs.retain(|_, handle| !handle.is_finished());
-
-        if jobs.contains_key(&name) {
-            tracing::debug!(
-                queue = %self.name,
-                job = %name,
-                "job already running; skipping duplicate submission",
+        let runtime = tokio::runtime::Handle::current();
+        let (done, completion) = watch::channel(false);
+        let identity = Arc::new(());
+        {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if jobs.contains_key(&name) {
+                return;
+            }
+            jobs.insert(
+                name.clone(),
+                Job {
+                    abort: None,
+                    cancelled: false,
+                    completion,
+                    identity: Arc::clone(&identity),
+                },
             );
-            return;
         }
-
-        tracing::debug!(queue = %self.name, job = %name, "submitting background job");
-
-        let job_name = name.clone();
-        let queue_name = self.name.clone();
-        let jobs_ref = Arc::clone(&self.jobs);
+        // Never spawn or run a destructor while holding the registry lock:
+        // a runtime shutting down can drop an unpolled future immediately.
+        let cleanup = JobCompletion {
+            jobs: Arc::downgrade(&self.jobs),
+            name: name.clone(),
+            identity: Arc::clone(&identity),
+            done,
+        };
         let semaphore = self.semaphore.clone();
-
-        let handle = tokio::spawn(async move {
-            // Acquire a semaphore permit if concurrency limiting is enabled.
+        tracing::debug!(queue = %self.name, job = %name, "submitting background job");
+        let handle = runtime.spawn(async move {
+            let _cleanup = cleanup;
             let _permit = match &semaphore {
                 Some(sem) => Some(sem.acquire().await.expect("semaphore should not be closed")),
                 None => None,
             };
-
             f().await;
-
-            // Remove ourselves from the map once complete.
-            // The permit is dropped automatically when `_permit` goes out of
-            // scope, allowing another job to proceed.
-            let mut jobs = jobs_ref.lock().await;
-            jobs.remove(&job_name);
-
-            tracing::debug!(
-                queue = %queue_name,
-                job = %job_name,
-                "background job completed",
-            );
         });
-
-        jobs.insert(name, handle);
-    }
-
-    /// Wait for the job with the given `name` to complete.
-    ///
-    /// Returns immediately if no job with that name is currently tracked.
-    pub async fn wait(&self, name: &str) {
-        let handle = {
-            let mut jobs = self.jobs.lock().await;
-            jobs.remove(name)
+        let abort = handle.abort_handle();
+        let cancelled = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(job) = jobs
+                .get_mut(&name)
+                .filter(|job| Arc::ptr_eq(&job.identity, &identity))
+            {
+                job.abort = Some(abort.clone());
+                job.cancelled
+            } else {
+                false
+            }
         };
-
-        if let Some(handle) = handle {
-            // We intentionally ignore the JoinError (panic / cancellation) —
-            // the important thing is that the task is done.
-            let _ = handle.await;
+        if cancelled {
+            abort.abort();
         }
     }
 
-    /// Check whether a job with the given `name` is currently running.
+    /// Wait for the currently registered generation without removing it.
+    /// Other waiters, deduplication and cancellation remain available.
+    pub async fn wait(&self, name: &str) {
+        let completion = self
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|job| job.completion.clone());
+        if let Some(mut completion) = completion {
+            while !*completion.borrow_and_update() {
+                if completion.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Whether the named job is registered and not yet completed.
     pub async fn is_running(&self, name: &str) -> bool {
-        let jobs = self.jobs.lock().await;
-        match jobs.get(name) {
-            Some(handle) => !handle.is_finished(),
-            None => false,
-        }
+        self.jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
     }
 
-    /// Cancel (abort) the job with the given `name`.
-    ///
-    /// If no job with that name exists, this is a no-op.
+    /// Abort a job. It remains registered until its future has actually been
+    /// dropped, so a replacement cannot overlap the cancelled generation.
     pub async fn cancel(&self, name: &str) {
-        let mut jobs = self.jobs.lock().await;
-        if let Some(handle) = jobs.remove(name) {
-            handle.abort();
-            tracing::debug!(
-                queue = %self.name,
-                job = %name,
-                "background job cancelled",
-            );
+        let cancelled = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.get_mut(name).map(|job| {
+                job.cancelled = true;
+                (job.completion.clone(), job.abort.clone())
+            })
+        };
+        if let Some((mut completion, abort)) = cancelled {
+            if let Some(abort) = abort {
+                abort.abort();
+            }
+            while !*completion.borrow_and_update() {
+                if completion.changed().await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
-    /// Returns the number of currently tracked (potentially still-running)
-    /// jobs.
+    /// Number of currently registered jobs.
     pub async fn len(&self) -> usize {
-        let mut jobs = self.jobs.lock().await;
-        jobs.retain(|_, handle| !handle.is_finished());
-        jobs.len()
+        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Returns `true` if there are no tracked jobs.
+    /// Whether no jobs are registered.
     pub async fn is_empty(&self) -> bool {
         self.len().await == 0
     }
@@ -677,6 +696,91 @@ mod tests {
 
         queue.wait("a").await;
         queue.wait("b").await;
+        assert!(queue.is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn waiting_preserves_deduplication_and_cancellation_for_all_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let queue = Arc::new(JobQueue::new("wait-regression"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        queue
+            .submit("domain".into(), {
+                let calls = Arc::clone(&calls);
+                let started = Arc::clone(&started);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                }
+            })
+            .await;
+        started.notified().await;
+        let first = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move {
+                queue.wait("domain").await;
+            }
+        });
+        let second = tokio::spawn({
+            let queue = Arc::clone(&queue);
+            async move {
+                queue.wait("domain").await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(queue.is_running("domain").await);
+        queue
+            .submit("domain".into(), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        assert_eq!(queue.len().await, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        queue.cancel("domain").await;
+        tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(queue.is_empty().await);
+        queue
+            .submit("domain".into(), {
+                let calls = Arc::clone(&calls);
+                move || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .await;
+        queue.wait("domain").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn panic_and_abort_before_first_poll_release_queue_entries() {
+        let queue = JobQueue::new("cleanup");
+        queue
+            .submit("panic".into(), || async {
+                panic!("expected test panic");
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), queue.wait("panic"))
+            .await
+            .unwrap();
+        assert!(!queue.is_running("panic").await);
+        queue
+            .submit("abort".into(), || async {
+                std::future::pending::<()>().await;
+            })
+            .await;
+        queue.cancel("abort").await;
         assert!(queue.is_empty().await);
     }
 }

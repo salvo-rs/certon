@@ -34,17 +34,19 @@
 //! // let cert = cache.get_by_name("example.com").await;
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
 use rand::RngExt;
-use tokio::sync::{RwLock, watch};
-use tracing::{debug, info};
+use rustls::sign::CertifiedKey;
+use tokio::sync::watch;
+use tracing::info;
 
 use crate::certificates::Certificate;
 use crate::error::Result;
+use crate::handshake::cert_to_certified_key;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -198,476 +200,405 @@ impl std::fmt::Debug for CacheOptions {
 ///
 /// Certificates are keyed by their SHA-256 content hash and indexed by
 /// lowercase subject name (SAN) for O(1) lookups during TLS handshakes.
-/// Wildcard matching is performed by replacing each label of the queried
-/// domain with `*` and checking the index.
+/// Wildcard matching replaces only the leftmost label of the queried
+/// domain with `*`, and matches exactly one label.
 ///
-/// When the cache is dropped (or [`CertCache::stop`] is called), any
-/// background maintenance task is signalled to stop.
+/// Call [`CertCache::stop`] to signal background maintenance to stop.
+/// Maintenance tasks retain the cache until they exit.
 ///
 /// **Do not construct this struct directly** -- use [`CertCache::new`].
 pub struct CertCache {
-    /// Primary store: certificate hash -> Certificate.
-    cache: RwLock<HashMap<String, Certificate>>,
-
-    /// Name index: lowercase SAN -> list of certificate hashes.
-    cache_index: RwLock<HashMap<String, Vec<String>>>,
-
-    /// Cache configuration. Wrapped in a `RwLock` so options can be updated
-    /// at runtime (e.g. via `set_options`).
+    // Certificate metadata and the serving index share one short, synchronous
+    // critical section. No user callback or cryptographic operation runs here.
+    state: RwLock<CacheState>,
     options: RwLock<CacheOptions>,
-
-    /// Sender half of a watch channel used to signal the maintenance task to
-    /// stop. Sending `true` requests a graceful shutdown.
     stop_tx: watch::Sender<bool>,
-
-    /// Receiver half of a watch channel that the maintenance loop signals
-    /// (by sending `true`) when it has exited. Used by [`CertCache::stop_and_wait`].
-    done_rx: RwLock<watch::Receiver<bool>>,
-
-    /// Sender half of the "done" watch channel, exposed so that the
-    /// maintenance loop can signal completion.
     done_tx: watch::Sender<bool>,
+    maintenance_count: Mutex<usize>,
+}
+
+#[derive(Default)]
+struct CacheState {
+    certificates: HashMap<String, CachedCertificate>,
+    index: HashMap<String, Vec<String>>,
+}
+
+struct CachedCertificate {
+    certificate: Certificate,
+    key: Option<Arc<CertifiedKey>>,
+}
+
+/// A serving lookup contains no raw private-key copy.
+pub(crate) struct CachedKey {
+    pub key: Arc<CertifiedKey>,
+    pub hash: String,
+    pub needs_ocsp: bool,
+}
+
+/// Registered before spawning maintenance, so immediate shutdown cannot race
+/// task startup. Dropping an unpolled or aborted task releases its registration.
+pub(crate) struct MaintenanceGuard {
+    cache: Arc<CertCache>,
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        let mut count = self
+            .cache
+            .maintenance_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *count -= 1;
+        if *count == 0 {
+            self.cache.done_tx.send_replace(true);
+        }
+    }
 }
 
 impl std::fmt::Debug for CertCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CertCache")
-            .field("cache", &"<RwLock<HashMap>>")
-            .field("cache_index", &"<RwLock<HashMap>>")
-            .finish()
+        f.debug_struct("CertCache").finish_non_exhaustive()
+    }
+}
+
+impl CacheState {
+    fn remove(&mut self, hash: &str) -> Option<CacheEvent> {
+        let entry = self.certificates.remove(hash)?;
+        for name in &entry.certificate.names {
+            let lower = name.to_lowercase();
+            if let Some(hashes) = self.index.get_mut(&lower) {
+                hashes.retain(|h| h != hash);
+                if hashes.is_empty() {
+                    self.index.remove(&lower);
+                }
+            }
+        }
+        Some(CacheEvent::Removed {
+            names: entry.certificate.names,
+            hash: hash.to_owned(),
+        })
+    }
+
+    fn matching(&self, name: &str) -> Vec<&CachedCertificate> {
+        let lower = name.to_lowercase();
+        let wildcard = if !lower.contains('*') && !lower.split('.').any(str::is_empty) {
+            lower
+                .split_once('.')
+                .filter(|(label, rest)| !label.is_empty() && !rest.is_empty())
+                .map(|(_, suffix)| format!("*.{suffix}"))
+        } else {
+            None
+        };
+        let mut seen = HashSet::new();
+        std::iter::once(lower.as_str())
+            .chain(wildcard.as_deref())
+            .filter_map(|subject| self.index.get(subject))
+            .flatten()
+            .filter(|hash| seen.insert(hash.as_str()))
+            .filter_map(|hash| self.certificates.get(hash))
+            .collect()
+    }
+
+    fn add(
+        &mut self,
+        cert: Certificate,
+        key: Option<Arc<CertifiedKey>>,
+        options: &CacheOptions,
+        events: &mut Vec<CacheEvent>,
+    ) {
+        let hash = cert.hash.clone();
+        if let Some(existing) = self.certificates.get_mut(&hash) {
+            for tag in &cert.tags {
+                if !existing.certificate.tags.contains(tag) {
+                    existing.certificate.tags.push(tag.clone());
+                }
+            }
+            events.push(CacheEvent::Updated {
+                names: cert.names,
+                hash,
+            });
+            return;
+        }
+        if options.capacity > 0 && self.certificates.len() >= options.capacity {
+            let managed: Vec<_> = self
+                .certificates
+                .iter()
+                .filter(|(_, e)| e.certificate.managed)
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            if !managed.is_empty() {
+                let hash = &managed[rand::rng().random_range(0..managed.len())];
+                if let Some(event) = self.remove(hash) {
+                    events.push(event);
+                }
+            }
+        }
+        for name in &cert.names {
+            self.index
+                .entry(name.to_lowercase())
+                .or_default()
+                .push(hash.clone());
+        }
+        events.push(CacheEvent::Added {
+            names: cert.names.clone(),
+            hash: hash.clone(),
+        });
+        self.certificates.insert(
+            hash,
+            CachedCertificate {
+                certificate: cert,
+                key,
+            },
+        );
+    }
+}
+
+fn dispatch_events(options: &CacheOptions, events: Vec<CacheEvent>) {
+    for event in events {
+        if let CacheEvent::Added { names, hash } = &event {
+            info!(subjects = ?names, hash = %hash, "added certificate to cache");
+        }
+        if let Some(callback) = &options.on_event {
+            callback(event);
+        }
     }
 }
 
 impl CertCache {
-    /// Create a new certificate cache with the given options.
-    ///
-    /// The returned cache is wrapped in an `Arc` for shared ownership.
-    /// A background maintenance task is **not** started automatically; call
-    /// [`start_maintenance`](crate::maintain::start_maintenance) if periodic renewal/OCSP checking
-    /// is desired.
+    /// Create an empty cache. Maintenance must be started separately.
     pub fn new(options: CacheOptions) -> Arc<Self> {
-        let opts = normalize_options(options);
-        let (stop_tx, _stop_rx) = watch::channel(false);
-        let (done_tx, done_rx) = watch::channel(false);
-
+        let (stop_tx, _) = watch::channel(false);
+        let (done_tx, _) = watch::channel(true);
         Arc::new(Self {
-            cache: RwLock::new(HashMap::new()),
-            cache_index: RwLock::new(HashMap::new()),
-            options: RwLock::new(opts),
+            state: RwLock::new(CacheState::default()),
+            options: RwLock::new(normalize_options(options)),
             stop_tx,
-            done_rx: RwLock::new(done_rx),
             done_tx,
+            maintenance_count: Mutex::new(0),
         })
     }
 
-    /// Update the cache options at runtime.
-    ///
-    /// Intervals that are zero or negative are replaced with their defaults.
+    /// Update cache options; zero intervals are replaced with their defaults.
     pub async fn set_options(&self, options: CacheOptions) {
-        let opts = normalize_options(options);
-        let mut guard = self.options.write().await;
-        *guard = opts;
+        *self.options.write().unwrap_or_else(|e| e.into_inner()) = normalize_options(options);
     }
 
-    /// Signal the maintenance task (if running) to stop.
-    ///
-    /// This is a non-blocking operation. The maintenance task will observe
-    /// the signal on its next iteration and exit gracefully.
+    /// Persist a stop request, including when maintenance has not subscribed yet.
     pub fn stop(&self) {
-        let _ = self.stop_tx.send(true);
+        self.stop_tx.send_replace(true);
     }
 
-    /// Subscribe to the stop signal. Returns a `watch::Receiver<bool>` that
-    /// yields `true` when the cache is being shut down.
+    /// Subscribe to shutdown. Check the current value before waiting for changes.
     pub fn subscribe_stop(&self) -> watch::Receiver<bool> {
         self.stop_tx.subscribe()
     }
 
-    /// Signal the maintenance task to stop and wait until it has actually
-    /// exited.
-    ///
-    /// This sends the stop signal and then awaits the "done" channel that
-    /// the maintenance loop signals on exit. If no maintenance loop is
-    /// running, this returns immediately after sending the stop signal.
+    /// Stop all registered maintenance loops and wait for their guards to drop.
+    /// Returns immediately if no maintenance loop is registered.
     pub async fn stop_and_wait(&self) {
-        let _ = self.stop_tx.send(true);
-
-        let mut done_rx = self.done_rx.write().await;
-        // If already done, return immediately.
-        if *done_rx.borrow() {
-            return;
+        self.stop();
+        let mut done = self.done_tx.subscribe();
+        while !*done.borrow_and_update() {
+            if done.changed().await.is_err() {
+                break;
+            }
         }
-        // Wait for the maintenance loop to signal done.
-        let _ = done_rx.changed().await;
     }
 
-    /// Signal that the maintenance loop has exited.
-    ///
-    /// This is called by the maintenance loop when it is about to return,
-    /// so that [`CertCache::stop_and_wait`] can resolve.
+    pub(crate) fn maintenance_guard(self: &Arc<Self>) -> MaintenanceGuard {
+        let mut count = self
+            .maintenance_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *count += 1;
+        self.done_tx.send_replace(false);
+        MaintenanceGuard {
+            cache: Arc::clone(self),
+        }
+    }
+
+    /// Signal completion for legacy callers. Registered maintenance is tracked
+    /// by guards, so a single loop cannot mark other active loops as complete.
     pub fn signal_done(&self) {
-        let _ = self.done_tx.send(true);
+        let count = self
+            .maintenance_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *count == 0 {
+            self.done_tx.send_replace(true);
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // Add / update
-    // -----------------------------------------------------------------------
-
-    /// Add a certificate to the cache.
-    ///
-    /// If a certificate with the same hash already exists, its tags are merged
-    /// (any tags present on `cert` but missing from the cached copy are
-    /// appended) and no duplicate is created.
-    ///
-    /// When the cache is at capacity, a random **managed** certificate is
-    /// evicted to make room.
+    /// Add a certificate, merging tags if the hash is already present.
+    /// Signing keys are prepared once, outside the cache lock.
     pub async fn add(&self, cert: Certificate) {
-        let mut cache = self.cache.write().await;
-        let mut index = self.cache_index.write().await;
-        let options = self.options.read().await;
-
-        self.unsynced_add(&mut cache, &mut index, &options, cert)
-            .await;
+        let key = cert_to_certified_key(&cert).ok();
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut events = Vec::new();
+        self.state
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(cert, key, &options, &mut events);
+        dispatch_events(&options, events);
     }
 
-    /// Internal add implementation that operates on already-locked maps.
-    async fn unsynced_add(
-        &self,
-        cache: &mut HashMap<String, Certificate>,
-        index: &mut HashMap<String, Vec<String>>,
-        options: &CacheOptions,
-        cert: Certificate,
-    ) {
-        let cert_hash = cert.hash.clone();
-
-        // If the certificate already exists, merge tags and return.
-        if let Some(existing) = cache.get_mut(&cert_hash) {
-            let mut merged = false;
-            for tag in &cert.tags {
-                if !existing.tags.contains(tag) {
-                    existing.tags.push(tag.clone());
-                    merged = true;
-                }
-            }
-
-            let log_action = if merged {
-                "certificate already cached; appended missing tags"
-            } else {
-                "certificate already cached"
-            };
-            debug!(
-                subjects = ?cert.names,
-                managed = cert.managed,
-                issuer_key = %cert.issuer_key,
-                hash = %cert_hash,
-                log_action,
-            );
-
-            if let Some(ref on_event) = options.on_event {
-                on_event(CacheEvent::Updated {
-                    names: cert.names.clone(),
-                    hash: cert_hash,
-                });
-            }
-            return;
-        }
-
-        // Evict a random managed cert if at capacity.
-        if options.capacity > 0 && cache.len() >= options.capacity {
-            let cache_size = cache.len();
-            let target_idx = rand::rng().random_range(0..cache_size);
-
-            // Collect all hashes so we can pick one by index.
-            let hashes: Vec<String> = cache.keys().cloned().collect();
-
-            // Starting from the random index, find the first managed cert to evict.
-            for offset in 0..cache_size {
-                let idx = (target_idx + offset) % cache_size;
-                let hash = &hashes[idx];
-                if let Some(evict_cert) = cache.get(hash)
-                    && evict_cert.managed
-                {
-                    let evict_names = evict_cert.names.clone();
-                    let evict_hash = evict_cert.hash.clone();
-
-                    debug!(
-                        removing_subjects = ?evict_names,
-                        removing_hash = %evict_hash,
-                        inserting_subjects = ?cert.names,
-                        inserting_hash = %cert_hash,
-                        "cache full; evicting random managed certificate",
-                    );
-
-                    Self::unsynced_remove_by_hash(cache, index, &evict_hash);
-
-                    if let Some(ref on_event) = options.on_event {
-                        on_event(CacheEvent::Removed {
-                            names: evict_names,
-                            hash: evict_hash,
-                        });
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Update the name index.
-        for name in &cert.names {
-            let lower = name.to_lowercase();
-            index.entry(lower).or_default().push(cert_hash.clone());
-        }
-
-        let event_names = cert.names.clone();
-        let event_hash = cert_hash.clone();
-
-        info!(
-            subjects = ?cert.names,
-            managed = cert.managed,
-            issuer_key = %cert.issuer_key,
-            hash = %cert_hash,
-            expires = %cert.not_after,
-            cache_size = cache.len() + 1,
-            cache_capacity = options.capacity,
-            "added certificate to cache",
-        );
-
-        // Store the certificate.
-        cache.insert(cert_hash, cert);
-
-        if let Some(ref on_event) = options.on_event {
-            on_event(CacheEvent::Added {
-                names: event_names,
-                hash: event_hash,
-            });
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Remove
-    // -----------------------------------------------------------------------
-
-    /// Remove a certificate from the cache by its hash.
+    /// Remove a certificate by hash.
     pub async fn remove(&self, hash: &str) {
-        let mut cache = self.cache.write().await;
-        let mut index = self.cache_index.write().await;
-        let options = self.options.read().await;
-
-        if let Some(cert) = cache.get(hash) {
-            let names = cert.names.clone();
-            let hash_owned = hash.to_owned();
-
-            Self::unsynced_remove_by_hash(&mut cache, &mut index, hash);
-
-            debug!(
-                subjects = ?names,
-                hash = %hash_owned,
-                cache_size = cache.len(),
-                "removed certificate from cache",
-            );
-
-            if let Some(ref on_event) = options.on_event {
-                on_event(CacheEvent::Removed {
-                    names,
-                    hash: hash_owned,
-                });
-            }
-        }
+        self.remove_many(&[hash.to_owned()]).await;
     }
 
-    /// Remove certificates with the given hashes from the cache.
-    ///
-    /// Certificates whose hashes are not found in the cache are silently
-    /// skipped. The operation holds a single write lock for the entire batch.
+    /// Remove a batch atomically. Callbacks run after releasing the cache lock.
     pub async fn remove_many(&self, hashes: &[String]) {
-        let mut cache = self.cache.write().await;
-        let mut index = self.cache_index.write().await;
-        let options = self.options.read().await;
-
-        for hash in hashes {
-            if let Some(cert) = cache.get(hash.as_str()) {
-                let names = cert.names.clone();
-                let hash_owned = hash.clone();
-
-                Self::unsynced_remove_by_hash(&mut cache, &mut index, hash);
-
-                if let Some(ref on_event) = options.on_event {
-                    on_event(CacheEvent::Removed {
-                        names,
-                        hash: hash_owned,
-                    });
-                }
-            }
-        }
-    }
-
-    /// Remove managed certificates matching the given subjects (and optionally
-    /// issuer keys) from the cache.
-    ///
-    /// If [`SubjectIssuer::issuer_key`] is empty, all managed certificates for
-    /// that subject are removed regardless of issuer.
-    pub async fn remove_managed(&self, subjects: &[SubjectIssuer]) {
-        let mut to_remove = Vec::new();
-
-        for subj in subjects {
-            let lower = subj.subject.to_lowercase();
-            let certs = self.get_all_matching_exact(&lower).await;
-            for cert in certs {
-                if !cert.managed {
-                    continue;
-                }
-                if subj.issuer_key.is_empty() || cert.issuer_key == subj.issuer_key {
-                    to_remove.push(cert.hash.clone());
-                }
-            }
-        }
-
-        self.remove_many(&to_remove).await;
-    }
-
-    /// Internal removal that operates on already-locked maps.
-    fn unsynced_remove_by_hash(
-        cache: &mut HashMap<String, Certificate>,
-        index: &mut HashMap<String, Vec<String>>,
-        hash: &str,
-    ) {
-        if let Some(cert) = cache.remove(hash) {
-            // Remove all index entries for this cert.
-            for name in &cert.names {
-                let lower = name.to_lowercase();
-                if let Some(hashes) = index.get_mut(&lower) {
-                    hashes.retain(|h| h != hash);
-                    if hashes.is_empty() {
-                        index.remove(&lower);
-                    }
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Replace
-    // -----------------------------------------------------------------------
-
-    /// Atomically replace an old certificate with a new one.
-    ///
-    /// The old certificate is removed and the new one is added in a single
-    /// lock acquisition, ensuring no window where neither certificate is
-    /// available.
-    pub async fn replace(&self, old_hash: &str, new_cert: Certificate) {
-        let mut cache = self.cache.write().await;
-        let mut index = self.cache_index.write().await;
-        let options = self.options.read().await;
-
-        // Remove old cert.
-        if let Some(old_cert) = cache.get(old_hash) {
-            let old_names = old_cert.names.clone();
-            let old_hash_owned = old_hash.to_owned();
-            Self::unsynced_remove_by_hash(&mut cache, &mut index, old_hash);
-
-            if let Some(ref on_event) = options.on_event {
-                on_event(CacheEvent::Removed {
-                    names: old_names,
-                    hash: old_hash_owned,
-                });
-            }
-        }
-
-        let new_names = new_cert.names.clone();
-        let new_expires = new_cert.not_after;
-
-        // Add new cert.
-        self.unsynced_add(&mut cache, &mut index, &options, new_cert)
-            .await;
-
-        info!(
-            subjects = ?new_names,
-            expires = %new_expires,
-            "replaced certificate in cache",
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Lookups
-    // -----------------------------------------------------------------------
-
-    /// Look up a certificate by domain name.
-    ///
-    /// The lookup follows this strategy:
-    /// 1. Exact match on the lowercase name.
-    /// 2. Wildcard match: replace the first label with `*` and try again (e.g. `sub.example.com` ->
-    ///    `*.example.com`).
-    ///
-    /// When multiple certificates match, the best one is selected:
-    /// - Non-expired certificates are preferred over expired ones.
-    /// - Among non-expired certs, the one with the longest remaining lifetime wins.
-    /// - Managed certificates are preferred over unmanaged ones.
-    pub async fn get_by_name(&self, name: &str) -> Option<Certificate> {
-        let candidates = self.all_matching_certificates(name).await;
-        select_best_certificate(candidates)
-    }
-
-    /// Look up a certificate by its content hash.
-    pub async fn get_by_hash(&self, hash: &str) -> Option<Certificate> {
-        let cache = self.cache.read().await;
-        cache.get(hash).cloned()
-    }
-
-    /// Return all certificates that could serve the given name, including
-    /// both exact and wildcard matches.
-    ///
-    /// Each label of the domain is replaced with `*` in turn to search for
-    /// wildcard certificates. For example, looking up `sub.example.com` will
-    /// also check `*.example.com`, `sub.*.com`, and `sub.example.*`. This
-    pub async fn all_matching_certificates(&self, name: &str) -> Vec<Certificate> {
-        let lower = name.to_lowercase();
-        let mut certs = self.get_all_matching_exact(&lower).await;
-
-        // Try wildcard matches by replacing each label with '*'.
-        let labels: Vec<&str> = lower.split('.').collect();
-        let mut wildcard_labels: Vec<String> = labels.iter().map(|l| l.to_string()).collect();
-        for i in 0..wildcard_labels.len() {
-            let original = wildcard_labels[i].clone();
-            wildcard_labels[i] = "*".to_string();
-            let candidate = wildcard_labels.join(".");
-            let mut wildcard_certs = self.get_all_matching_exact(&candidate).await;
-            certs.append(&mut wildcard_certs);
-            wildcard_labels[i] = original;
-        }
-
-        certs
-    }
-
-    /// Return all certificates whose index entry exactly matches `subject`
-    /// (no wildcard expansion).
-    async fn get_all_matching_exact(&self, subject: &str) -> Vec<Certificate> {
-        let cache = self.cache.read().await;
-        let index = self.cache_index.read().await;
-
-        match index.get(subject) {
-            Some(hashes) => hashes
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let events = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            hashes
                 .iter()
-                .filter_map(|h| cache.get(h).cloned())
-                .collect(),
-            None => Vec::new(),
+                .filter_map(|hash| state.remove(hash))
+                .collect()
+        };
+        dispatch_events(&options, events);
+    }
+
+    /// Remove managed certificates matching a subject and optional issuer key.
+    pub async fn remove_managed(&self, subjects: &[SubjectIssuer]) {
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let events = {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let hashes: Vec<_> = state
+                .certificates
+                .iter()
+                .filter(|(_, e)| {
+                    e.certificate.managed
+                        && subjects.iter().any(|s| {
+                            e.certificate
+                                .names
+                                .iter()
+                                .any(|n| n.eq_ignore_ascii_case(&s.subject))
+                                && (s.issuer_key.is_empty()
+                                    || s.issuer_key == e.certificate.issuer_key)
+                        })
+                })
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            hashes
+                .iter()
+                .filter_map(|hash| state.remove(hash))
+                .collect()
+        };
+        dispatch_events(&options, events);
+    }
+
+    /// Replace metadata and the prebuilt serving key in one critical section.
+    pub async fn replace(&self, old_hash: &str, new_cert: Certificate) {
+        let key = cert_to_certified_key(&new_cert).ok();
+        let options = self
+            .options
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut events = Vec::new();
+        {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if let Some(event) = state.remove(old_hash) {
+                events.push(event);
+            }
+            state.add(new_cert, key, &options, &mut events);
         }
+        dispatch_events(&options, events);
     }
 
-    /// Return the number of certificates currently in the cache.
+    /// Get the best exact or single leftmost-label wildcard match.
+    pub async fn get_by_name(&self, name: &str) -> Option<Certificate> {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        state
+            .matching(name)
+            .into_iter()
+            .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))
+            .map(|entry| entry.certificate.clone())
+    }
+
+    /// Synchronous hot path for rustls, independent of any async runtime.
+    pub(crate) fn resolve(&self, name: &str) -> Option<CachedKey> {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let now = Utc::now();
+        let entry = state
+            .matching(name)
+            .into_iter()
+            .filter(|e| e.key.is_some())
+            .min_by(|a, b| compare_certificates(&a.certificate, &b.certificate, now))?;
+        Some(CachedKey {
+            key: Arc::clone(entry.key.as_ref()?),
+            hash: entry.certificate.hash.clone(),
+            needs_ocsp: entry.certificate.ocsp_status.is_none()
+                || entry.certificate.ocsp_response.is_none(),
+        })
+    }
+
+    /// Look up metadata by content hash.
+    pub async fn get_by_hash(&self, hash: &str) -> Option<Certificate> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .certificates
+            .get(hash)
+            .map(|e| e.certificate.clone())
+    }
+
+    /// All exact and valid single leftmost-label wildcard matches.
+    pub async fn all_matching_certificates(&self, name: &str) -> Vec<Certificate> {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .matching(name)
+            .into_iter()
+            .map(|e| e.certificate.clone())
+            .collect()
+    }
+
+    /// Number of cached certificates.
     pub async fn count(&self) -> usize {
-        let cache = self.cache.read().await;
-        cache.len()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .certificates
+            .len()
     }
 
-    /// Return all certificates currently in the cache.
+    /// Snapshot all certificate metadata.
     pub async fn get_all(&self) -> Vec<Certificate> {
-        let cache = self.cache.read().await;
-        cache.values().cloned().collect()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .certificates
+            .values()
+            .map(|e| e.certificate.clone())
+            .collect()
     }
 
-    /// Return all managed certificates in the cache.
+    /// Snapshot all managed certificate metadata.
     pub async fn get_managed_certificates(&self) -> Vec<Certificate> {
-        let cache = self.cache.read().await;
-        cache.values().filter(|c| c.managed).cloned().collect()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .certificates
+            .values()
+            .filter(|e| e.certificate.managed)
+            .map(|e| e.certificate.clone())
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -783,39 +714,24 @@ impl CertCache {
 /// 2. Managed certificates are preferred over unmanaged ones.
 /// 3. Among otherwise-equal certs, the one with the longest remaining lifetime (latest `not_after`)
 ///    wins.
-fn select_best_certificate(mut candidates: Vec<Certificate>) -> Option<Certificate> {
-    if candidates.is_empty() {
-        return None;
-    }
-    if candidates.len() == 1 {
-        return Some(candidates.remove(0));
-    }
-
+#[cfg(test)]
+fn select_best_certificate(candidates: Vec<Certificate>) -> Option<Certificate> {
     let now = Utc::now();
+    candidates
+        .into_iter()
+        .min_by(|a, b| compare_certificates(a, b, now))
+}
 
-    candidates.sort_by(|a, b| {
-        let a_expired = a.not_after < now;
-        let b_expired = b.not_after < now;
-
-        // Prefer non-expired.
-        match (a_expired, b_expired) {
-            (false, true) => return std::cmp::Ordering::Less,
-            (true, false) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
-
-        // Prefer managed.
-        match (a.managed, b.managed) {
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
-
-        // Prefer longer remaining lifetime (later not_after).
-        b.not_after.cmp(&a.not_after)
-    });
-
-    Some(candidates.remove(0))
+fn compare_certificates(
+    a: &Certificate,
+    b: &Certificate,
+    now: chrono::DateTime<Utc>,
+) -> std::cmp::Ordering {
+    (a.not_after < now)
+        .cmp(&(b.not_after < now))
+        .then_with(|| b.managed.cmp(&a.managed))
+        .then_with(|| b.not_after.cmp(&a.not_after))
+        .then_with(|| a.hash.cmp(&b.hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,5 +1165,96 @@ mod tests {
         let opts = CacheOptions::default();
         let debug_str = format!("{:?}", opts);
         assert!(debug_str.contains("CacheOptions"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_maintenance_returns_and_preserves_stop() {
+        let cache = CertCache::new(CacheOptions::default());
+        tokio::time::timeout(Duration::from_secs(1), cache.stop_and_wait())
+            .await
+            .unwrap();
+        assert!(*cache.subscribe_stop().borrow());
+        let guard = cache.maintenance_guard();
+        assert!(*cache.subscribe_stop().borrow());
+        drop(guard);
+        cache.stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_all_maintenance_guards() {
+        let cache = CertCache::new(CacheOptions::default());
+        let first = cache.maintenance_guard();
+        let second = cache.maintenance_guard();
+        let waiter = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move {
+                cache.stop_and_wait().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_wildcards_do_not_match_other_labels() {
+        let cache = CertCache::new(CacheOptions::default());
+        cache
+            .add(make_cert(
+                &["sub.*.com", "sub.example.*", "*.*.com", "*..example.com"],
+                "invalid",
+                true,
+            ))
+            .await;
+        assert!(cache.get_by_name("sub.example.com").await.is_none());
+        assert!(cache.get_by_name("sub..example.com").await.is_none());
+        assert!(
+            cache
+                .all_matching_certificates("sub.example.com")
+                .await
+                .is_empty()
+        );
+        cache
+            .add(make_cert(&["*.example.com"], "valid", true))
+            .await;
+        assert_eq!(
+            cache.get_by_name("sub.example.com").await.unwrap().hash,
+            "valid"
+        );
+        assert!(cache.get_by_name("deep.sub.example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn event_callback_can_read_the_serving_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = CertCache::new(CacheOptions::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&cache);
+        cache
+            .set_options(CacheOptions {
+                on_event: Some(Arc::new({
+                    let calls = Arc::clone(&calls);
+                    move |_| {
+                        let cache = weak.upgrade().unwrap();
+                        let _ = cache.resolve("example.com");
+                        calls.fetch_add(1, Ordering::SeqCst);
+                    }
+                })),
+                ..Default::default()
+            })
+            .await;
+        cache.add(make_cert(&["example.com"], "old", true)).await;
+        cache
+            .replace("old", make_cert(&["example.com"], "new", true))
+            .await;
+        cache.remove("new").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 }
