@@ -670,9 +670,7 @@ impl crate::CertIssuer for NoIssuance {
     }
     async fn issue(&self, _: &[u8], _: &[String]) -> Result<crate::IssuedCertificate> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        Err(crate::Error::Other(
-            "a healthy replacement must not be forced".into(),
-        ))
+        Err(crate::Error::Other("test issuer rejects issuance".into()))
     }
 }
 
@@ -803,7 +801,7 @@ async fn delayed_default_force_renewal_does_not_restore_removed_management() {
 }
 
 #[tokio::test]
-async fn a_shared_replacement_verified_revoked_during_reload_gets_a_retry_deadline() {
+async fn a_shared_revoked_replacement_keeps_its_retry_deadline_after_one_failed_recovery() {
     for imported in [false, true] {
         let (mut old, _) = certificate("new-revoked.example.com", false);
         old.ocsp_status = Some(ocsp::OcspStatus::Revoked);
@@ -844,11 +842,14 @@ async fn a_shared_replacement_verified_revoked_during_reload_gets_a_retry_deadli
             .save("observed-CA", &resource(&new))
             .await
             .unwrap();
-        manager
+        let error = manager
             .renew_observed_revocation(&old.names[0], &old_leaf)
             .await
-            .unwrap();
-        assert_eq!(issuer.0.load(Ordering::SeqCst), 0);
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::Error::Other(message) if message == "test issuer rejects issuance")
+        );
+        assert_eq!(issuer.0.load(Ordering::SeqCst), 1);
         let current = manager.cache.get_by_hash(&new.hash).await.unwrap();
         assert!(current.managed);
         assert_eq!(current.ocsp_status, Some(ocsp::OcspStatus::Revoked));

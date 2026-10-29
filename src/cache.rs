@@ -426,6 +426,14 @@ impl std::fmt::Debug for CertCache {
 }
 
 impl CacheState {
+    fn has_managed_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
+        self.matching(name).into_iter().any(|entry| {
+            entry.certificate.managed
+                && entry.leaf_hash.as_deref() == Some(leaf_hash)
+                && entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+        })
+    }
+
     fn has_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
         self.matching(name).into_iter().any(|entry| {
             entry.leaf_hash.as_deref() == Some(leaf_hash)
@@ -996,13 +1004,28 @@ impl CertCache {
     /// Time-invalid entries remain available as lifecycle metadata, but are
     /// excluded from TLS selection until their validity period begins.
     pub async fn add(&self, cert: Certificate) {
-        let _ = self.publish_prepared(None, cert, None).await;
+        let _ = self.publish_prepared(None, cert, None, None).await;
     }
 
     /// Managed publication rechecks time at the write-lock linearization point,
     /// after any asynchronous OCSP/AIA preparation has finished.
     pub(crate) async fn add_managed(&self, cert: Certificate, domain: &str) -> Result<()> {
-        self.publish_prepared(None, cert, Some(domain)).await
+        self.publish_prepared(None, cert, Some(domain), None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Publish management only while the queued revocation observation still
+    /// belongs to a managed entry. Verified revocation of an existing incoming
+    /// leaf is retained even if this observation has been withdrawn.
+    pub(crate) async fn add_managed_if_observed_revoked(
+        &self,
+        cert: Certificate,
+        domain: &str,
+        observed_leaf: &str,
+    ) -> Result<bool> {
+        self.publish_prepared(None, cert, Some(domain), Some(observed_leaf))
+            .await
     }
 
     /// Remove a certificate by hash.
@@ -1067,7 +1090,9 @@ impl CertCache {
 
     /// Replace metadata and the prebuilt serving key in one critical section.
     pub async fn replace(&self, old_hash: &str, new_cert: Certificate) {
-        let _ = self.publish_prepared(Some(old_hash), new_cert, None).await;
+        let _ = self
+            .publish_prepared(Some(old_hash), new_cert, None, None)
+            .await;
     }
 
     pub(crate) async fn replace_managed(
@@ -1076,8 +1101,9 @@ impl CertCache {
         cert: Certificate,
         domain: &str,
     ) -> Result<()> {
-        self.publish_prepared(Some(old_hash), cert, Some(domain))
+        self.publish_prepared(Some(old_hash), cert, Some(domain), None)
             .await
+            .map(|_| ())
     }
 
     async fn publish_prepared(
@@ -1085,7 +1111,8 @@ impl CertCache {
         old_hash: Option<&str>,
         mut cert: Certificate,
         domain: Option<&str>,
-    ) -> Result<()> {
+        observed_leaf: Option<&str>,
+    ) -> Result<bool> {
         let requires_staple = domain.is_some() && crate::ocsp::requires_ocsp_staple(&cert)?;
         // Keep a version token while preparation awaits. Holding this Arc makes
         // any concurrent OCSP metadata write use copy-on-write, so pointer
@@ -1116,7 +1143,7 @@ impl CertCache {
             .clone();
         let mut events = Vec::new();
         let mut quarantine_event = None;
-        let publication: Result<()> = (|| {
+        let publication: Result<bool> = (|| {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             if let Some(domain) = domain {
                 let now = Utc::now();
@@ -1174,6 +1201,11 @@ impl CertCache {
             if cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked) {
                 quarantine_event = state.record_verified_revocation(&cert.hash);
             }
+            if let (Some(domain), Some(observed_leaf)) = (domain, observed_leaf)
+                && !state.has_managed_ocsp_revoked_leaf(domain, observed_leaf)
+            {
+                return Ok(false);
+            }
             if let Some(current) = state.certificates.get(&cert.hash)
                 && ((requires_staple && old_hash != Some(cert.hash.as_str()))
                     || (old_hash == Some(cert.hash.as_str())
@@ -1229,20 +1261,20 @@ impl CertCache {
             {
                 entry.ari_unpersisted = ari_unpersisted;
             }
-            Ok(())
+            Ok(true)
         })();
         // A later managed-readiness guard may reject publication after an
         // authenticated revocation has quarantined the existing entry. Still
         // publish that status/deadline change. Successful add/replace already
         // emits its normal events, without an extra duplicate Updated event.
-        if publication.is_err()
+        if !matches!(&publication, Ok(true))
             && let Some(event) = quarantine_event
         {
             events.push(event);
         }
         self.notify_ocsp_schedule();
         dispatch_events(&options, events);
-        if publication.is_ok() && domain.is_some() {
+        if matches!(&publication, Ok(true)) && domain.is_some() {
             let _ = self.ari_schedule_changed.send(AriChange {
                 hash: published_hash,
                 reload: true,
@@ -1409,13 +1441,7 @@ impl CertCache {
         self.state
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .matching(name)
-            .into_iter()
-            .any(|entry| {
-                entry.certificate.managed
-                    && entry.leaf_hash.as_deref() == Some(leaf_hash)
-                    && entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
-            })
+            .has_managed_ocsp_revoked_leaf(name, leaf_hash)
     }
 
     /// Client authentication uses the certificate metadata, independently of

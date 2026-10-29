@@ -44,11 +44,19 @@ use crate::ocsp::{OcspConfig, OcspStatus, staple_ocsp};
 use crate::policy::{CertificateSelector, IssuerPolicy, Policy};
 use crate::storage::{CertificateResource, Storage, acquire};
 
+#[cfg(test)]
+mod replacement_recovery_tests;
+
 /// Callback invoked on notable lifecycle events.
 type EventCallback = Arc<dyn Fn(&str, &serde_json::Value) -> Result<()> + Send + Sync>;
 
 /// Transform applied to domain names before obtaining certificates.
 type SubjectTransformer = Arc<dyn Fn(&str) -> Result<String> + Send + Sync>;
+
+struct ManagedCertificatePlan {
+    needs_renewal: bool,
+    revoked: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Event name constants
@@ -736,64 +744,13 @@ impl CertManager {
         // Planning may read an expired/future resource for its SANs and issuer,
         // but those credentials must not be published before renewal succeeds.
         match self.load_stored_certificate(domain).await {
-            Ok(mut cert) => {
-                let current = Self::validate_certificate_time(&cert, domain).is_ok();
-                let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
-                let cached_revoked = leaf_hash
-                    .as_deref()
-                    .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
-                let mut revoked =
-                    matches!(cert.ocsp_status, Some(OcspStatus::Revoked)) || cached_revoked;
-                if cached_revoked {
-                    cert.ocsp_status = Some(OcspStatus::Revoked);
-                    cert.ocsp_response = None;
-                }
-                let mut needs_action = !current
-                    || crate::ari::needs_renewal(
-                        &cert,
-                        self.policy.renewal_window_ratio,
-                        self.policy.disable_ari,
-                    )
-                    || revoked;
-                if current {
-                    // Readiness for serving is distinct from eligibility for
-                    // renewal. Apply admission first so a known revocation
-                    // still quarantines the existing same-hash entry, then let
-                    // a due/OCSP-revoked Must-Staple leaf supply renewal metadata
-                    // even when its required Good response is unavailable.
-                    let must_staple = crate::ocsp::requires_ocsp_staple(&cert)?;
-                    let hash = cert.hash.clone();
-                    let admission = self.cache_loaded_certificate(cert, domain).await;
-                    // Admission reconciles sticky state atomically. A stored
-                    // Good response may be older than a confirmed cache
-                    // revocation, including one received during preparation.
-                    let cached_revoked = leaf_hash
-                        .as_deref()
-                        .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
-                    if cached_revoked {
-                        revoked = true;
-                        // Close a revocation arriving after admission before
-                        // awaiting the CA; do not leave an admitted alternate
-                        // chain serving while a replacement is obtained.
-                        if admission.is_ok() {
-                            self.cache
-                                .update_ocsp_if_present(&hash, Some(OcspStatus::Revoked), None)
-                                .await;
-                        }
-                    }
-                    needs_action |= revoked;
-                    match admission {
-                        Ok(_) => {}
-                        Err(Error::Cert(CertError::OcspFailed(_)))
-                            if needs_action && must_staple => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                if needs_action {
+            Ok(cert) => {
+                let plan = self.plan_managed_certificate(cert, domain, None).await?;
+                if plan.needs_renewal {
                     if r#async {
-                        self.renew_in_background(domain, revoked).await?;
+                        self.renew_in_background(domain, plan.revoked).await?;
                     } else {
-                        self.renew(domain, revoked).await?;
+                        self.renew(domain, plan.revoked).await?;
                     }
                     // renew publishes its validated replacement before return.
                 }
@@ -813,6 +770,74 @@ impl CertManager {
         }
     }
 
+    fn certificate_needs_renewal(&self, cert: &Certificate) -> bool {
+        cert.not_before > chrono::Utc::now()
+            || cert.expired()
+            || crate::ari::needs_renewal(
+                cert,
+                self.policy.renewal_window_ratio,
+                self.policy.disable_ari,
+            )
+    }
+
+    /// Serving admission must not hide renewal inputs for a due or verified
+    /// revoked Must-Staple leaf. Use the same plan for initial management and
+    /// the current resource encountered by a delayed maintenance callback.
+    async fn plan_managed_certificate(
+        &self,
+        mut cert: Certificate,
+        domain: &str,
+        observed_leaf: Option<&str>,
+    ) -> Result<ManagedCertificatePlan> {
+        let current = Self::validate_certificate_time(&cert, domain).is_ok();
+        let leaf_hash = crate::storage::certificate_leaf_hash(&cert);
+        let cached_revoked = leaf_hash
+            .as_deref()
+            .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
+        let mut revoked = cert.ocsp_status == Some(OcspStatus::Revoked) || cached_revoked;
+        if cached_revoked {
+            cert.ocsp_status = Some(OcspStatus::Revoked);
+            cert.ocsp_response = None;
+        }
+        let mut needs_renewal = self.certificate_needs_renewal(&cert) || revoked;
+        if current {
+            let must_staple = crate::ocsp::requires_ocsp_staple(&cert)?;
+            let hash = cert.hash.clone();
+            let admission = self
+                .cache_loaded_certificate_observing(&cert, domain, observed_leaf)
+                .await;
+            if matches!(&admission, Ok(false)) {
+                return Ok(ManagedCertificatePlan {
+                    needs_renewal: false,
+                    revoked: false,
+                });
+            }
+            // Admission can reconcile a revocation received while preparing
+            // the signing key; never await issuance with that leaf serving.
+            let cached_revoked = leaf_hash
+                .as_deref()
+                .is_some_and(|hash| self.cache.has_ocsp_revoked_leaf(domain, hash));
+            if cached_revoked {
+                revoked = true;
+                if admission.is_ok() {
+                    self.cache
+                        .update_ocsp_if_present(&hash, Some(OcspStatus::Revoked), None)
+                        .await;
+                }
+            }
+            needs_renewal |= revoked;
+            match admission {
+                Ok(_) => {}
+                Err(Error::Cert(CertError::OcspFailed(_))) if needs_renewal && must_staple => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ManagedCertificatePlan {
+            needs_renewal,
+            revoked,
+        })
+    }
+
     /// Load a managed certificate from storage and add it to the in-memory
     /// cache. A future or expired certificate returns a validity error without
     /// replacing any working certificate already in the cache.
@@ -826,13 +851,36 @@ impl CertManager {
         cert: Certificate,
         domain: &str,
     ) -> Result<Certificate> {
-        Self::validate_certificate_time(&cert, domain)?;
-        self.cache.add_managed(cert.clone(), domain).await?;
-        let _ = self.emit(
-            EVENT_CACHED_MANAGED_CERT,
-            &serde_json::json!({"sans": cert.names}),
-        );
+        self.cache_loaded_certificate_observing(&cert, domain, None)
+            .await?;
         Ok(cert)
+    }
+
+    async fn cache_loaded_certificate_observing(
+        &self,
+        cert: &Certificate,
+        domain: &str,
+        observed_leaf: Option<&str>,
+    ) -> Result<bool> {
+        Self::validate_certificate_time(cert, domain)?;
+        let published = match observed_leaf {
+            Some(leaf) => {
+                self.cache
+                    .add_managed_if_observed_revoked(cert.clone(), domain, leaf)
+                    .await?
+            }
+            None => {
+                self.cache.add_managed(cert.clone(), domain).await?;
+                true
+            }
+        };
+        if published {
+            let _ = self.emit(
+                EVENT_CACHED_MANAGED_CERT,
+                &serde_json::json!({"sans": cert.names}),
+            );
+        }
+        Ok(published)
     }
 
     fn validate_certificate_time(cert: &Certificate, domain: &str) -> Result<()> {
@@ -849,16 +897,26 @@ impl CertManager {
     /// resources remain usable as renewal inputs; revocation checks still apply.
     async fn load_stored_certificate(&self, domain: &str) -> Result<Certificate> {
         let cert_res = self.load_cert_resource_any_issuer(domain).await?;
-        let mut cert = self.validated_certificate(&cert_res, domain).await?;
+        self.certificate_for_planning(&cert_res, domain).await
+    }
+
+    async fn certificate_for_planning(
+        &self,
+        cert_res: &CertificateResource,
+        domain: &str,
+    ) -> Result<Certificate> {
+        let mut cert = self.validated_certificate(cert_res, domain).await?;
         cert.managed = true;
         cert.issuer_key = cert_res.issuer_key.clone();
-        crate::ari::attach_cached(
-            self.storage.as_ref(),
-            &self.cache,
-            &mut cert,
-            self.policy.disable_ari,
-        )
-        .await;
+        if cert.ocsp_status != Some(OcspStatus::Revoked) {
+            crate::ari::attach_cached(
+                self.storage.as_ref(),
+                &self.cache,
+                &mut cert,
+                self.policy.disable_ari,
+            )
+            .await;
+        }
         Ok(cert)
     }
 
@@ -1353,9 +1411,9 @@ impl CertManager {
             .await
     }
 
-    /// A delayed OCSP request may only force the leaf it actually observed.
-    /// Recheck shared storage after both lifecycle locks, since another manager
-    /// may have renewed it while this request waited in the maintenance queue.
+    /// Re-evaluate the current resource for a delayed OCSP recovery request.
+    /// A healthy replacement is only reloaded; a replacement independently
+    /// verified revoked or due uses its own renewal plan under lifecycle locks.
     pub(crate) async fn renew_observed_revocation(
         &self,
         domain: &str,
@@ -1383,8 +1441,56 @@ impl CertManager {
                 return Ok(());
             }
             if leaf != observed_leaf {
-                self.cache_certificate(domain).await?;
-                return Ok(());
+                let cert = self.certificate_for_planning(&current, domain).await;
+                // A verified status is useful independently of the authority
+                // to keep managing A. Preserve it for an already cached B even
+                // if later identity/observation checks make this job stale.
+                if let Ok(cert) = &cert
+                    && cert.ocsp_status == Some(OcspStatus::Revoked)
+                {
+                    let _ = self
+                        .cache
+                        .update_ocsp_if_present(&cert.hash, Some(OcspStatus::Revoked), None)
+                        .await;
+                }
+                // OCSP and ARI can await storage or a remote responder. Recheck
+                // the selected identity before admission, and again afterwards
+                // because key preparation can also await issuer discovery.
+                let latest = self.load_cert_resource_for_operation(domain, true).await?;
+                if crate::storage::resource_leaf_hash(&latest)? != leaf
+                    || latest.issuer_key != current.issuer_key
+                {
+                    drop(leaf_lock);
+                    continue;
+                }
+                if !self
+                    .cache
+                    .has_managed_ocsp_revoked_leaf(domain, observed_leaf)
+                {
+                    return Ok(());
+                }
+                let plan = self
+                    .plan_managed_certificate(cert?, domain, Some(observed_leaf))
+                    .await;
+                let latest = self.load_cert_resource_for_operation(domain, true).await?;
+                if crate::storage::resource_leaf_hash(&latest)? != leaf
+                    || latest.issuer_key != current.issuer_key
+                {
+                    drop(leaf_lock);
+                    continue;
+                }
+                if !self
+                    .cache
+                    .has_managed_ocsp_revoked_leaf(domain, observed_leaf)
+                {
+                    return Ok(());
+                }
+                let plan = plan?;
+                return if plan.needs_renewal {
+                    self.do_renew(domain, plan.revoked).await
+                } else {
+                    Ok(())
+                };
             }
             // Maintenance uses one foreground attempt, without long background
             // retry/backoff while holding these locks.
@@ -1435,30 +1541,15 @@ impl CertManager {
         // Explicit forced renewal may use a quarantined resource only as the
         // source of its SANs/key policy. It is never republished, and validation
         // of the replacement still rejects the old leaf or another banned leaf.
-        let mut cert = if force {
+        let cert = if force {
             Self::parse_managed_certificate(&cert_res, domain)?
         } else {
-            self.validated_certificate(&cert_res, domain).await?
+            self.certificate_for_planning(&cert_res, domain).await?
         };
-        if !force && cert.ocsp_status != Some(OcspStatus::Revoked) {
-            crate::ari::attach_cached(
-                self.storage.as_ref(),
-                &self.cache,
-                &mut cert,
-                self.policy.disable_ari,
-            )
-            .await;
-        }
         // Maintenance may have rejected an unusable storage replacement. Do
         // not let its normal renewal callback republish a future certificate
         // through the "already renewed" shortcut below.
-        let needs_renewal = cert.not_before > chrono::Utc::now()
-            || cert.expired()
-            || crate::ari::needs_renewal(
-                &cert,
-                self.policy.renewal_window_ratio,
-                self.policy.disable_ari,
-            );
+        let needs_renewal = self.certificate_needs_renewal(&cert);
 
         // Renew all actual DNS/IP SANs, including managed overlaps that would
         // otherwise lose coverage. CNs, URIs and email SANs are not TLS names.
