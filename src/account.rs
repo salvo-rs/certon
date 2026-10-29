@@ -258,7 +258,7 @@ fn legacy_account_keys(issuer: &str, email: &str) -> [String; 3] {
 }
 
 fn account_migration_required() -> crate::Error {
-    AcmeError::Account("an account exists in an unbound legacy CA namespace; explicitly migrate it with the original account key/registration after confirming its directory endpoint".into()).into()
+    crate::Error::Config("an account exists in an unbound legacy CA namespace; explicitly call account::migrate_account_ca_identity with the original account key/registration after confirming its directory endpoint".into())
 }
 
 async fn account_bytes(storage: &dyn Storage, key: &str) -> Result<Option<Vec<u8>>> {
@@ -279,7 +279,7 @@ fn read_bound_snapshot(bytes: &[u8], ca_url: &str, email: &str) -> Result<AcmeAc
         || !snapshot.configured_email.present
         || snapshot.configured_email.value != canonical_account_email(email)
     {
-        return Err(AcmeError::Account("account snapshot is bound to a different CA endpoint or configured identity, or lacks its required binding".into()).into());
+        return Err(crate::Error::Config("account snapshot is bound to a different CA endpoint or configured identity, or lacks its required binding".into()));
     }
     validate_account(snapshot.registration, snapshot.private_key_pem)
 }
@@ -302,10 +302,9 @@ async fn discovered_account(
     }
     let email = snapshot.configured_email.value;
     if storage_key_account_snapshot(issuer, email.as_deref().unwrap_or_default()) != key {
-        return Err(AcmeError::Account(
+        return Err(crate::Error::Config(
             "discovered account snapshot is in another configured identity's slot".into(),
-        )
-        .into());
+        ));
     }
     let account = read_bound_snapshot(&bytes, ca_url, email.as_deref().unwrap_or_default())?;
     Ok(Some((email, account)))
@@ -407,10 +406,9 @@ pub(crate) async fn retired_account_matches(
         || receipt.source_issuer != source
         || receipt.source_email != normalise_email(email)
     {
-        return Err(AcmeError::Account(
+        return Err(crate::Error::Config(
             "account migration receipt lacks its required identity binding".into(),
-        )
-        .into());
+        ));
     }
     Ok(receipt.location == account.location
         && receipt.public_key_identity == public_account_identity(account)?)

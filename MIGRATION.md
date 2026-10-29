@@ -859,7 +859,9 @@ default ports and dot segments normalize together. Certificate and account
 storage use an additional versioned directory level, so an old URL-derived
 slug cannot masquerade as a new digest identity. Account locks use that same
 separate namespace. Ordinary custom issuer keys and fixed ZeroSSL wrapper keys
-are unchanged.
+are unchanged. The exact `_certon-ca-v2/<64 lowercase hexadecimal characters>`
+identity syntax is now reserved for this namespace; custom issuers must not
+choose that syntax for an unrelated provider.
 
 Existing ACME accounts and certificate resources are **not automatically
 adopted**. Old records do not identify which full directory endpoint owned their

@@ -51,12 +51,11 @@ async fn legacy_migration_requires_proof_and_does_not_adopt_another_endpoint() {
     let storage = Arc::new(FileStorage::new(directory.path()));
     let original = account("https://ca.example:8443/account/old");
     let bytes = old_account(storage.as_ref(), CA, EMAIL, &original).await;
+    let needs_migration = get_account(storage.as_ref(), CA, EMAIL).await.unwrap_err();
+    assert!(needs_migration.to_string().contains("migrate"));
     assert!(
-        get_account(storage.as_ref(), CA, EMAIL)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("migrate")
+        !certon::async_jobs::should_retry(&needs_migration),
+        "operator migration cannot be repaired by background CA retries"
     );
     assert!(
         get_account(storage.as_ref(), OTHER_CA, EMAIL)
@@ -477,4 +476,40 @@ async fn migration_retry_preserves_current_destination_metadata() {
     assert_eq!(loaded.status, current.status);
     assert_eq!(loaded.contact, current.contact);
     assert_eq!(public_identity(&loaded), public_identity(&original));
+}
+
+#[tokio::test]
+async fn unbound_split_files_under_the_new_ca_need_explicit_upgrade_too() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let original = account("https://ca.example:8443/account/imported");
+    let prefix = certon::storage::account_key_prefix(&certon::storage::issuer_key(CA), EMAIL);
+    let registration = format!("{prefix}/operator.json");
+    let private_key = format!("{prefix}/operator.key");
+    storage
+        .store(&registration, &serde_json::to_vec(&original).unwrap())
+        .await
+        .unwrap();
+    assert!(get_account(storage.as_ref(), CA, EMAIL).await.is_err());
+    storage
+        .store(&private_key, original.private_key_pem.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        get_account(storage.as_ref(), CA, EMAIL)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("migrate")
+    );
+    migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original)
+        .await
+        .unwrap();
+    let loaded = get_account(storage.as_ref(), CA, EMAIL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(public_identity(&loaded), public_identity(&original));
+    assert!(storage.exists(&registration).await.unwrap());
+    assert!(storage.exists(&private_key).await.unwrap());
 }

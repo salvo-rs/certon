@@ -367,6 +367,20 @@ fn issuer_namespace(issuer: &str) -> String {
     }
 }
 
+pub(crate) fn certificate_site_parts(site: &str) -> Option<(String, &str)> {
+    let path = site.strip_prefix("certificates/")?;
+    if let Some(versioned) = path.strip_prefix("_certon-ca-v2/")
+        && let Some((hash, folder)) = versioned.split_once('/')
+    {
+        let issuer = format!("_certon-ca-v2/{hash}");
+        if ca_identity_digest(&issuer).is_some() {
+            return Some((issuer, folder));
+        }
+    }
+    let (issuer, folder) = path.split_once('/')?;
+    Some((issuer.into(), folder))
+}
+
 pub(crate) fn lock_storage_identity(name: &str) -> String {
     // A slash-bearing v2 identity has a distinct lock namespace too: an old
     // URL-derived slug must not alias it after generic filename sanitization.

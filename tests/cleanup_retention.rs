@@ -117,6 +117,51 @@ async fn assert_resource(storage: &dyn Storage, expected: &CertificateResource) 
 }
 
 #[tokio::test]
+async fn versioned_ca_namespaces_keep_expired_certificate_cleanup_working() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(directory.path());
+    let issuer = certon::storage::issuer_key("https://ca.example:8443/directory?tenant=one");
+    let long = format!(
+        "*.{}.{}.{}.{}",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(57)
+    );
+    for name in ["expired.example", long.as_str()] {
+        let mut expired = resource(name, Utc::now() - chrono::Duration::days(7));
+        expired.issuer_key = issuer.clone();
+        certon::storage::store_certificate(&storage, &issuer, &expired)
+            .await
+            .unwrap();
+    }
+    let mut fresh = resource("fresh.example", Utc::now() + chrono::Duration::days(7));
+    fresh.issuer_key = issuer.clone();
+    certon::storage::store_certificate(&storage, &issuer, &fresh)
+        .await
+        .unwrap();
+    let result = clean_storage(&storage, &CleanStorageOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_certs, 2);
+    for name in ["expired.example", long.as_str()] {
+        assert!(matches!(
+            certon::storage::load_certificate(&storage, &issuer, name).await,
+            Err(certon::Error::Storage(
+                certon::error::StorageError::NotFound(_)
+            ))
+        ));
+    }
+    assert_eq!(
+        certon::storage::load_certificate(&storage, &issuer, "fresh.example")
+            .await
+            .unwrap()
+            .certificate_pem,
+        fresh.certificate_pem
+    );
+}
+
+#[tokio::test]
 async fn maximum_retention_preserves_snapshots_legacy_credentials_and_staples() {
     let directory = tempfile::tempdir().unwrap();
     let mut storage = TestStorage::new(directory.path());
