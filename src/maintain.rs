@@ -288,9 +288,9 @@ pub fn start_maintenance(
 
 /// Start maintenance using the manager's certificate store and renewal policy.
 /// Each loop has an independent four-execution, 68-admitted expiration-renewal
-/// budget. OCSP uses eight concurrent refreshes and an independent force-renewal
-/// queue with four executions and 64 waiting requests. Saturation is logged and
-/// retried on the certificate's next OCSP deadline. Stopping drops in-flight
+/// budget, including each job's storage preflight. OCSP uses eight concurrent refreshes and an
+/// independent force-renewal queue with four executions and 64 waiting requests. Saturation is
+/// logged and retried on the certificate's next OCSP deadline. Stopping drops in-flight
 /// refreshes and force-renewals, then awaits expiration jobs' cleanup.
 ///
 /// Custom callbacks receive the domain observed at dispatch. They must recheck
@@ -647,7 +647,7 @@ async fn read_revocation(
 /// (e.g. in a multi-instance deployment). If the stored certificate does
 /// not need renewal, it is reloaded into the cache instead of re-issuing.
 async fn check_renewals_with_policy(
-    cache: &CertCache,
+    cache: &Arc<CertCache>,
     policy: &RenewalPolicy,
     job_queue: &JobQueue,
 ) {
@@ -692,51 +692,36 @@ async fn check_renewals_with_policy(
             }
         };
 
-        // Multi-instance coordination: check if the certificate in storage
-        // has already been renewed by another instance.
-        if try_reload_from_storage(
-            cache,
-            policy.certificates.as_ref(),
-            policy.revocations.as_ref(),
-            cert,
-            &domain,
-            policy.ratio,
-            policy
-                .ari_manager
-                .as_ref()
-                .is_some_and(|manager| manager.policy.disable_ari),
-        )
-        .await
-        {
-            continue;
-        }
-
-        info!(
-            domain = %domain,
-            hash = %cert.hash,
-            expired = cert.expired(),
-            "maintenance: certificate needs renewal",
-        );
-
-        // Submit renewal through the JobQueue for deduplication.
-        // If a renewal for this domain is already in progress, the
-        // submission is silently ignored.
+        // Admission and execution cover storage preflight as well as issuance.
+        // A slow store for one domain cannot serialize all other due domains.
         let job_name = format!("renew_{}", domain);
-        let domain_clone = domain.clone();
-        let renew = Arc::clone(&policy.renew);
+        let cache = Arc::clone(cache);
+        let policy = policy.clone();
+        let snapshot = Arc::clone(cert);
 
         job_queue
             .submit(job_name, move || async move {
-                match renew(domain_clone.clone(), RenewalReason::Expiring).await {
+                let Some(current) = current_renewal_candidate(&cache, &snapshot, &domain, &policy) else { return; };
+                // Check cross-instance replacements only after taking an
+                // execution slot. Publication rechecks management atomically.
+                if try_reload_from_storage(
+                    &cache, policy.certificates.as_ref(), policy.revocations.as_ref(),
+                    &current, &domain, policy.ratio,
+                    policy.ari_manager.as_ref().is_some_and(|manager| manager.policy.disable_ari),
+                ).await || current_renewal_candidate(&cache, &current, &domain, &policy).is_none() {
+                    return;
+                }
+                info!(domain = %domain, hash = %current.hash, expired = current.expired(), "maintenance: certificate needs renewal");
+                match (policy.renew)(domain.clone(), RenewalReason::Expiring).await {
                     Ok(()) => {
                         info!(
-                            domain = %domain_clone,
+                            domain = %domain,
                             "maintenance: certificate renewed successfully",
                         );
                     }
                     Err(e) => {
                         error!(
-                            domain = %domain_clone,
+                            domain = %domain,
                             error = %e,
                             "maintenance: certificate renewal failed",
                         );
@@ -745,6 +730,27 @@ async fn check_renewals_with_policy(
             })
             .await;
     }
+}
+
+fn current_renewal_candidate(
+    cache: &CertCache,
+    snapshot: &Certificate,
+    domain: &str,
+    policy: &RenewalPolicy,
+) -> Option<Arc<Certificate>> {
+    cache.managed_certificate(&snapshot.hash).filter(|current| {
+        current.issuer_key == snapshot.issuer_key
+            && current.names.first().is_some_and(|name| name == domain)
+            && (current.not_before > chrono::Utc::now()
+                || crate::ari::needs_renewal(
+                    current,
+                    policy.ratio,
+                    policy
+                        .ari_manager
+                        .as_ref()
+                        .is_some_and(|manager| manager.policy.disable_ari),
+                ))
+    })
 }
 
 /// Check storage for a certificate that may have been renewed by another
@@ -798,9 +804,14 @@ async fn try_reload_from_storage(
             "maintenance: certificate already renewed by another instance; reloading from storage",
         );
         return cache
-            .replace_managed(&cached_cert.hash, stored_cert, domain)
+            .replace_managed_if_current(
+                &cached_cert.hash,
+                stored_cert,
+                domain,
+                &cached_cert.issuer_key,
+            )
             .await
-            .is_ok();
+            .unwrap_or(false);
     }
 
     false
@@ -1213,6 +1224,9 @@ fn normalize_interval(interval: Duration, default: Duration) -> Duration {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod preflight_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2078,7 +2092,9 @@ mod tests {
             certificates: store,
             renew: Arc::new(|_, _| panic!("fresh certificate must be reloaded rather than issued")),
         };
-        check_renewals_with_policy(&cache, &policy, &JobQueue::new("reload")).await;
+        let jobs = JobQueue::new("reload");
+        check_renewals_with_policy(&cache, &policy, &jobs).await;
+        jobs.wait("renew_example.com").await;
         let current = cache.get_all().await;
         assert_eq!(current.len(), 1);
         assert_ne!(current[0].hash, old.hash);
@@ -2383,7 +2399,7 @@ mod tests {
 
     #[tokio::test]
     async fn saturated_maintenance_can_stop_and_drops_never_completing_renewals() {
-        use crate::async_jobs::{CERTIFICATE_JOB_CONCURRENCY, CERTIFICATE_JOB_PENDING};
+        use crate::async_jobs::CERTIFICATE_JOB_CONCURRENCY;
 
         #[derive(Debug)]
         struct AbsentStore(Arc<AtomicUsize>);
@@ -2449,9 +2465,8 @@ mod tests {
             Arc::new(AbsentStore(loads.clone())),
             DEFAULT_RENEWAL_WINDOW_RATIO,
         );
-        let capacity = CERTIFICATE_JOB_CONCURRENCY + CERTIFICATE_JOB_PENDING;
         tokio::time::timeout(Duration::from_secs(2), async {
-            while loads.load(Ordering::SeqCst) < capacity + 1
+            while loads.load(Ordering::SeqCst) < CERTIFICATE_JOB_CONCURRENCY
                 || active.load(Ordering::SeqCst) < CERTIFICATE_JOB_CONCURRENCY
             {
                 tokio::time::sleep(Duration::from_millis(1)).await;
@@ -2461,8 +2476,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             loads.load(Ordering::SeqCst),
-            capacity + 1,
-            "scan must backpressure at the first unadmitted renewal"
+            CERTIFICATE_JOB_CONCURRENCY,
+            "preflight must share the execution budget with renewal"
         );
         assert_eq!(
             constructed.load(Ordering::SeqCst),
@@ -2502,7 +2517,7 @@ mod tests {
         .await
         .expect("saturated renewal scan starved OCSP refresh");
         assert_eq!(cache.resolve(&domain).unwrap().key.ocsp, Some(response));
-        assert_eq!(loads.load(Ordering::SeqCst), capacity + 1);
+        assert_eq!(loads.load(Ordering::SeqCst), CERTIFICATE_JOB_CONCURRENCY);
         tokio::time::timeout(Duration::from_secs(1), cache.stop_and_wait())
             .await
             .unwrap();

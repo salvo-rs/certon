@@ -171,8 +171,12 @@ Certificate lifecycle corrections:
   `renew_in_background`, and arbitrary public `JobQueue::submit` futures keep
   their existing semantics.
 - Each maintenance loop has a separate four-execution, 68-admitted expiration
-  renewal budget. These are not process-wide limits: foreground operations,
-  handshake on-demand work, and sequential OCSP force-renewals are independent.
+  renewal budget, including storage preflight and per-domain deduplication.
+  A slow preflight holds one execution slot rather than blocking the scan.
+  Queued jobs recheck current management and renewal eligibility before doing
+  I/O and before calling renewal; a withdrawn or replaced identity cannot be
+  reintroduced by a delayed reload. These are not process-wide limits:
+  foreground operations, handshake on-demand work, and OCSP force-renewals are independent.
   Renewal admission cannot block OCSP checks. Stopping maintenance cancels
   waiting submissions, aborts admitted renewals, and awaits their cleanup.
   Owned revocation workers still continue if their caller is dropped.

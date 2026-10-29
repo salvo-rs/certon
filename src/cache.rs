@@ -198,6 +198,11 @@ pub(crate) struct AriChange {
     pub reload: bool,
 }
 
+enum ManagedObservation<'a> {
+    RevokedLeaf(&'a str),
+    ManagedHash { hash: &'a str, issuer: &'a str },
+}
+
 /// An in-memory certificate cache that indexes certificates by subject name
 /// for efficient TLS handshake lookups.
 ///
@@ -793,6 +798,10 @@ impl CertCache {
     }
 
     pub(crate) fn ari_certificate(&self, hash: &str) -> Option<Arc<Certificate>> {
+        self.managed_certificate(hash)
+    }
+
+    pub(crate) fn managed_certificate(&self, hash: &str) -> Option<Arc<Certificate>> {
         self.state
             .read()
             .unwrap_or_else(|error| error.into_inner())
@@ -1024,8 +1033,32 @@ impl CertCache {
         domain: &str,
         observed_leaf: &str,
     ) -> Result<bool> {
-        self.publish_prepared(None, cert, Some(domain), Some(observed_leaf))
-            .await
+        self.publish_prepared(
+            None,
+            cert,
+            Some(domain),
+            Some(ManagedObservation::RevokedLeaf(observed_leaf)),
+        )
+        .await
+    }
+
+    pub(crate) async fn replace_managed_if_current(
+        &self,
+        old_hash: &str,
+        cert: Certificate,
+        domain: &str,
+        issuer: &str,
+    ) -> Result<bool> {
+        self.publish_prepared(
+            Some(old_hash),
+            cert,
+            Some(domain),
+            Some(ManagedObservation::ManagedHash {
+                hash: old_hash,
+                issuer,
+            }),
+        )
+        .await
     }
 
     /// Remove a certificate by hash.
@@ -1111,7 +1144,7 @@ impl CertCache {
         old_hash: Option<&str>,
         mut cert: Certificate,
         domain: Option<&str>,
-        observed_leaf: Option<&str>,
+        observation: Option<ManagedObservation<'_>>,
     ) -> Result<bool> {
         let requires_staple = domain.is_some() && crate::ocsp::requires_ocsp_staple(&cert)?;
         // Keep a version token while preparation awaits. Holding this Arc makes
@@ -1201,10 +1234,26 @@ impl CertCache {
             if cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked) {
                 quarantine_event = state.record_verified_revocation(&cert.hash);
             }
-            if let (Some(domain), Some(observed_leaf)) = (domain, observed_leaf)
-                && !state.has_managed_ocsp_revoked_leaf(domain, observed_leaf)
-            {
-                return Ok(false);
+            if let (Some(domain), Some(observation)) = (domain, observation) {
+                let still_managed = match observation {
+                    ManagedObservation::RevokedLeaf(leaf) => {
+                        state.has_managed_ocsp_revoked_leaf(domain, leaf)
+                    }
+                    ManagedObservation::ManagedHash { hash, issuer } => {
+                        state.certificates.get(hash).is_some_and(|entry| {
+                            entry.certificate.managed
+                                && entry.certificate.issuer_key == issuer
+                                && entry
+                                    .certificate
+                                    .names
+                                    .first()
+                                    .is_some_and(|name| name == domain)
+                        })
+                    }
+                };
+                if !still_managed {
+                    return Ok(false);
+                }
             }
             if let Some(current) = state.certificates.get(&cert.hash)
                 && ((requires_staple && old_hash != Some(cert.hash.as_str()))
