@@ -627,3 +627,270 @@ async fn acme_revocation_retries_confirmation_failure_and_cleans_up_already_revo
         );
     }
 }
+
+#[tokio::test]
+async fn identity_contacts_can_change_or_clear_without_registering_again() {
+    for contact_mode in [0, 1, 2] {
+        let server = Server::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(directory.path()));
+        let ca = format!("{}/directory", server.url);
+        for _ in 0..2 {
+            let issuer = AcmeIssuer::builder()
+                .ca(&ca)
+                .test_ca(&ca)
+                .storage(storage.clone())
+                .email("original@example.com")
+                .agreed(true)
+                .new_account_func(Arc::new(move |account| {
+                    if contact_mode == 1 {
+                        account.contact = vec!["mailto:replacement@example.com".into()];
+                    }
+                    if contact_mode == 2 {
+                        account.contact.clear();
+                    }
+                }))
+                .build();
+            issuer
+                .issue(b"csr", &["review.example.com".into()])
+                .await
+                .unwrap();
+        }
+        let requests = server.requests.lock().unwrap();
+        let registrations = requests
+            .iter()
+            .filter(|request| request.path == "/new-account")
+            .count();
+        let keys: std::collections::HashSet<_> = requests
+            .iter()
+            .filter(|request| request.path == "/new-account")
+            .map(|request| request.protected["jwk"].to_string())
+            .collect();
+        eprintln!(
+            "contact_mode={contact_mode} registrations={registrations} keys={}",
+            keys.len()
+        );
+        assert_eq!(
+            registrations, 1,
+            "recreating an issuer must preserve its account identity"
+        );
+        assert_eq!(keys.len(), 1);
+    }
+}
+
+fn contact_issuer(
+    server: &Server,
+    storage: Arc<dyn certon::Storage>,
+    key: Option<String>,
+    clear: bool,
+) -> AcmeIssuer {
+    let ca = format!("{}/directory", server.url);
+    let mut builder = AcmeIssuer::builder()
+        .ca(&ca)
+        .test_ca(&ca)
+        .storage(storage)
+        .email("original@example.com")
+        .agreed(true)
+        .new_account_func(Arc::new(move |account| {
+            account.contact = if clear {
+                Vec::new()
+            } else {
+                vec!["mailto:replacement@example.com".into()]
+            };
+        }));
+    if let Some(key) = key {
+        builder = builder.account_key_pem(key);
+    }
+    builder.build()
+}
+
+#[tokio::test]
+async fn identity_matching_legacy_contact_and_key_migrate_without_registration() {
+    for clear in [false, true] {
+        let server = Server::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(directory.path()));
+        let ca = format!("{}/directory", server.url);
+        let email = if clear { "" } else { "replacement@example.com" };
+        let mut legacy = certon::account::new_account(email, KeyType::EcdsaP256).unwrap();
+        legacy.status = "valid".into();
+        legacy.location = format!("{}/account/legacy", server.url);
+        certon::account::save_account(storage.as_ref(), &ca, &legacy)
+            .await
+            .unwrap();
+        let decoded = certon::crypto::decode_private_key_pem(&legacy.private_key_pem).unwrap();
+        let pkcs8 = pem::encode(&pem::Pem::new("PRIVATE KEY", decoded.pkcs8_der().to_vec()));
+        assert_ne!(
+            pkcs8, legacy.private_key_pem,
+            "fixture must compare equivalent PEM encodings"
+        );
+        for _ in 0..2 {
+            let issuer = contact_issuer(&server, storage.clone(), Some(pkcs8.clone()), clear);
+            issuer
+                .issue(b"csr", &["review.example.com".into()])
+                .await
+                .unwrap();
+        }
+        let canonical = certon::account::get_account(storage.as_ref(), &ca, "original@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canonical.location, legacy.location);
+        assert_eq!(canonical.private_key_pem, legacy.private_key_pem);
+        assert!(
+            certon::account::get_account(storage.as_ref(), &ca, email)
+                .await
+                .unwrap()
+                .is_some(),
+            "legacy alias remains readable"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert!(!requests.iter().any(|r| r.path == "/new-account"));
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.path == "/new-order")
+                .all(|r| r.protected["kid"] == legacy.location)
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_mismatched_supplied_or_callback_keys_do_not_adopt_legacy_accounts() {
+    for mode in [0, 1, 2] {
+        let server = Server::start(false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FileStorage::new(directory.path()));
+        let ca = format!("{}/directory", server.url);
+        let mut legacy =
+            certon::account::new_account("replacement@example.com", KeyType::EcdsaP256).unwrap();
+        legacy.status = "valid".into();
+        legacy.location = format!("{}/account/legacy", server.url);
+        certon::account::save_account(storage.as_ref(), &ca, &legacy)
+            .await
+            .unwrap();
+        let other = certon::account::new_account("other@example.com", KeyType::EcdsaP256)
+            .unwrap()
+            .private_key_pem;
+        let mut issuer = contact_issuer(
+            &server,
+            storage.clone(),
+            if mode == 0 {
+                None
+            } else if mode == 1 {
+                Some(other.clone())
+            } else {
+                Some(legacy.private_key_pem.clone())
+            },
+            false,
+        );
+        if mode == 2 {
+            issuer.new_account_func = Some(Arc::new(move |account| {
+                account.contact = vec!["mailto:replacement@example.com".into()];
+                account.private_key_pem = other.clone();
+            }));
+        }
+        let error = issuer
+            .issue(b"csr", &["review.example.com".into()])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("different key"), "{error}");
+        assert!(
+            certon::account::get_account(storage.as_ref(), &ca, "original@example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let after = certon::account::get_account(storage.as_ref(), &ca, "replacement@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.private_key_pem, legacy.private_key_pem);
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.path == "/new-account" || r.path == "/new-order")
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_migrated_account_recovery_removes_invalid_alias_and_survives_restart() {
+    let server = Server::start(true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let ca = format!("{}/directory", server.url);
+    let mut legacy =
+        certon::account::new_account("replacement@example.com", KeyType::EcdsaP256).unwrap();
+    legacy.status = "valid".into();
+    legacy.location = format!("{}/account/old", server.url);
+    certon::account::save_account(storage.as_ref(), &ca, &legacy)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let issuer = contact_issuer(
+            &server,
+            storage.clone(),
+            Some(legacy.private_key_pem.clone()),
+            false,
+        );
+        issuer
+            .issue(b"csr", &["review.example.com".into()])
+            .await
+            .unwrap();
+    }
+    let canonical = certon::account::get_account(storage.as_ref(), &ca, "original@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(canonical.location, format!("{}/account/new", server.url));
+    assert_eq!(canonical.contact, legacy.contact);
+    assert!(
+        certon::account::get_account(storage.as_ref(), &ca, "replacement@example.com")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().filter(|r| r.path == "/new-account").count(),
+        1
+    );
+    let orders: Vec<_> = requests.iter().filter(|r| r.path == "/new-order").collect();
+    assert_eq!(orders.len(), 3);
+    assert_eq!(orders[0].protected["kid"], legacy.location);
+    assert!(
+        orders[1..]
+            .iter()
+            .all(|r| r.protected["kid"] == canonical.location)
+    );
+}
+
+#[tokio::test]
+async fn identity_concurrent_issuers_with_changed_contacts_share_one_registration() {
+    let server = Server::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let first = contact_issuer(&server, storage.clone(), None, false);
+    let second = contact_issuer(&server, storage, None, false);
+    let domains = vec!["review.example.com".into()];
+    let (a, b) = tokio::join!(
+        first.issue(b"csr", &domains),
+        second.issue(b"csr", &domains)
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/new-account")
+            .count(),
+        1
+    );
+}

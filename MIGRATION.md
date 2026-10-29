@@ -671,3 +671,35 @@ populates the confirmed SOA cache. Only successful system-resolver discoveries
 use that bounded five-minute cache; custom resolver views are uncached. Clear
 it with `clear_zone_cache` after system DNS configuration or delegation changes.
 Challenge names and overrides are normalized to lowercase fully qualified names.
+
+## ACME account identity and mutable contacts
+
+`AcmeIssuer` now consistently loads, saves and recovers an account under its
+configured email identity. Changing or clearing contacts in `new_account_func`
+does not move that storage slot, generate another account key on restart, or
+cause another instance with the same configuration to register again. Existing
+snapshots in the configured slot keep their current key; supplied keys and the
+new-account callback continue to apply only when that slot is absent. Public
+`account::save_account` and `delete_account_locally` retain their contact-based
+storage behavior and signatures.
+
+For an old account saved under a callback-modified contact, migration examines
+only that exact contact slot. It reuses the account only when the post-callback
+key has the same public identity, the stored account has a registration URI,
+and its contact identifies that legacy slot. Equivalent private-key PEM formats
+are accepted. Missing proof, mismatched keys, malformed resources or a contact
+pointing to another identity-bound slot produce an account error rather than
+guessing an account or registering a replacement. Configure the original
+`account_key_pem` (or provide the same key through the callback) to prove ownership
+when migrating an old account whose generated key otherwise cannot be inferred.
+The original alias remains readable after the complete identity snapshot is saved.
+
+An `accountDoesNotExist` response carries its failed account snapshot into
+recovery. Under the CA registration lock, recovery preserves newer stored/cache
+generations, removes only contact aliases with the same failed key and URI, and
+removes the configured snapshot last. Failed or cancelled alias cleanup can be
+retried without reviving the invalid account. Verified legacy registration/key
+pairs in either slot first receive an atomic snapshot, so interruption between
+deleting their old files retains the complete proof needed for a retry.
+Use upgraded writers for consistent
+recovery; older versions still remove accounts using their primary contact.

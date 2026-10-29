@@ -36,7 +36,10 @@ fn get_ca_rate_limiter(ca_url: &str, email: &str) -> Arc<RateLimiter> {
         .clone()
 }
 
-use crate::account::{AcmeAccount, delete_account_locally, get_or_create_account, save_account};
+use crate::account::{
+    AcmeAccount, delete_account_for_email, get_account, get_or_create_account, get_primary_contact,
+    migrate_contact_account, same_account_slot, same_registered_account, save_account_for_email,
+};
 use crate::acme_client::{
     AcmeClient, ExternalAccountBinding, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
 };
@@ -794,6 +797,12 @@ impl AcmeIssuer {
                 func(&mut acct);
             }
 
+            if let Some(legacy) =
+                migrate_contact_account(self.storage.as_ref(), ca_url, &self.email, &acct).await?
+            {
+                return Ok(legacy);
+            }
+
             // Register the account with the CA.
             info!(
                 email = %self.email,
@@ -813,7 +822,7 @@ impl AcmeIssuer {
             acct.location = location;
             acct.terms_of_service_agreed = self.agreed;
 
-            save_account(self.storage.as_ref(), ca_url, &acct).await?;
+            save_account_for_email(self.storage.as_ref(), ca_url, &self.email, &acct).await?;
 
             info!(
                 location = %acct.location,
@@ -1260,7 +1269,34 @@ impl AcmeIssuer {
         acct: &AcmeAccount,
         use_test: bool,
     ) -> Result<()> {
-        delete_account_locally(self.storage.as_ref(), ca_url, acct).await?;
+        // Match get_account's lock order: CA storage lock, then cache mutex.
+        // The failed request carries its own snapshot; a newer registration
+        // published while it was in flight must never be deleted or cleared.
+        let lock_key = format!("acme_account_{}", issuer_key(ca_url));
+        let _lock = acquire(Arc::clone(&self.storage), &lock_key).await?;
+        let current = get_account(self.storage.as_ref(), ca_url, &self.email).await?;
+        let unchanged = match &current {
+            Some(current) => same_registered_account(current, acct)?,
+            None => true,
+        };
+        if unchanged {
+            if let Some(current) = &current {
+                // A readable legacy pair needs an atomic proof before any
+                // component is deleted; a partial cleanup must stay retryable.
+                save_account_for_email(self.storage.as_ref(), ca_url, &self.email, current).await?;
+            }
+            let contact = get_primary_contact(acct);
+            if !same_account_slot(ca_url, &self.email, &contact)
+                && let Some(alias) = get_account(self.storage.as_ref(), ca_url, &contact).await?
+                && same_registered_account(&alias, acct)?
+            {
+                save_account_for_email(self.storage.as_ref(), ca_url, &contact, &alias).await?;
+                // Remove a known-invalid contact alias before its canonical
+                // slot, so failure/cancellation cannot resurrect it by migration.
+                delete_account_for_email(self.storage.as_ref(), ca_url, &contact).await?;
+            }
+            delete_account_for_email(self.storage.as_ref(), ca_url, &self.email).await?;
+        }
 
         // Clear the cached account.
         let mutex = if use_test {
@@ -1269,7 +1305,11 @@ impl AcmeIssuer {
             &self.account
         };
         let mut guard = mutex.lock().await;
-        *guard = None;
+        if let Some(cached) = guard.as_ref()
+            && same_registered_account(cached, acct)?
+        {
+            *guard = None;
+        }
 
         Ok(())
     }
@@ -1468,6 +1508,9 @@ impl Solver for SolverWrapper {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod account_identity_tests;
 
 #[cfg(test)]
 mod tests {
