@@ -215,7 +215,7 @@ pub struct CertCache {
     stop_tx: watch::Sender<bool>,
     done_tx: watch::Sender<bool>,
     maintenance_count: Mutex<usize>,
-    ocsp_changed: watch::Sender<Option<DateTime<Utc>>>,
+    ocsp_changed: watch::Sender<u64>,
 }
 
 #[derive(Default)]
@@ -227,6 +227,7 @@ struct CacheState {
     managed_hashes: Vec<String>,
     /// One indexed effective deadline per scheduled certificate.
     ocsp_deadlines: BTreeMap<DateTime<Utc>, HashSet<String>>,
+    ocsp_revision: u64,
 }
 
 struct CachedCertificate {
@@ -458,6 +459,7 @@ impl CacheState {
         if old == new {
             return;
         }
+        self.ocsp_revision = self.ocsp_revision.wrapping_add(1);
         if let Some(old) = old
             && let Some(hashes) = self.ocsp_deadlines.get_mut(&old)
         {
@@ -537,6 +539,7 @@ impl CacheState {
         }
         let hash = cert.hash.clone();
         if let Some(existing) = self.certificates.get_mut(&hash) {
+            let old_deadline = existing.ocsp_deadline();
             if cert.managed && !existing.certificate.managed {
                 let old_names = existing.certificate.names.clone();
                 let current = Arc::make_mut(&mut existing.certificate);
@@ -571,10 +574,21 @@ impl CacheState {
                         .push(tag.clone());
                 }
             }
+            // Promotion retains the imported OCSP state and key. A verified
+            // revoked import may never have had a timer; taking responsibility
+            // for it must also make recovery schedulable.
+            if existing.certificate.managed
+                && existing.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                && old_deadline.is_none()
+            {
+                existing.ocsp_retry_after = Some(Utc::now() + chrono::Duration::seconds(30));
+            }
+            let new_deadline = existing.ocsp_deadline();
             events.push(CacheEvent::Updated {
                 names: existing.certificate.names.clone(),
-                hash,
+                hash: hash.clone(),
             });
+            self.change_ocsp_deadline(&hash, old_deadline, new_deadline);
             return;
         }
         if options.capacity > 0
@@ -602,13 +616,20 @@ impl CacheState {
             self.managed_hashes.push(hash.clone());
             index
         });
+        // A reload can discover revocation before this hash has ever had an
+        // OCSP index entry. Keep it eligible for bounded maintenance recovery
+        // even if replacing the old leaf removes that leaf's retry deadline.
+        let retry_after = key.retry_after.or_else(|| {
+            (cert.managed && cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked))
+                .then(|| Utc::now() + chrono::Duration::seconds(30))
+        });
         self.change_ocsp_deadline(
             &hash,
             None,
             key.validity
                 .map(|validity| validity.refresh_at)
                 .into_iter()
-                .chain(key.retry_after)
+                .chain(retry_after)
                 .max(),
         );
         self.certificates.insert(
@@ -619,7 +640,7 @@ impl CacheState {
                 key: key.key,
                 unstapled_key: key.unstapled,
                 ocsp_validity: key.validity,
-                ocsp_retry_after: key.retry_after,
+                ocsp_retry_after: retry_after,
                 must_staple: key.must_staple,
                 managed_index,
             },
@@ -649,7 +670,7 @@ impl CertCache {
             stop_tx,
             done_tx,
             maintenance_count: Mutex::new(0),
-            ocsp_changed: watch::channel(None).0,
+            ocsp_changed: watch::channel(0).0,
         })
     }
 
@@ -668,7 +689,7 @@ impl CertCache {
         self.stop_tx.subscribe()
     }
 
-    pub(crate) fn subscribe_ocsp(&self) -> watch::Receiver<Option<DateTime<Utc>>> {
+    pub(crate) fn subscribe_ocsp(&self) -> watch::Receiver<u64> {
         self.ocsp_changed.subscribe()
     }
 
@@ -676,12 +697,11 @@ impl CertCache {
         // Keep the snapshot and notification ordered with mutations. The watch
         // wakes tasks without polling their futures under this read lock.
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        let deadline = state.next_ocsp_deadline();
         self.ocsp_changed.send_if_modified(|current| {
-            if *current == deadline {
+            if *current == state.ocsp_revision {
                 false
             } else {
-                *current = deadline;
+                *current = state.ocsp_revision;
                 true
             }
         });
@@ -692,6 +712,29 @@ impl CertCache {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .next_ocsp_deadline()
+    }
+
+    /// A maintenance loop owns its own refresh pool; another loop may still
+    /// refresh these hashes independently. Skip only this loop's work without
+    /// removing global deadlines or hiding another certificate's later timer.
+    pub(crate) fn next_ocsp_deadline_excluding(
+        &self,
+        excluded: &HashSet<String>,
+    ) -> Option<DateTime<Utc>> {
+        if excluded.is_empty() {
+            return self.next_ocsp_deadline();
+        }
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ocsp_deadlines
+            .iter()
+            .find_map(|(deadline, hashes)| {
+                hashes
+                    .iter()
+                    .any(|hash| !excluded.contains(hash))
+                    .then_some(*deadline)
+            })
     }
 
     pub(crate) fn ocsp_refresh_due(&self, hash: &str) -> bool {
@@ -720,6 +763,23 @@ impl CertCache {
                 .map(|entry| Arc::clone(&entry.certificate))
                 .collect()
         }
+    }
+
+    pub(crate) fn due_ocsp_snapshot(
+        &self,
+        excluded: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<Arc<Certificate>> {
+        let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+        state
+            .ocsp_deadlines
+            .range(..=Utc::now())
+            .flat_map(|(_, hashes)| hashes)
+            .filter(|hash| !excluded.contains(*hash))
+            .filter_map(|hash| state.certificates.get(hash))
+            .take(limit)
+            .map(|entry| Arc::clone(&entry.certificate))
+            .collect()
     }
 
     /// Stop all registered maintenance loops and wait for their guards to drop.
@@ -1089,7 +1149,10 @@ impl CertCache {
             // sticky revocation, but move its due timer forward to avoid an
             // immediate retry loop when the responder fails or returns Good.
             let validity = current.ocsp_validity;
-            current.ocsp_retry_after = if validity.is_some() || was_scheduled {
+            current.ocsp_retry_after = if validity.is_some()
+                || was_scheduled
+                || current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+            {
                 let now = Utc::now();
                 let delay = validity.map_or(chrono::Duration::seconds(30), |validity| {
                     ((validity.expires_at - now) / 2)
@@ -1140,6 +1203,19 @@ impl CertCache {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .has_ocsp_revoked_leaf(name, leaf_hash)
+    }
+
+    pub(crate) fn has_managed_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .matching(name)
+            .into_iter()
+            .any(|entry| {
+                entry.certificate.managed
+                    && entry.leaf_hash.as_deref() == Some(leaf_hash)
+                    && entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+            })
     }
 
     /// Client authentication uses the certificate metadata, independently of
@@ -2079,7 +2155,11 @@ pub(crate) mod tests {
             if scenario == 0 {
                 assert!(cache.resolve("ocsp.example.com").is_none());
             }
-            assert!(cache.next_ocsp_deadline().is_none());
+            if expected_status == crate::ocsp::OcspStatus::Revoked {
+                assert!(cache.next_ocsp_deadline().unwrap() > Utc::now());
+            } else {
+                assert!(cache.next_ocsp_deadline().is_none());
+            }
         }
     }
 
