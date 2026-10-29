@@ -828,3 +828,12 @@ before any solver is presented.
 This check runs only for authorizations that need validation. Already-valid
 authorizations can still complete issuance with no configured solver. Public
 builder and solver APIs are unchanged.
+
+## ARI deadlines retain periodic revocation scan cadence
+
+An ARI-only renewal wakeup checks revocation markers for the due jobs, rather
+than requesting a global backend marker scan for every unrelated cached leaf.
+Renewal and OCSP periodic ticks still request global scans, including when OCSP
+stapling is disabled. The existing scan concurrency, coalescing and cancellation
+limits are unchanged. ARI wakeups still evaluate cached renewal eligibility;
+this change removes redundant backend reads, not that in-memory walk.
