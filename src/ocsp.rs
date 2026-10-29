@@ -120,7 +120,9 @@ impl std::fmt::Display for OcspStatus {
 ///
 /// The `raw` field contains the complete DER-encoded response suitable for
 /// TLS stapling. The remaining fields are extracted for convenience during
-/// freshness checks and status inspection.
+/// freshness checks and status inspection. Verified fetches select the unique
+/// SingleResponse matching the requested certificate; `raw` always retains
+/// the complete signed response, including any unrelated entries.
 #[derive(Debug, Clone)]
 pub struct OcspResponse {
     /// The certificate status.
@@ -1045,7 +1047,9 @@ fn validate_certificate_issuer(
 /// ```
 #[cfg(test)]
 fn parse_ocsp_response_raw(data: &[u8]) -> Result<OcspResponse> {
-    parse_ocsp_response_der(data).map(|parsed| parsed.response)
+    // Diagnostic test parser only: without a target, report the first entry.
+    // Production validation always supplies the requested full CertID.
+    parse_ocsp_response_der(data, None).map(|parsed| parsed.response)
 }
 
 fn parse_and_validate_ocsp_response_raw(
@@ -1053,7 +1057,13 @@ fn parse_and_validate_ocsp_response_raw(
     leaf: &X509Certificate<'_>,
     issuer: &X509Certificate<'_>,
 ) -> Result<OcspResponse> {
-    let parsed = parse_ocsp_response_der(data)?;
+    let expected = OcspCertId {
+        issuer_name_hash: sha1_hash(issuer.subject().as_raw()),
+        issuer_key_hash: hash_issuer_public_key(issuer)?,
+        serial_number: leaf.raw_serial().to_vec(),
+        uses_sha1: true, // The existing OCSP request/validation algorithm.
+    };
+    let parsed = parse_ocsp_response_der(data, Some(&expected))?;
     if let Some(basic) = &parsed.basic {
         validate_basic_ocsp_response(basic, leaf, issuer)?;
     } else {
@@ -1071,7 +1081,10 @@ fn parse_and_validate_ocsp_response_raw(
     Ok(parsed.response)
 }
 
-fn parse_ocsp_response_der(data: &[u8]) -> Result<ParsedOcspResponse<'_>> {
+fn parse_ocsp_response_der<'a>(
+    data: &'a [u8],
+    target: Option<&OcspCertId>,
+) -> Result<ParsedOcspResponse<'a>> {
     let outer_tlv = read_der_tlv(data)?;
     if outer_tlv.tag != 0x30 || !outer_tlv.rest.is_empty() {
         return Err(CertError::OcspFailed("OCSP response is not a single SEQUENCE".into()).into());
@@ -1136,11 +1149,15 @@ fn parse_ocsp_response_der(data: &[u8]) -> Result<ParsedOcspResponse<'_>> {
         .into());
     }
 
-    parse_basic_ocsp_response(response_octet.value, data)
+    parse_basic_ocsp_response(response_octet.value, data, target)
 }
 
 /// Parse a BasicOCSPResponse structure.
-fn parse_basic_ocsp_response<'a>(data: &'a [u8], raw: &[u8]) -> Result<ParsedOcspResponse<'a>> {
+fn parse_basic_ocsp_response<'a>(
+    data: &'a [u8],
+    raw: &[u8],
+    target: Option<&OcspCertId>,
+) -> Result<ParsedOcspResponse<'a>> {
     use x509_parser::der_parser::parse_der;
 
     let basic_tlv = read_der_tlv(data)?;
@@ -1198,7 +1215,7 @@ fn parse_basic_ocsp_response<'a>(data: &'a [u8], raw: &[u8]) -> Result<ParsedOcs
         .as_sequence()
         .map_err(|e| CertError::OcspFailed(format!("tbsResponseData is not a SEQUENCE: {e}")))?;
 
-    let parsed_response_data = parse_tbs_response_data(tbs, raw)?;
+    let parsed_response_data = parse_tbs_response_data(tbs, raw, target)?;
     Ok(ParsedOcspResponse {
         response: parsed_response_data.response,
         basic: Some(ParsedBasicOcspResponse {
@@ -1224,6 +1241,7 @@ fn parse_basic_ocsp_response<'a>(data: &'a [u8], raw: &[u8]) -> Result<ParsedOcs
 fn parse_tbs_response_data(
     tbs: &[x509_parser::der_parser::ber::BerObject<'_>],
     raw: &[u8],
+    target: Option<&OcspCertId>,
 ) -> Result<ParsedResponseData> {
     // The version field is optional (context tag [0]). We need to handle
     // both cases: with and without version.
@@ -1265,8 +1283,32 @@ fn parse_tbs_response_data(
         .into());
     }
 
-    // Parse the first SingleResponse (we only need one).
-    let (response, cert_id) = parse_single_response(&responses[0], raw, produced_at)?;
+    let (mut response, cert_id) = match target {
+        Some(target) => {
+            let mut selected = None;
+            for item in responses {
+                // Only metadata is allocated here. In particular, an unrelated
+                // entry never clones the complete response body.
+                let (response, id) = parse_single_response(item, produced_at)?;
+                if id.uses_sha1 == target.uses_sha1
+                    && id.issuer_name_hash == target.issuer_name_hash
+                    && id.issuer_key_hash == target.issuer_key_hash
+                    && normalize_der_integer(&id.serial_number)
+                        == normalize_der_integer(&target.serial_number)
+                {
+                    if selected.is_some() {
+                        return Err(CertError::OcspFailed("OCSP response has duplicate SingleResponses for the target certificate".into()).into());
+                    }
+                    selected = Some((response, id));
+                }
+            }
+            selected.ok_or_else(|| CertError::OcspFailed("OCSP response has no SingleResponse matching the target certificate issuer, algorithm and serial number".into()))?
+        }
+        None => parse_single_response(&responses[0], produced_at)?,
+    };
+    // Preserve the full original envelope for signature checking and stapling,
+    // with exactly one body allocation regardless of the batch size.
+    response.raw = raw.to_vec();
     Ok(ParsedResponseData {
         response,
         responder_id,
@@ -1285,7 +1327,6 @@ fn parse_tbs_response_data(
 /// }
 fn parse_single_response(
     obj: &x509_parser::der_parser::ber::BerObject<'_>,
-    raw: &[u8],
     produced_at: DateTime<Utc>,
 ) -> Result<(OcspResponse, OcspCertId)> {
     let seq = obj
@@ -1323,7 +1364,7 @@ fn parse_single_response(
     Ok((
         OcspResponse {
             status,
-            raw: raw.to_vec(),
+            raw: Vec::new(),
             this_update,
             next_update,
             produced_at,

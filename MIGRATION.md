@@ -494,3 +494,17 @@ management only while the original revoked observation is still managed. Removin
 or unmanaging that observation during issuer discovery cannot let a stale job
 create another managed entry. Independently verified revocation of an existing
 incoming cache entry still quarantines it and emits its notification.
+
+
+## OCSP responses containing multiple certificate statuses
+
+Verified OCSP paths now select the unique `SingleResponse` matching the requested
+certificate's full CertID: the existing SHA-1 request hash algorithm, issuer name
+hash, issuer key hash and serial number. An unrelated entry may appear before the
+target or have expired without making a fresh target unusable. Missing or duplicate
+target entries, including conflicting statuses, are rejected.
+
+The complete original response remains the TLS staple. Its full ResponseData
+signature, responder authorization and the selected target's time/status checks
+are still validated; selection does not re-encode or sign a reduced response.
+No public API signatures or supported CertID hash algorithms change.
