@@ -1133,30 +1133,19 @@ impl AcmeIssuer {
             );
         }
 
-        // Step 5: finalize the order with the CSR.
-        let finalized = client
-            .finalize_order(&account_key, &acct.location, &order.finalize, csr_der)
+        // Finalization and polling share one budget, including same-order
+        // recovery when the CA has not yet made the order ready.
+        let order_deadline = deadline.min(Instant::now() + DEFAULT_ORDER_POLL_TIMEOUT);
+        let completed = client
+            .complete_order_for_issuer(
+                &account_key,
+                &acct.location,
+                &order_url,
+                &order.finalize,
+                csr_der,
+                order_deadline,
+            )
             .await?;
-
-        debug!(
-            order_url = %order_url,
-            status = %finalized.status,
-            "order finalized"
-        );
-
-        // Step 6: poll order until the certificate is ready.
-        let completed = if finalized.status == "valid" {
-            finalized
-        } else {
-            client
-                .poll_order(
-                    &account_key,
-                    &acct.location,
-                    &order_url,
-                    DEFAULT_ORDER_POLL_TIMEOUT,
-                )
-                .await?
-        };
 
         // Step 7: download the certificate.
         let cert_url = completed.certificate.ok_or_else(|| {

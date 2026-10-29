@@ -792,3 +792,26 @@ existing shared account lock and newer-account identity checks remain in place,
 and order creation is retried only once after recovery. Other failures propagate
 without deleting the stored account. No public error variants or signatures
 change.
+
+
+## Same-order ACME finalization recovery
+
+`AcmeIssuer` now continues the existing order when finalization receives HTTP
+403 with exactly `urn:ietf:params:acme:error:orderNotReady`. It reads that order's
+current state and waits for readiness before retrying the same CSR, account and
+finalization URL. It does not register a replacement account, create another
+order or replay solved challenges for this recoverable response.
+
+Pending and processing orders use bounded backoff; ready orders that repeatedly
+reject finalization also back off. Valid orders proceed to download, while invalid
+and unknown states return their available CA error details. Requests, nonce
+retries, response bodies and sleeps share the remaining issuance deadline and
+the existing 120-second order-operation cap. Cancellation drops the active
+operation. The normal successful finalization path has no extra order request.
+
+Public low-level `finalize_order` still returns `orderNotReady` as an error, and
+`poll_order` still waits for `valid`, rather than stopping at `ready`. Only the
+issuer's internal flow performs this recovery. Other problem types, similar
+human-readable text, JSON status fields and responses with other HTTP statuses
+do not trigger it. Account-missing and already-revoked recognition remain
+restricted to their existing exact HTTP 400 problem contracts.

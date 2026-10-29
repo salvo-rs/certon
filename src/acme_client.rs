@@ -989,15 +989,15 @@ impl AcmeClient {
             .ok_or_else(|| AcmeError::Order("unexpected accepted ACME problem".into()).into())
     }
 
-    /// Only the caller that explicitly names a problem may treat its HTTP 400
-    /// response as an already-completed operation. Other POSTs retain errors.
+    /// Only an explicit caller may recognize a problem with its actual HTTP
+    /// status and complete type URI. Other POSTs retain their original errors.
     async fn acme_post_accepting_problem(
         &self,
         account_key: &PrivateKey,
         kid: Option<&str>,
         url: &str,
         payload: Option<&str>,
-        accepted_problem: Option<&str>,
+        accepted_problem: Option<(u16, &str)>,
     ) -> Result<Option<reqwest::Response>> {
         self.transport
             .validate_url(url)
@@ -1019,14 +1019,25 @@ impl AcmeClient {
             // Always cache the nonce from the response.
             self.cache_nonce(&resp).await;
 
-            // Check for badNonce and retry once.
-            if resp.status().as_u16() == 400 && (attempt == 0 || accepted_problem.is_some()) {
+            // The actual response status, never the problem JSON's status,
+            // controls recognition. Keep the original first-400 nonce retry.
+            let status = resp.status();
+            if (status.as_u16() == 400 && (attempt == 0 || accepted_problem.is_some()))
+                || accepted_problem.is_some_and(|(code, _)| status.as_u16() == code)
+            {
                 // Peek at the body to see if it's a badNonce error.
                 let resp_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
                     .await
-                    .map_err(|e| AcmeError::Nonce(e.to_string()))?;
+                    .map_err(|e| {
+                        if status.as_u16() == 400 {
+                            AcmeError::Nonce(e.to_string())
+                        } else {
+                            AcmeError::Order(e.to_string())
+                        }
+                    })?;
 
                 if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&resp_bytes)
+                    && status.as_u16() == 400
                     && problem.problem_type.contains("badNonce")
                     && attempt == 0
                 {
@@ -1038,14 +1049,20 @@ impl AcmeClient {
                 let problem: std::result::Result<AcmeProblem, _> =
                     serde_json::from_slice(&resp_bytes);
                 let detail = match problem {
-                    Ok(p) if accepted_problem == Some(p.problem_type.as_str()) => return Ok(None),
+                    Ok(p)
+                        if accepted_problem == Some((status.as_u16(), p.problem_type.as_str())) =>
+                    {
+                        return Ok(None);
+                    }
                     Ok(p) => format!("{p}"),
                     Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
                 };
-                return Err(AcmeError::Order(format!(
-                    "ACME request to {url} failed (HTTP 400): {detail}"
-                ))
-                .into());
+                let message = if status.as_u16() == 400 {
+                    format!("ACME request to {url} failed (HTTP 400): {detail}")
+                } else {
+                    format!("ACME {url} returned HTTP {status}: {detail}")
+                };
+                return Err(AcmeError::Order(message).into());
             }
 
             return Ok(Some(resp));
@@ -1068,7 +1085,7 @@ impl AcmeClient {
             .ok_or_else(|| AcmeError::Order("unexpected accepted ACME problem".into()).into())
     }
 
-    /// Preserve an explicitly accepted HTTP 400 problem before its body is
+    /// Preserve an explicitly accepted status/type problem before its body is
     /// consumed, including the response after the single badNonce retry.
     async fn acme_post_json_accepting_problem<T: serde::de::DeserializeOwned>(
         &self,
@@ -1076,7 +1093,7 @@ impl AcmeClient {
         kid: Option<&str>,
         url: &str,
         payload: Option<&str>,
-        accepted_problem: Option<&str>,
+        accepted_problem: Option<(u16, &str)>,
     ) -> Result<Option<(T, Option<String>)>> {
         let Some(resp) = self
             .acme_post_accepting_problem(account_key, kid, url, payload, accepted_problem)
@@ -1371,7 +1388,7 @@ impl AcmeClient {
                 Some(account_url),
                 &self.directory.new_order,
                 Some(&payload),
-                recognize_missing_account.then_some(ACCOUNT_DOES_NOT_EXIST),
+                recognize_missing_account.then_some((400, ACCOUNT_DOES_NOT_EXIST)),
             )
             .await?;
         let Some((order, location)) = response else {
@@ -1540,6 +1557,19 @@ impl AcmeClient {
         finalize_url: &str,
         csr_der: &[u8],
     ) -> Result<AcmeOrder> {
+        self.finalize_order_inner(account_key, account_url, finalize_url, csr_der, false)
+            .await?
+            .ok_or_else(|| AcmeError::Order("unexpected accepted ACME problem".into()).into())
+    }
+
+    async fn finalize_order_inner(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        finalize_url: &str,
+        csr_der: &[u8],
+        recognize_not_ready: bool,
+    ) -> Result<Option<AcmeOrder>> {
         debug!(finalize_url, "finalizing order");
 
         #[derive(Serialize)]
@@ -1553,13 +1583,94 @@ impl AcmeClient {
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Order(format!("failed to serialize finalize request: {e}")))?;
 
-        let (order, _): (AcmeOrder, _) = self
-            .acme_post_json(account_key, Some(account_url), finalize_url, Some(&payload))
+        let response: Option<(AcmeOrder, _)> = self
+            .acme_post_json_accepting_problem(
+                account_key,
+                Some(account_url),
+                finalize_url,
+                Some(&payload),
+                recognize_not_ready.then_some((403, "urn:ietf:params:acme:error:orderNotReady")),
+            )
             .await?;
+        Ok(response.map(|(order, _)| order))
+    }
 
-        debug!(status = %order.status, "order finalized");
-
-        Ok(order)
+    /// Continue one issuer order without registering again or replaying its
+    /// authorizations. Public finalize/poll methods keep their original behavior.
+    pub(crate) async fn complete_order_for_issuer(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        order_url: &str,
+        finalize_url: &str,
+        csr_der: &[u8],
+        deadline: Instant,
+    ) -> Result<AcmeOrder> {
+        tokio::time::timeout_at(deadline, async {
+            let mut order = self
+                .finalize_order_inner(account_key, account_url, finalize_url, csr_der, true)
+                .await?;
+            let mut interval = Duration::from_secs(1);
+            let mut polled = false;
+            loop {
+                match order.as_ref().map(|order| order.status.as_str()) {
+                    Some("valid") => return Ok(order.expect("valid order")),
+                    Some("invalid") => {
+                        let detail = order
+                            .as_ref()
+                            .and_then(|order| order.error.as_ref())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "unknown".into());
+                        return Err(AcmeError::Order(format!("order failed: {detail}")).into());
+                    }
+                    Some("ready") => {
+                        // Even an advertised-ready order may reject finalization
+                        // again. Back off before every repeated CSR submission.
+                        tokio::time::sleep(interval).await;
+                        interval = (interval * 2).min(Duration::from_secs(30));
+                        order = self
+                            .finalize_order_inner(
+                                account_key,
+                                account_url,
+                                finalize_url,
+                                csr_der,
+                                true,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    Some("pending" | "processing") => {
+                        if polled {
+                            tokio::time::sleep(interval).await;
+                            interval = (interval * 2).min(Duration::from_secs(30));
+                        }
+                    }
+                    None => {} // Exact 403/orderNotReady: inspect the same order now.
+                    Some(status) => {
+                        let detail = order
+                            .as_ref()
+                            .and_then(|order| order.error.as_ref())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "unknown".into());
+                        return Err(AcmeError::Order(format!(
+                            "unexpected order status: {status}: {detail}"
+                        ))
+                        .into());
+                    }
+                }
+                let (current, _): (AcmeOrder, _) = self
+                    .acme_post_json(account_key, Some(account_url), order_url, None)
+                    .await?;
+                order = Some(current);
+                polled = true;
+            }
+        })
+        .await
+        .map_err(|_| {
+            crate::error::Error::Timeout(
+                "order finalization and polling exceeded the issuance deadline".into(),
+            )
+        })?
     }
 
     /// Poll an order URL until its status is `valid`, `invalid`, or the
@@ -1824,7 +1935,7 @@ impl AcmeClient {
                 Some(account_url),
                 &self.directory.revoke_cert,
                 Some(&payload),
-                Some("urn:ietf:params:acme:error:alreadyRevoked"),
+                Some((400, "urn:ietf:params:acme:error:alreadyRevoked")),
             )
             .await?
         else {
