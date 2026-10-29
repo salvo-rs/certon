@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result, StorageError};
-use crate::storage::{KeyInfo, Storage, safe_key};
+use crate::storage::{KeyInfo, Storage, safe_key, storage_identity_hash};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -270,7 +270,53 @@ impl FileStorage {
 
     /// Return the path to a specific lock file.
     fn lock_filename(&self, name: &str) -> PathBuf {
-        self.lock_dir().join(format!("{}.lock", safe_key(name)))
+        let identity = safe_key(name);
+        let filename = format!("{identity}.lock");
+        if filename.len() <= 255 {
+            self.lock_dir().join(filename)
+        } else {
+            self.lock_dir()
+                .join("_certon-long-v1")
+                .join(format!("{}.lock", storage_identity_hash(&identity)))
+        }
+    }
+
+    /// Old derived keys can contain a component that this filesystem cannot
+    /// represent. Only an actual name-length error plus an oversized component
+    /// proves absence; permissions and whole-path length errors still propagate.
+    fn absent_long_component(error: &std::io::Error, key: &str) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(error.raw_os_error(), Some(123 | 206))
+                && key.split('/').any(|part| part.encode_utf16().count() > 255)
+        }
+        #[cfg(unix)]
+        {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            let too_long = 63;
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            )))]
+            let too_long = 36;
+            error.raw_os_error() == Some(too_long) && key.split('/').any(|part| part.len() > 255)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (error, key);
+            false
+        }
     }
 
     // -- atomic file creation -----------------------------------------------
@@ -420,7 +466,7 @@ impl Storage for FileStorage {
     async fn load(&self, key: &str) -> Result<Vec<u8>> {
         let filename = self.filename(key)?;
         tokio::fs::read(&filename).await.map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
+            if e.kind() == ErrorKind::NotFound || Self::absent_long_component(&e, key) {
                 StorageError::NotFound(key.to_string()).into()
             } else {
                 Error::from(StorageError::Io(e))
@@ -434,12 +480,14 @@ impl Storage for FileStorage {
         // Try removing as a file first, then as a directory tree.
         match tokio::fs::remove_file(&filename).await {
             Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::NotFound || Self::absent_long_component(&e, key) => {}
             Err(_) => {
                 // Might be a directory — remove recursively.
                 match tokio::fs::remove_dir_all(&filename).await {
                     Ok(()) => {}
-                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e)
+                        if e.kind() == ErrorKind::NotFound
+                            || Self::absent_long_component(&e, key) => {}
                     Err(e) => return Err(StorageError::Io(e).into()),
                 }
             }
@@ -457,7 +505,9 @@ impl Storage for FileStorage {
         let filename = self.filename(key)?;
         match tokio::fs::metadata(&filename).await {
             Ok(_) => Ok(true),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) if e.kind() == ErrorKind::NotFound || Self::absent_long_component(&e, key) => {
+                Ok(false)
+            }
             Err(e) => Err(StorageError::Io(e).into()),
         }
     }
@@ -511,7 +561,7 @@ impl Storage for FileStorage {
     async fn stat(&self, key: &str) -> Result<KeyInfo> {
         let filename = self.filename(key)?;
         let metadata = tokio::fs::metadata(&filename).await.map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
+            if e.kind() == ErrorKind::NotFound || Self::absent_long_component(&e, key) {
                 Error::from(StorageError::NotFound(key.to_string()))
             } else {
                 Error::from(StorageError::Io(e))
@@ -696,6 +746,26 @@ mod tests {
         let fs = FileStorage::new("/data");
         let lf = fs.lock_filename("my-lock");
         assert_eq!(lf, PathBuf::from("/data/locks/my-lock.lock"));
+    }
+
+    #[test]
+    fn long_component_absence_never_hides_permission_or_whole_path_failures() {
+        let long = format!("legacy/{}.json", "x".repeat(253));
+        let permission = std::io::Error::new(ErrorKind::PermissionDenied, "denied");
+        assert!(!FileStorage::absent_long_component(&permission, &long));
+        #[cfg(windows)]
+        for code in [123, 206] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(FileStorage::absent_long_component(&error, &long));
+            assert!(!FileStorage::absent_long_component(
+                &error,
+                &"ordinary/".repeat(100)
+            ));
+            assert!(
+                !FileStorage::absent_long_component(&error, &"é".repeat(200)),
+                "Windows counts UTF-16 units, not UTF-8 bytes"
+            );
+        }
     }
 
     #[test]

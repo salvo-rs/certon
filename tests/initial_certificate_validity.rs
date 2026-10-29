@@ -682,3 +682,56 @@ async fn invalid_overlapping_managed_leaf_keeps_its_coverage_for_maintenance() {
         );
     }
 }
+
+fn longest_dns_name(wildcard: bool) -> String {
+    let prefix = if wildcard { "*." } else { "" };
+    let remaining = 253 - prefix.len() - ".example.com".len();
+    let name = format!(
+        "{prefix}{}.{}.{}.{}.example.com",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(remaining - 3 * 63 - 3)
+    );
+    assert_eq!(name.len(), 253);
+    assert!(name.split('.').all(|label| label.len() <= 63));
+    name
+}
+
+#[tokio::test]
+async fn longest_dns_names_obtain_and_reload_with_file_storage() {
+    for name in [
+        "example.com".to_owned(),
+        longest_dns_name(false),
+        longest_dns_name(true),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(directory.path()));
+        let issuer = Arc::new(Issuer::new());
+        issuer.fail.store(false, Ordering::SeqCst);
+        let make_manager = || {
+            CertManager::builder()
+                .storage(storage.clone())
+                .issuers(vec![issuer.clone()])
+                .ocsp(OcspConfig {
+                    disable_stapling: true,
+                    ..Default::default()
+                })
+                .build()
+        };
+        let first = make_manager();
+        first.manage(std::slice::from_ref(&name)).await.unwrap();
+        let obtained = first.cache_certificate(&name).await.unwrap();
+        assert!(obtained.names.contains(&name));
+        assert_eq!(issuer.calls.load(Ordering::SeqCst), 1, "{name}");
+        let second = make_manager();
+        second.manage(std::slice::from_ref(&name)).await.unwrap();
+        let reloaded = second.cache_certificate(&name).await.unwrap();
+        assert_eq!(reloaded.hash, obtained.hash);
+        assert_eq!(
+            issuer.calls.load(Ordering::SeqCst),
+            1,
+            "reload must not reissue {name}"
+        );
+    }
+}

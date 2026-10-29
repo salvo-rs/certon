@@ -741,3 +741,37 @@ Promotion preserves the retained certificate's signing key, OCSP and ARI state,
 and merges management metadata as before. Evictions use the normal removal
 indexes and events; a metadata-only duplicate of an already managed entry does
 not gain a new eviction side effect. Zero capacity remains unlimited.
+
+
+## Long certificate names in filesystem storage
+
+Derived certificate and OCSP keys now fit the common 255-byte filename-component
+limit, including accepted 253-character ASCII DNS names and long wildcards.
+`safe_key` itself is unchanged. Ordinary site folders, legacy filenames and locks
+retain their previous paths.
+
+A sanitized site component longer than 255 bytes uses
+`certificates/<issuer>/_certon-long-v1/<sha256(sanitized-name)>`.
+Legacy `.crt`, `.key` and `.json` basenames longer than 250 bytes use
+`_certon-long-v1-<sha256(sanitized-name)>`; private snapshots still end in
+`_certon/resource.v1.key`. OCSP filenames longer than 255 bytes use
+`ocsp/_certon-long-v1/<sha256(original-OCSP-filename)>`. Digests cover the full
+previously derived identity, with no truncation of DNS names. The existing
+`CertificateResource::names_key` normalization remains unchanged.
+
+Readers prefer the canonical complete snapshot, then the old long-path snapshot,
+then compatible legacy assets. Generic storage backends can still read their old
+long keys. Missing assets allow fallback; malformed snapshots, partial legacy
+sets and backend errors do not. Deletion removes every legacy generation before
+any snapshot, with the canonical snapshot last. Cleanup groups physical layouts
+by verified identity so an expired old copy cannot delete a current snapshot.
+Digest directories without a readable snapshot are retained conservatively:
+cleanup cannot recover their original identity from a digest alone.
+
+FileStorage uses `locks/_certon-long-v1/<sha256(sanitized-lock-name)>.lock` only
+when the old lock filename exceeds 255 bytes; logical distributed lock names are
+unchanged. Its compatibility reads recognize an unrepresentable old component
+only after an actual OS filename-length error, leaving permission and whole-path
+errors visible. Upgrade all FileStorage writers before using these long names;
+older versions do not understand the bounded layout or long lock paths. Existing
+atomic publication, private-file permissions and cancellation behavior are retained.

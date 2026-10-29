@@ -34,6 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::error::{Error, Result, StorageError};
@@ -355,51 +356,132 @@ pub fn certs_prefix(issuer_key: &str) -> String {
 ///
 /// Example: `"certificates/<safe_issuer_key>/<safe_domain>"`
 pub fn certs_site_prefix(issuer_key: &str, domain: &str) -> String {
-    path_join(&[&certs_prefix(issuer_key), &safe_key(domain)])
+    certificate_site_prefix_from_safe_name(issuer_key, &safe_key(domain))
 }
 
-/// Return the path to the certificate PEM file for `domain` under `issuer_key`.
-///
-/// Example: `"certificates/<issuer>/<domain>/<domain>.crt"`
-pub fn site_cert_key(issuer_key: &str, domain: &str) -> String {
-    let safe_domain = safe_key(domain);
-    let filename = format!("{safe_domain}.crt");
-    path_join(&[&certs_site_prefix(issuer_key, domain), &filename])
-}
-
-/// Return the path to the private key PEM file for `domain` under `issuer_key`.
-///
-/// Example: `"certificates/<issuer>/<domain>/<domain>.key"`
-pub fn site_private_key(issuer_key: &str, domain: &str) -> String {
-    let safe_domain = safe_key(domain);
-    let filename = format!("{safe_domain}.key");
-    path_join(&[&certs_site_prefix(issuer_key, domain), &filename])
-}
-
-/// Return the path to the metadata JSON file for `domain` under `issuer_key`.
-///
-/// Example: `"certificates/<issuer>/<domain>/<domain>.json"`
-pub fn site_meta_key(issuer_key: &str, domain: &str) -> String {
-    let safe_domain = safe_key(domain);
-    let filename = format!("{safe_domain}.json");
-    path_join(&[&certs_site_prefix(issuer_key, domain), &filename])
-}
-
-/// Return the path for an OCSP staple identified by `domain` and `hash`.
-///
-/// `domain` is the first SAN on the certificate (already sanitized by the
-/// caller is fine, but this function applies [`safe_key`] again for safety).
-/// `hash` is a hex-encoded hash of the PEM bundle.
-///
-/// Example: `"ocsp/<safe_domain>-<hash>"`
-pub fn ocsp_key(domain: &str, hash: &str) -> String {
-    let mut filename = String::new();
-    if !domain.is_empty() {
-        filename.push_str(&safe_key(domain));
-        filename.push('-');
+/// Bound only derived certificate components, preserving every ordinary path.
+/// The extra namespace level cannot collide with a single legacy site name.
+pub(crate) fn certificate_site_prefix_from_safe_name(issuer: &str, name: &str) -> String {
+    if name.len() <= 255 {
+        path_join(&[&certs_prefix(issuer), name])
+    } else {
+        path_join(&[
+            &certs_prefix(issuer),
+            "_certon-long-v1",
+            &storage_identity_hash(name),
+        ])
     }
-    filename.push_str(hash);
-    path_join(&[PREFIX_OCSP, &filename])
+}
+
+pub(crate) fn storage_identity_hash(identity: &str) -> String {
+    Sha256::digest(identity.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn certificate_sites(issuer: &str, domain: &str) -> Vec<String> {
+    let name = safe_key(domain);
+    let mut sites = vec![certificate_site_prefix_from_safe_name(issuer, &name)];
+    let old = path_join(&[&certs_prefix(issuer), &name]);
+    if old != sites[0] {
+        sites.push(old);
+    }
+    sites
+}
+
+fn certificate_basename(name: &str) -> String {
+    if name.len() <= 250 {
+        name.to_owned()
+    } else {
+        format!("_certon-long-v1-{}", storage_identity_hash(name))
+    }
+}
+
+/// Certificate PEM, private key, and metadata keys, in that order.
+pub(crate) fn certificate_keys_for_site(site: &str, safe_name: &str) -> [String; 3] {
+    legacy_certificate_keys_for_site(site, &certificate_basename(safe_name))
+}
+
+pub(crate) fn legacy_certificate_keys_for_site(site: &str, safe_name: &str) -> [String; 3] {
+    ["crt", "key", "json"].map(|extension| format!("{site}/{safe_name}.{extension}"))
+}
+
+/// All compatible assets, ordered so the canonical snapshot is removed last.
+pub(crate) fn certificate_storage_keys(issuer: &str, domain: &str) -> Vec<String> {
+    let safe_name = safe_key(domain);
+    let sites = certificate_sites(issuer, domain);
+    let mut keys = Vec::new();
+    for site in sites.iter().rev() {
+        for key in legacy_certificate_keys_for_site(site, &safe_name)
+            .into_iter()
+            .chain(certificate_keys_for_site(site, &safe_name))
+        {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    for site in sites.iter().rev() {
+        keys.push(site_snapshot_key_from_prefix(site));
+    }
+    keys
+}
+
+/// Return the bounded legacy certificate PEM key. Ordinary paths are unchanged.
+pub fn site_cert_key(issuer_key: &str, domain: &str) -> String {
+    certificate_keys_for_site(&certs_site_prefix(issuer_key, domain), &safe_key(domain))[0].clone()
+}
+
+/// Return the bounded legacy private key key. Ordinary paths are unchanged.
+pub fn site_private_key(issuer_key: &str, domain: &str) -> String {
+    certificate_keys_for_site(&certs_site_prefix(issuer_key, domain), &safe_key(domain))[1].clone()
+}
+
+/// Return the bounded legacy metadata key. Ordinary paths are unchanged.
+pub fn site_meta_key(issuer_key: &str, domain: &str) -> String {
+    certificate_keys_for_site(&certs_site_prefix(issuer_key, domain), &safe_key(domain))[2].clone()
+}
+
+/// Return the OCSP staple key; long derived filenames use a versioned digest.
+pub fn ocsp_key(domain: &str, hash: &str) -> String {
+    let old = legacy_ocsp_key(domain, hash);
+    let filename = old.strip_prefix("ocsp/").expect("OCSP prefix");
+    if filename.len() <= 255 {
+        old
+    } else {
+        format!("ocsp/_certon-long-v1/{}", storage_identity_hash(filename))
+    }
+}
+
+pub(crate) fn legacy_ocsp_key(domain: &str, hash: &str) -> String {
+    let prefix = if domain.is_empty() {
+        String::new()
+    } else {
+        format!("{}-", safe_key(domain))
+    };
+    format!("{PREFIX_OCSP}/{prefix}{hash}")
+}
+
+/// Return the actual cache key along with its bytes, for precise corrupt cleanup.
+pub(crate) async fn load_ocsp_cache(
+    storage: &dyn Storage,
+    domain: &str,
+    hash: &str,
+) -> Result<(String, Vec<u8>)> {
+    let canonical = ocsp_key(domain, hash);
+    match storage.load(&canonical).await {
+        Ok(bytes) => Ok((canonical, bytes)),
+        Err(Error::Storage(StorageError::NotFound(_))) => {
+            let old = legacy_ocsp_key(domain, hash);
+            if old == canonical {
+                return Err(StorageError::NotFound(canonical).into());
+            }
+            let bytes = storage.load(&old).await?;
+            Ok((old, bytes))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Sanitize a CA URL into a storage-safe issuer key.
@@ -565,10 +647,11 @@ impl CertificateResource {
 /// The complete resource is published as one value. The `.key` suffix tells
 /// file backends that this JSON contains a secret and needs private permissions.
 pub(crate) fn site_snapshot_key(issuer: &str, domain: &str) -> String {
-    format!(
-        "{}/_certon/resource.v1.key",
-        certs_site_prefix(issuer, domain)
-    )
+    site_snapshot_key_from_prefix(&certs_site_prefix(issuer, domain))
+}
+
+pub(crate) fn site_snapshot_key_from_prefix(site: &str) -> String {
+    format!("{site}/_certon/resource.v1.key")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -612,48 +695,94 @@ pub async fn store_certificate(
 ///
 /// # Errors
 ///
-/// Returns [`StorageError::NotFound`] if any of the three assets are missing,
+/// Returns [`StorageError::NotFound`] if no compatible assets exist,
 /// or [`StorageError::Deserialize`] if the metadata JSON is malformed.
 pub async fn load_certificate(
     storage: &dyn Storage,
     issuer_key: &str,
     domain: &str,
 ) -> Result<CertificateResource> {
-    match storage.load(&site_snapshot_key(issuer_key, domain)).await {
-        Ok(bytes) => {
-            let mut snapshot: CertificateSnapshot =
-                serde_json::from_slice(&bytes).map_err(|e| {
-                    StorageError::Deserialize(format!("decoding certificate snapshot: {e}"))
-                })?;
-            if snapshot.version != 1 {
-                return Err(StorageError::Deserialize(
-                    "unsupported certificate snapshot version".into(),
-                )
-                .into());
-            }
-            snapshot.metadata.certificate_pem = snapshot.certificate_pem;
-            snapshot.metadata.private_key_pem = snapshot.private_key_pem;
-            snapshot.metadata.issuer_key = issuer_key.to_owned();
-            return Ok(snapshot.metadata);
+    let sites = certificate_sites(issuer_key, domain);
+    // Atomic snapshots take precedence across both generations of the layout.
+    for site in &sites {
+        match load_certificate_snapshot_from_site(storage, site, issuer_key).await {
+            Ok(resource) => return Ok(resource),
+            Err(Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
         }
-        Err(Error::Storage(StorageError::NotFound(_))) => {}
-        Err(error) => return Err(error),
     }
-    let key_bytes = storage.load(&site_private_key(issuer_key, domain)).await?;
-    let cert_bytes = storage.load(&site_cert_key(issuer_key, domain)).await?;
-    let meta_bytes = storage.load(&site_meta_key(issuer_key, domain)).await?;
+    let name = safe_key(domain);
+    for site in &sites {
+        match load_legacy_certificate_from_site(storage, site, issuer_key, &name).await {
+            Ok(resource) => return Ok(resource),
+            Err(Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(StorageError::NotFound(site_snapshot_key(issuer_key, domain)).into())
+}
 
-    let mut cert_res: CertificateResource = serde_json::from_slice(&meta_bytes).map_err(|e| {
-        Error::Storage(StorageError::Deserialize(format!(
-            "decoding certificate metadata: {e}"
-        )))
-    })?;
+pub(crate) async fn load_certificate_snapshot_from_site(
+    storage: &dyn Storage,
+    site: &str,
+    issuer: &str,
+) -> Result<CertificateResource> {
+    let bytes = storage.load(&site_snapshot_key_from_prefix(site)).await?;
+    let mut snapshot: CertificateSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|e| StorageError::Deserialize(format!("decoding certificate snapshot: {e}")))?;
+    if snapshot.version != 1 {
+        return Err(
+            StorageError::Deserialize("unsupported certificate snapshot version".into()).into(),
+        );
+    }
+    snapshot.metadata.certificate_pem = snapshot.certificate_pem;
+    snapshot.metadata.private_key_pem = snapshot.private_key_pem;
+    snapshot.metadata.issuer_key = issuer.to_owned();
+    Ok(snapshot.metadata)
+}
 
-    cert_res.private_key_pem = key_bytes;
-    cert_res.certificate_pem = cert_bytes;
-    cert_res.issuer_key = issuer_key.to_owned();
-
-    Ok(cert_res)
+async fn load_legacy_certificate_from_site(
+    storage: &dyn Storage,
+    site: &str,
+    issuer: &str,
+    safe_name: &str,
+) -> Result<CertificateResource> {
+    let bounded = certificate_keys_for_site(site, safe_name);
+    let raw = legacy_certificate_keys_for_site(site, safe_name);
+    for keys in [&bounded, &raw] {
+        // A partial generation must not silently fall back to another one.
+        let mut values = Vec::new();
+        let mut missing = false;
+        for key in keys {
+            match storage.load(key).await {
+                Ok(bytes) => values.push(bytes),
+                Err(Error::Storage(StorageError::NotFound(_))) => {
+                    missing = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if !missing {
+            let mut resource: CertificateResource =
+                serde_json::from_slice(&values[2]).map_err(|e| {
+                    StorageError::Deserialize(format!("decoding certificate metadata: {e}"))
+                })?;
+            resource.certificate_pem = std::mem::take(&mut values[0]);
+            resource.private_key_pem = std::mem::take(&mut values[1]);
+            resource.issuer_key = issuer.to_owned();
+            return Ok(resource);
+        }
+        if !values.is_empty() {
+            return Err(StorageError::Deserialize(format!(
+                "incomplete certificate resources at {site}"
+            ))
+            .into());
+        }
+        if raw == bounded {
+            break;
+        }
+    }
+    Err(StorageError::NotFound(site.to_owned()).into())
 }
 
 // Revocation intent is independent of the certificate store, so a failed
@@ -1112,5 +1241,91 @@ mod lock_guard_tests {
             .unwrap();
         drop(guard);
         assert!(runtime.block_on(becomes_free(&storage, "outside")));
+    }
+}
+
+#[cfg(test)]
+mod long_ocsp_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Memory {
+        entries: Mutex<BTreeMap<String, Vec<u8>>>,
+        failure: Mutex<Option<String>>,
+    }
+    #[async_trait]
+    impl Storage for Memory {
+        async fn store(&self, key: &str, value: &[u8]) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(key.into(), value.into());
+            Ok(())
+        }
+        async fn load(&self, key: &str) -> Result<Vec<u8>> {
+            if self.failure.lock().unwrap().as_deref() == Some(key) {
+                return Err(StorageError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "load denied",
+                ))
+                .into());
+            }
+            self.entries
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| StorageError::NotFound(key.into()).into())
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.entries.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.entries.lock().unwrap().contains_key(key))
+        }
+        async fn list(&self, _: &str, _: bool) -> Result<Vec<String>> {
+            unreachable!()
+        }
+        async fn stat(&self, _: &str) -> Result<KeyInfo> {
+            unreachable!()
+        }
+        async fn lock(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn unlock(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn old_long_ocsp_keys_are_read_only_on_canonical_not_found() {
+        let storage = Memory::default();
+        let name = "a".repeat(253);
+        let hash = "b".repeat(64);
+        let old = legacy_ocsp_key(&name, &hash);
+        let canonical = ocsp_key(&name, &hash);
+        assert_ne!(old, canonical);
+        storage.store(&old, b"old response").await.unwrap();
+        assert_eq!(
+            load_ocsp_cache(&storage, &name, &hash).await.unwrap(),
+            (old.clone(), b"old response".to_vec())
+        );
+        storage
+            .store(&canonical, b"bad DER must not fall back")
+            .await
+            .unwrap();
+        assert_eq!(
+            load_ocsp_cache(&storage, &name, &hash).await.unwrap(),
+            (canonical.clone(), b"bad DER must not fall back".to_vec())
+        );
+        *storage.failure.lock().unwrap() = Some(canonical.clone());
+        assert!(matches!(
+            load_ocsp_cache(&storage, &name, &hash).await,
+            Err(Error::Storage(StorageError::Io(_)))
+        ));
+        assert_eq!(storage.load(&old).await.unwrap(), b"old response");
     }
 }
