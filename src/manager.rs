@@ -911,7 +911,18 @@ impl CertManager {
         resource: &CertificateResource,
         domain: &str,
     ) -> Result<Certificate> {
-        let mut cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
+        let cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
+        Self::validate_managed_certificate(cert, domain, &resource.issuer_key)
+    }
+
+    /// Complete identity admission for an already parsed resource. Callers may
+    /// first apply persistent revocation intent, including its quarantine side
+    /// effect, before rejecting an otherwise unusable replacement key or name.
+    pub(crate) fn validate_managed_certificate(
+        mut cert: Certificate,
+        domain: &str,
+        issuer_key: &str,
+    ) -> Result<Certificate> {
         crate::handshake::cert_to_certified_key(&cert)?
             .keys_match()
             .map_err(|error| Error::Config(format!("certificate/private key mismatch: {error}")))?;
@@ -921,7 +932,7 @@ impl CertManager {
         cert.names.retain(|name| !name.eq_ignore_ascii_case(domain));
         cert.names.insert(0, domain.to_ascii_lowercase());
         cert.managed = true;
-        cert.issuer_key = resource.issuer_key.clone();
+        cert.issuer_key = issuer_key.to_owned();
         Ok(cert)
     }
 
