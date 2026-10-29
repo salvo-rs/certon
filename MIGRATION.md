@@ -615,3 +615,19 @@ the appropriate HTTP Host or reverse-map TLS SNI. No dual-stack binding change
 is included. For ordinary application TLS, IP clients do not send DNS SNI;
 configure `CertManagerBuilder::default_server_name` with the canonical IP for
 that listener instead of relying on a DNS SNI cache lookup.
+
+## Runtime certificate cache resizing
+
+`CertCache::set_options` now applies a finite `capacity` immediately, randomly
+evicting managed certificates until the total cached count fits or no managed
+entries remain. Eviction uses the normal removal bookkeeping and emits removal
+events after releasing the cache and configuration locks. An in-flight publisher
+uses the latest capacity when it acquires the publication lock, even if it
+captured older callback options before the resize.
+
+Capacity still counts all entries, and unmanaged certificates remain protected
+from eviction. If protected entries alone exceed the limit, the total can remain
+above it; the existing insertion policy also permits a new entry while evicting
+one older managed entry when available. A capacity of zero remains unlimited
+and does not evict existing certificates. Raising the limit does not restore
+previously evicted entries.
