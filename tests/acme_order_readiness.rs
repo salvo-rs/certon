@@ -278,7 +278,15 @@ fn successful(issued: certon::IssuedCertificate) {
         certon::Certificate::from_pem(&issued.certificate_pem, &issued.private_key_pem).unwrap();
     let (_, leaf) =
         x509_parser::certificate::X509Certificate::from_der(parsed.cert_chain[0].as_ref()).unwrap();
-    let private = KeyPair::from_pem(std::str::from_utf8(&issued.private_key_pem).unwrap()).unwrap();
+    let decoded = certon::crypto::decode_private_key_pem(
+        std::str::from_utf8(&issued.private_key_pem).unwrap(),
+    )
+    .unwrap();
+    let private = KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls::pki_types::PrivatePkcs8KeyDer::from(decoded.pkcs8_der()),
+        &rcgen::PKCS_ECDSA_P256_SHA256,
+    )
+    .unwrap();
     assert_eq!(
         leaf.public_key().subject_public_key.data.as_ref(),
         private.der_bytes()
