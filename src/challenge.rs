@@ -64,6 +64,30 @@ pub(crate) fn domain(domain: &str) -> Result<String> {
     Ok(format!("{wildcard}{ascii}"))
 }
 
+/// RFC 8738 section 6: IP validation uses a reverse-map DNS SNI while the
+/// challenge certificate and stored identifier continue to contain the IP.
+pub(crate) fn tls_alpn_server_name(identifier: &str) -> String {
+    match identifier.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(address)) => {
+            let [a, b, c, d] = address.octets();
+            format!("{d}.{c}.{b}.{a}.in-addr.arpa")
+        }
+        Ok(std::net::IpAddr::V6(address)) => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut name = String::with_capacity(72);
+            for byte in address.octets().iter().rev() {
+                name.push(HEX[(byte & 15) as usize] as char);
+                name.push('.');
+                name.push(HEX[(byte >> 4) as usize] as char);
+                name.push('.');
+            }
+            name.push_str("ip6.arpa");
+            name
+        }
+        Err(_) => identifier.to_owned(),
+    }
+}
+
 pub(crate) fn host(host: &str) -> Result<String> {
     if host.len() > 1024 || host.contains('*') {
         return Err(Error::Config("invalid Host".into()));

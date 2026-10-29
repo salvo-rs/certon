@@ -338,6 +338,8 @@ fn challenge_tokens_key(issuer_prefix: &str, domain: &str) -> String {
 ///
 /// **Important**: Port 80 must be reachable from the internet for the ACME
 /// CA's validation server to reach this solver.
+/// The built-in listener binds IPv4; native IPv6 validation requires an
+/// IPv6-facing proxy or a custom solver/listener.
 pub struct Http01Solver {
     /// In-memory map of token -> key_auth for currently active challenges.
     challenges: Arc<RwLock<HashMap<String, String>>>,
@@ -600,7 +602,10 @@ const ACME_TLS_ALPN_PROTOCOL: &[u8] = b"acme-tls/1";
 /// authorization match, so an older cleanup cannot withdraw a replacement.
 ///
 /// **Important**: Port 443 must be reachable from the internet, and the
-/// client's SNI value must match the domain being validated.
+/// client's SNI value must match the domain being validated. IP validation
+/// uses the RFC 8738 reverse-map SNI and an IP SAN in the proof certificate.
+/// The built-in listener binds IPv4; native IPv6 reachability requires an
+/// IPv6-facing proxy or a custom solver/listener.
 pub struct TlsAlpn01Solver {
     /// In-memory map of domain -> (cert chain DER, private key DER) for
     /// currently active challenges.
@@ -757,6 +762,11 @@ impl std::fmt::Debug for TlsAlpn01Solver {
 #[async_trait]
 impl Solver for TlsAlpn01Solver {
     async fn present(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        let identifier = domain
+            .parse::<std::net::IpAddr>()
+            .map_or_else(|_| domain.to_owned(), |address| address.to_string());
+        let domain = identifier.as_str();
+        let server_name = crate::challenge::tls_alpn_server_name(domain);
         let (certs, key_der) = Self::generate_challenge_cert(domain, key_auth)?;
         let key = crate::handshake::signing_key_from_der(&key_der)
             .map_err(|e| Error::Other(format!("failed to load challenge signing key: {e}")))?;
@@ -776,22 +786,27 @@ impl Solver for TlsAlpn01Solver {
         self.challenges
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(domain.to_owned(), prepared);
+            .insert(server_name, prepared);
         registry.insert(domain.to_owned(), ChallengeOwner::new(token, key_auth));
         debug!(domain, "TLS-ALPN-01 challenge presented");
         Ok(())
     }
 
     async fn cleanup(&self, domain: &str, token: &str, key_auth: &str) -> Result<()> {
+        let identifier = domain
+            .parse::<std::net::IpAddr>()
+            .map_or_else(|_| domain.to_owned(), |address| address.to_string());
+        let domain = identifier.as_str();
+        let server_name = crate::challenge::tls_alpn_server_name(domain);
         let mut handle = self.server_handle.lock().await;
         let should_stop = {
             let mut registry = active_challenges().write().await;
             let mut challenges = self.challenges.write().unwrap_or_else(|e| e.into_inner());
             if challenges
-                .get(domain)
+                .get(&server_name)
                 .is_some_and(|current| current.owner.matches(token, key_auth))
             {
-                challenges.remove(domain);
+                challenges.remove(&server_name);
             }
             unregister_active_challenge_if_matching(&mut registry, domain, token, key_auth);
             challenges.is_empty()

@@ -590,3 +590,28 @@ without registering an account or provisioning new EAB credentials. Unsupported
 ARI still returns no recommendation, and temporary ARI errors retain the existing
 retry handling. This change applies to the ACME issuer; the separate ZeroSSL REST
 API issuer is unchanged.
+
+## ACME IP identifiers and challenge names
+
+`AcmeClient::new_order` and `new_order_with_options` now encode parsed IPv4 and
+IPv6 addresses as RFC 8738 `ip` identifiers. Address values use canonical text
+(including compressed lowercase IPv6); DNS values retain their previous wire
+representation. A mixed order preserves its input order and profile/validity
+options. This requires a CA and, where applicable, a profile that supports IP
+issuance; it does not make every ACME CA accept IP certificates.
+
+IP authorizations never select DNS-01. HTTP-01 remains preferred when offered
+and enabled. TLS-ALPN-01 proof certificates keep a single IP SAN, but their
+challenge lookup uses the RFC 8738 reverse-map SNI (`in-addr.arpa` or
+`ip6.arpa`). Both the standalone solver and `CertResolver` challenge-certificate
+set/remove APIs use the same mapping. Distributed challenge storage and global
+proof ownership retain the canonical IP identifier, not its reverse DNS name;
+the distributed wrapper delegates to the same standalone solver. There is no
+new automatic cross-instance TLS proof reader.
+
+The built-in HTTP/TLS challenge listeners still bind IPv4. Native IPv6
+validation needs an IPv6-facing proxy or a custom listener/solver that forwards
+the appropriate HTTP Host or reverse-map TLS SNI. No dual-stack binding change
+is included. For ordinary application TLS, IP clients do not send DNS SNI;
+configure `CertManagerBuilder::default_server_name` with the canonical IP for
+that listener instead of relying on a DNS SNI cache lookup.
