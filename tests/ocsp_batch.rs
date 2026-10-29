@@ -35,6 +35,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(url: &str) -> Self {
+        Self::with_name(url, "target.example")
+    }
+    fn with_name(url: &str, name: &str) -> Self {
         let key = KeyPair::generate().unwrap();
         let mut ca = CertificateParams::new(vec!["probe-ca".into()]).unwrap();
         ca.distinguished_name
@@ -46,7 +49,9 @@ impl Fixture {
         ];
         let root = ca.self_signed(&key).unwrap();
         let issuer = rcgen::Issuer::new(ca, &key);
-        let mut leaf = CertificateParams::new(vec!["target.example".into()]).unwrap();
+        let mut leaf = CertificateParams::new(vec![name.into()]).unwrap();
+        leaf.distinguished_name
+            .push(rcgen::DnType::CommonName, name);
         leaf.serial_number = Some(123u64.into());
         // AIA = SEQUENCE { AccessDescription { id-ad-ocsp, URI } }.
         let aia = der(
@@ -860,4 +865,47 @@ async fn background_management_recovers_an_expired_good_staple() {
 #[tokio::test]
 async fn nonforced_renewal_recovers_an_expired_good_staple_without_issuing() {
     recover_expired_good("renew").await;
+}
+
+#[tokio::test]
+async fn longest_dns_ocsp_cache_survives_file_storage_restart() {
+    use certon::Storage;
+    for wildcard in [false, true] {
+        let prefix = if wildcard { "*." } else { "" };
+        let name = format!(
+            "{prefix}{}.{}.{}.{}.example.com",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(253 - prefix.len() - 12 - 3 * 63 - 3)
+        );
+        assert_eq!(name.len(), 253);
+        let server = Server::new().await;
+        let fixture = Fixture::with_name(&server.url, &name);
+        let response = fixture.response(&[Single::new(Identity::Target)]);
+        server.responses.lock().unwrap().push_back(response.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let storage = certon::FileStorage::new(directory.path());
+        let mut certificate =
+            certon::Certificate::from_pem(&fixture.pem, fixture.target_key_pem.as_bytes()).unwrap();
+        assert_eq!(certificate.names[0], name);
+        assert!(
+            certon::ocsp::staple_ocsp(&storage, &mut certificate, &certon::OcspConfig::default())
+                .await
+                .unwrap()
+        );
+        let cache_key = certon::storage::ocsp_key(&name, &certificate.hash);
+        assert_eq!(storage.load(&cache_key).await.unwrap(), response);
+        // Shut down the responder: only the verified persisted cache can pass.
+        drop(server);
+        let storage = certon::FileStorage::new(directory.path());
+        let mut reloaded =
+            certon::Certificate::from_pem(&fixture.pem, fixture.target_key_pem.as_bytes()).unwrap();
+        assert!(
+            certon::ocsp::staple_ocsp(&storage, &mut reloaded, &certon::OcspConfig::default())
+                .await
+                .unwrap()
+        );
+        assert_eq!(reloaded.ocsp_response.unwrap(), response);
+    }
 }

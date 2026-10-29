@@ -1114,39 +1114,100 @@ pub async fn clean_storage(
         }
     }
 
-    for site in sites {
-        let Some((issuer, domain)) = site
+    // Listed paths identify physical generations, not always the original
+    // names: long sites use a reserved digest directory. Recover those names
+    // only from a valid snapshot whose identity maps back to this exact site.
+    let mut groups = std::collections::BTreeMap::new();
+    for physical_site in sites {
+        let Some((issuer, folder)) = physical_site
             .strip_prefix("certificates/")
             .and_then(|path| path.split_once('/'))
         else {
             continue;
         };
-        if domain.contains('/') {
-            continue;
-        }
-        let snapshot = format!("{site}/_certon/resource.v1.key");
-        let cert_pem = match crate::storage::load_certificate(storage, issuer, domain).await {
-            Ok(resource) => resource.certificate_pem,
+        let safe_name = match crate::storage::load_certificate_snapshot_from_site(
+            storage,
+            &physical_site,
+            issuer,
+        )
+        .await
+        {
+            Ok(resource) => {
+                let safe_name = crate::storage::safe_key(&resource.names_key());
+                let canonical =
+                    crate::storage::certificate_site_prefix_from_safe_name(issuer, &safe_name);
+                if physical_site != canonical && folder != safe_name {
+                    continue;
+                }
+                safe_name
+            }
+            Err(crate::Error::Storage(crate::error::StorageError::NotFound(_)))
+                if !folder.contains('/') =>
+            {
+                folder.to_owned()
+            }
+            // A digest is not a reversible name. Keep malformed, unavailable
+            // or identity-less hashed sites, including legacy-only imports.
+            Err(_) => continue,
+        };
+        let canonical = crate::storage::certificate_site_prefix_from_safe_name(issuer, &safe_name);
+        groups
+            .entry(canonical)
+            .or_insert_with(|| (issuer.to_owned(), safe_name));
+    }
+
+    for (site, (issuer, domain)) in groups {
+        let physical_sites = crate::storage::certificate_sites(&issuer, &domain);
+        let snapshots: Vec<_> = physical_sites
+            .iter()
+            .map(|site| crate::storage::site_snapshot_key_from_prefix(site))
+            .collect();
+        let cert_pem = match crate::storage::load_certificate(storage, &issuer, &domain).await {
+            Ok(resource) => {
+                if crate::storage::safe_key(&resource.names_key()) != domain {
+                    continue;
+                }
+                resource.certificate_pem
+            }
             Err(_) => {
                 // A prior cleanup may have removed the legacy sidecars before
                 // .crt deletion failed. Retry from that cert only after proving
-                // no canonical snapshot exists. Present, malformed or unreadable
-                // snapshots must never fall back to an older expired .crt.
-                if !matches!(
-                    storage.load(&snapshot).await,
-                    Err(crate::Error::Storage(crate::error::StorageError::NotFound(
-                        _
-                    )))
-                ) {
+                // no snapshot in either generation exists. Present, malformed
+                // or unreadable snapshots must not fall back to an old .crt.
+                let mut snapshots_absent = true;
+                for snapshot in &snapshots {
+                    if !matches!(
+                        storage.load(snapshot).await,
+                        Err(crate::Error::Storage(crate::error::StorageError::NotFound(
+                            _
+                        )))
+                    ) {
+                        snapshots_absent = false;
+                        break;
+                    }
+                }
+                if !snapshots_absent {
                     continue;
                 }
-                match storage
-                    .load(&crate::storage::site_cert_key(issuer, domain))
-                    .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(_) => continue,
+                let mut cert_pem = None;
+                'certificate: for physical_site in &physical_sites {
+                    let bounded = crate::storage::certificate_keys_for_site(physical_site, &domain);
+                    let legacy =
+                        crate::storage::legacy_certificate_keys_for_site(physical_site, &domain);
+                    for key in [&bounded[0], &legacy[0]] {
+                        match storage.load(key).await {
+                            Ok(bytes) => {
+                                cert_pem = Some(bytes);
+                                break 'certificate;
+                            }
+                            Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {
+                            }
+                            Err(_) => break 'certificate,
+                        }
+                    }
                 }
+                let Some(cert_pem) = cert_pem else { continue };
+                cert_pem
             }
         };
         let cert_pem_str = match std::str::from_utf8(&cert_pem) {
@@ -1180,13 +1241,22 @@ pub async fn clean_storage(
             continue;
         }
 
-        // Keep the certificate as retryable expiry evidence until both legacy
-        // sidecars are gone. The snapshot remains authoritative until all legacy
-        // assets are removed, preventing resurrection through the legacy loader.
-        let sidecars = [
-            crate::storage::site_private_key(issuer, domain),
-            crate::storage::site_meta_key(issuer, domain),
-        ];
+        // Delete every generation's legacy assets before any snapshot. This
+        // keeps an old-layout authoritative snapshot available if deletion of
+        // a newer-layout legacy import fails or is cancelled.
+        let mut sidecars = std::collections::BTreeSet::new();
+        let mut certificates = std::collections::BTreeSet::new();
+        for physical_site in &physical_sites {
+            for keys in [
+                crate::storage::certificate_keys_for_site(physical_site, &domain),
+                crate::storage::legacy_certificate_keys_for_site(physical_site, &domain),
+            ] {
+                let [cert, key, meta] = keys;
+                certificates.insert(cert);
+                sidecars.insert(key);
+                sidecars.insert(meta);
+            }
+        }
         let mut sidecars_deleted = true;
         for path in sidecars {
             match storage.delete(&path).await {
@@ -1200,22 +1270,34 @@ pub async fn clean_storage(
         if !sidecars_deleted {
             continue;
         }
-        let cert_path = crate::storage::site_cert_key(issuer, domain);
-        match storage.delete(&cert_path).await {
-            Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
-            Err(error) => {
-                warn!(path = cert_path, error = %error, "clean_storage: failed to delete expired certificate");
-                continue;
+        let mut certificates_deleted = true;
+        for cert_path in certificates {
+            match storage.delete(&cert_path).await {
+                Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                Err(error) => {
+                    warn!(path = cert_path, error = %error, "clean_storage: failed to delete expired certificate");
+                    certificates_deleted = false;
+                }
             }
         }
-        match storage.delete(&snapshot).await {
-            Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {
-                info!(site, not_after = %not_after, "clean_storage: deleted expired certificate");
-                result.deleted_certs += 1;
+        if !certificates_deleted {
+            continue;
+        }
+        let mut snapshots_deleted = true;
+        // Canonical is first in the read order, last in the deletion order.
+        for snapshot in snapshots.iter().rev() {
+            match storage.delete(snapshot).await {
+                Ok(()) | Err(crate::Error::Storage(crate::error::StorageError::NotFound(_))) => {}
+                Err(error) => {
+                    warn!(path = snapshot, error = %error, "clean_storage: failed to delete expired certificate snapshot");
+                    snapshots_deleted = false;
+                    break;
+                }
             }
-            Err(error) => {
-                warn!(path = snapshot, error = %error, "clean_storage: failed to delete expired certificate snapshot")
-            }
+        }
+        if snapshots_deleted {
+            info!(site, not_after = %not_after, "clean_storage: deleted expired certificate");
+            result.deleted_certs += 1;
         }
     }
 
@@ -1233,6 +1315,12 @@ pub async fn clean_storage(
             Ok(s) => s,
             Err(_) => continue,
         };
+        // Recursive listings include namespace directories. Their modification
+        // time says nothing about refreshed descendants, so never GC a subtree
+        // using the directory's age.
+        if !stat.is_terminal {
+            continue;
+        }
 
         if retention_has_elapsed(stat.modified, options.ocsp_max_age, now) {
             if let Err(e) = storage.delete(entry).await {

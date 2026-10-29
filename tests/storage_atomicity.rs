@@ -426,3 +426,49 @@ async fn process_crash_releases_lock_without_deleting_its_inode() {
     assert!(directory.path().join("locks/process.lock").exists());
     storage.unlock("process").await.unwrap();
 }
+
+#[tokio::test]
+async fn longest_wildcard_snapshot_keeps_atomic_failure_and_cancellation_boundaries() {
+    let domain = format!(
+        "*.{}.{}.{}.{}.example.com",
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(47)
+    );
+    assert_eq!(domain.len(), 253);
+    for mode in [1, 2, 3] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = faulty(directory.path());
+        let mut old = resource(1);
+        old.sans = vec![domain.clone()];
+        let mut new = resource(2);
+        new.sans = old.sans.clone();
+        store_certificate(storage.as_ref(), "ca", &old)
+            .await
+            .unwrap();
+        storage.mode.store(mode, Ordering::SeqCst);
+        let writer = storage.clone();
+        let replacement = new.clone();
+        let task =
+            tokio::spawn(
+                async move { store_certificate(writer.as_ref(), "ca", &replacement).await },
+            );
+        if mode == 1 {
+            assert!(task.await.unwrap().is_err());
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), storage.entered.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        let loaded = load_certificate(&FileStorage::new(directory.path()), "ca", &domain)
+            .await
+            .unwrap();
+        let expected = if mode == 3 { new } else { old };
+        assert_eq!(loaded.certificate_pem, expected.certificate_pem);
+        assert_eq!(loaded.private_key_pem, expected.private_key_pem);
+        assert_eq!(loaded.issuer_data, expected.issuer_data);
+    }
+}

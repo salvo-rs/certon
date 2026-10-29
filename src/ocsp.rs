@@ -359,8 +359,8 @@ pub async fn staple_ocsp(
     };
 
     // Try loading a cached OCSP response from storage.
-    match storage.load(&ocsp_storage_key).await {
-        Ok(cached_bytes) => {
+    match storage::load_ocsp_cache(storage, &first_name, &cert.hash).await {
+        Ok((cached_key, cached_bytes)) => {
             match parse_ocsp_response_for_cert_chain(&cached_bytes, &cert.cert_chain).await {
                 Ok(parsed) if is_ocsp_fresh(&parsed) => {
                     debug!(
@@ -393,7 +393,7 @@ pub async fn staple_ocsp(
                         "failed to parse cached OCSP response; deleting corrupt entry and fetching fresh one"
                     );
                     // Delete the corrupt cached staple from storage (best effort).
-                    if let Err(del_err) = storage.delete(&ocsp_storage_key).await {
+                    if let Err(del_err) = storage.delete(&cached_key).await {
                         warn!(
                             name = %first_name,
                             error = %del_err,

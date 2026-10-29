@@ -34,8 +34,7 @@ use async_trait::async_trait;
 
 use crate::error::{Error, Result, StorageError};
 use crate::storage::{
-    CertificateResource, Storage, load_certificate, site_cert_key, site_meta_key, site_private_key,
-    site_snapshot_key, store_certificate,
+    CertificateResource, Storage, certificate_storage_keys, load_certificate, store_certificate,
 };
 
 /// Somewhere certificates are kept.
@@ -110,12 +109,7 @@ impl CertStore for KeyValueCertStore {
         match load_certificate(self.storage.as_ref(), issuer, domain).await {
             Ok(resource) => Ok(Some(resource)),
             Err(Error::Storage(StorageError::NotFound(_))) => {
-                for key in [
-                    site_snapshot_key(issuer, domain),
-                    site_cert_key(issuer, domain),
-                    site_private_key(issuer, domain),
-                    site_meta_key(issuer, domain),
-                ] {
+                for key in certificate_storage_keys(issuer, domain) {
                     if self.storage.exists(&key).await? {
                         return Err(StorageError::Deserialize(format!(
                             "incomplete certificate resources for {domain} under {issuer}"
@@ -140,12 +134,7 @@ impl CertStore for KeyValueCertStore {
     async fn remove(&self, issuer: &str, domain: &str) -> Result<()> {
         // Delete legacy entries first so a failed removal cannot resurrect an
         // older resource when the current snapshot disappears.
-        for key in [
-            site_cert_key(issuer, domain),
-            site_private_key(issuer, domain),
-            site_meta_key(issuer, domain),
-            site_snapshot_key(issuer, domain),
-        ] {
+        for key in certificate_storage_keys(issuer, domain) {
             match self.storage.delete(&key).await {
                 Ok(()) | Err(Error::Storage(StorageError::NotFound(_))) => {}
                 Err(error) => return Err(error),
@@ -159,6 +148,7 @@ impl CertStore for KeyValueCertStore {
 pub(crate) mod tests {
     use super::*;
     use crate::file_storage::FileStorage;
+    use crate::storage::{site_cert_key, site_meta_key, site_private_key};
 
     fn store() -> (tempfile::TempDir, KeyValueCertStore) {
         let directory = tempfile::tempdir().expect("a temporary directory");
