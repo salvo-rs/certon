@@ -128,7 +128,9 @@ impl Drop for TemporaryWrite {
 /// `<path>/locks/<safe_name>.lock`. Ownership belongs to the open handle, so
 /// a crashed process releases it and an old owner cannot unlink a successor's
 /// lock. An active owner is never evicted based on timestamps. Empty or corrupt
-/// legacy lock metadata is harmless. This is not a fencing protocol: a shared
+/// legacy lock metadata is harmless. Unlocking releases the registry mutex before
+/// awaiting the blocking handle close; cancelling that await does not cancel the
+/// submitted close worker, which owns the handle. This is not a fencing protocol: a shared
 /// filesystem must implement cross-host advisory locking correctly. Stop old
 /// certon processes before upgrading; timestamp-based and OS locks must not be
 /// mixed on the same storage directory.
@@ -548,7 +550,13 @@ impl Storage for FileStorage {
     async fn unlock(&self, name: &str) -> Result<()> {
         // Removing our own handle cannot release another instance's lock.
         // There is no path-based check/remove operation and no renewal task.
-        if let Some(file) = self.held_locks.lock().await.remove(name) {
+        // A close may wait for blocking capacity. Release bookkeeping first so
+        // it cannot hold up independent keys on another runtime.
+        let file = {
+            let mut held_locks = self.held_locks.lock().await;
+            held_locks.remove(name)
+        };
+        if let Some(file) = file {
             tokio::task::spawn_blocking(move || drop(file))
                 .await
                 .map_err(|e| Error::Other(format!("unlock task failed: {e}")))?;
