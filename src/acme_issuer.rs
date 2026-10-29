@@ -42,6 +42,7 @@ use crate::account::{
 };
 use crate::acme_client::{
     AcmeClient, ExternalAccountBinding, LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING,
+    NewOrderOutcome,
 };
 use crate::crypto::{
     KeyType, encode_private_key_pem, generate_csr, generate_private_key_async,
@@ -988,12 +989,12 @@ impl AcmeIssuer {
             not_after: self.not_after.map(offset).transpose()?,
         };
         let order_result = client
-            .new_order_with_options(&account_key, &acct.location, domains, &options)
+            .new_order_for_issuer(&account_key, &acct.location, domains, &options)
             .await;
 
         let (order, order_url) = match order_result {
-            Ok(result) => result,
-            Err(ref e) if format!("{e}").contains("accountDoesNotExist") => {
+            Ok(NewOrderOutcome::Created(order, url)) => (*order, url),
+            Ok(NewOrderOutcome::AccountDoesNotExist) => {
                 warn!(
                     ca = %ca_url,
                     "account does not exist on CA, deleting local account and retrying"
