@@ -418,8 +418,9 @@ never wait for queue capacity or for a CA renewal. Shutdown cancels these reques
 and drops their callback futures before releasing their deduplication records.
 
 The built-in manager callback rechecks both the cached observation and shared
-storage after lifecycle lock waits. If another operation has replaced the leaf,
-it reloads the replacement safely instead of forcing another issuance. Custom
+storage after lifecycle lock waits. A healthy replacement is only reloaded;
+a replacement independently verified revoked or due follows its own single
+renewal attempt. Custom
 `maintain::start_maintenance*` callbacks retain their existing signature and
 receive the domain observed at dispatch; they must recheck their own resource
 identity after asynchronous waits before forcing a replacement. Maintenance
@@ -474,3 +475,18 @@ including previously cached suggestions. It does not erase suggestions needed by
 another enabled manager sharing the cache. The public low-level
 `Certificate::needs_renewal` has no policy argument and continues to use attached
 ARI, with a stable derived point if a valid window has no explicit local choice.
+
+## Recovery after a shared Must-Staple replacement
+
+An OCSP recovery queued for an old revoked leaf now plans against the resource
+currently selected from shared storage. A verified revoked replacement receives
+one forced renewal attempt; a due or time-invalid replacement follows normal
+renewal even if its required staple is unavailable. A fresh replacement with
+Unknown or unavailable OCSP does not cause forced issuance, and the Must-Staple
+serving requirement is unchanged.
+
+Recovery rechecks the stored identity after asynchronous preparation and admits
+management only while the original revoked observation is still managed. Removing
+or unmanaging that observation during issuer discovery cannot let a stale job
+create another managed entry. Independently verified revocation of an existing
+incoming cache entry still quarantines it and emits its notification.
