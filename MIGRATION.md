@@ -890,7 +890,9 @@ retired and you have retained an appropriate backup.
 
 For certificates, use `issuer.legacy_issuer_key()` (or
 `storage::legacy_issuer_key(directory_url)`) to load the operator-confirmed old
-resource through your `CertStore`, then save it under `issuer.issuer_key()`.
+resource through your `CertStore`, set its `resource.issuer_key` to the new
+`issuer.issuer_key()`, then save it under that key. Custom stores must preserve
+that metadata binding as well as the storage partition.
 Check an existing destination before copying and never overwrite another leaf.
 The manager intentionally performs no such ownership decision. ARI advice is
 fetched again for the new issuer identity; do not blindly copy old CA advice.

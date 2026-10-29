@@ -247,3 +247,234 @@ async fn canonical_urls_and_versioned_paths_keep_legacy_slugs_distinct() {
     storage.unlock(&old_lock).await.unwrap();
     storage.unlock(&new_lock).await.unwrap();
 }
+
+struct ReceiptStorage {
+    files: FileStorage,
+    mode: std::sync::atomic::AtomicU8,
+    fail_reads: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl Storage for ReceiptStorage {
+    async fn store(&self, key: &str, value: &[u8]) -> certon::Result<()> {
+        if key.contains("/account-migrations/") {
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => return Err(certon::Error::Other("receipt storage unavailable".into())),
+                2 => {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                _ => {}
+            }
+        }
+        self.files.store(key, value).await
+    }
+    async fn load(&self, key: &str) -> certon::Result<Vec<u8>> {
+        if key.contains("/account-migrations/")
+            && self.fail_reads.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(certon::Error::Other("receipt reads unavailable".into()));
+        }
+        self.files.load(key).await
+    }
+    async fn delete(&self, key: &str) -> certon::Result<()> {
+        self.files.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> certon::Result<bool> {
+        self.files.exists(key).await
+    }
+    async fn list(&self, key: &str, recursive: bool) -> certon::Result<Vec<String>> {
+        self.files.list(key, recursive).await
+    }
+    async fn stat(&self, key: &str) -> certon::Result<certon::KeyInfo> {
+        self.files.stat(key).await
+    }
+    async fn lock(&self, key: &str) -> certon::Result<()> {
+        self.files.lock(key).await
+    }
+    async fn unlock(&self, key: &str) -> certon::Result<()> {
+        self.files.unlock(key).await
+    }
+}
+
+#[tokio::test]
+async fn failed_or_cancelled_receipt_publication_is_retryable_and_fail_closed() {
+    use std::sync::atomic::Ordering;
+    for mode in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Arc::new(ReceiptStorage {
+            files: FileStorage::new(directory.path()),
+            mode: mode.into(),
+            fail_reads: false.into(),
+            entered: Default::default(),
+            release: Default::default(),
+        });
+        let original = account("https://ca.example:8443/account/old");
+        old_account(storage.as_ref(), CA, EMAIL, &original).await;
+        if mode == 1 {
+            assert!(
+                migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("receipt storage")
+            );
+        } else {
+            let migration = tokio::spawn({
+                let storage = storage.clone();
+                let original = original.clone();
+                async move { migrate_account_ca_identity(storage, CA, EMAIL, &original).await }
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                storage.entered.notified(),
+            )
+            .await
+            .unwrap();
+            migration.abort();
+            assert!(migration.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(
+            public_identity(
+                &get_account(storage.as_ref(), CA, EMAIL)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            ),
+            public_identity(&original)
+        );
+        // A partially migrated target is complete, but no receipt was accepted.
+        delete_account_locally(storage.as_ref(), CA, &original)
+            .await
+            .unwrap();
+        assert!(get_account(storage.as_ref(), CA, EMAIL).await.is_err());
+        storage.mode.store(0, Ordering::SeqCst);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        delete_account_locally(storage.as_ref(), CA, &original)
+            .await
+            .unwrap();
+        storage.fail_reads.store(true, Ordering::SeqCst);
+        assert!(
+            get_account(storage.as_ref(), CA, EMAIL)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("receipt reads")
+        );
+        storage.fail_reads.store(false, Ordering::SeqCst);
+        assert!(
+            get_account(storage.as_ref(), CA, EMAIL)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_foreign_receipts_do_not_retire_old_accounts() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let original = account("https://ca.example:8443/account/old");
+    old_account(storage.as_ref(), CA, EMAIL, &original).await;
+    migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original)
+        .await
+        .unwrap();
+    delete_account_locally(storage.as_ref(), CA, &original)
+        .await
+        .unwrap();
+    let receipt_key = storage
+        .list("acme", true)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|key| key.contains("/account-migrations/") && key.ends_with(".key"))
+        .unwrap();
+    let original_bytes = storage.load(&receipt_key).await.unwrap();
+    for field in [
+        "ca_url",
+        "configured_email",
+        "source_issuer",
+        "source_email",
+        "public_key_identity",
+        "location",
+    ] {
+        let mut receipt: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+        receipt[field] = "foreign".into();
+        storage
+            .store(&receipt_key, &serde_json::to_vec(&receipt).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            get_account(storage.as_ref(), CA, EMAIL).await.is_err(),
+            "foreign {field} was accepted"
+        );
+    }
+    storage.store(&receipt_key, b"invalid JSON").await.unwrap();
+    assert!(get_account(storage.as_ref(), CA, EMAIL).await.is_err());
+    storage.store(&receipt_key, &original_bytes).await.unwrap();
+    assert!(
+        get_account(storage.as_ref(), CA, EMAIL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn discovery_reads_bound_identity_instead_of_a_lossy_directory_name() {
+    for email in ["operator+prod@example.com", ""] {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let mut original = new_account(email, KeyType::EcdsaP256).unwrap();
+        original.location = "https://ca.example/account/known".into();
+        save_account(&storage, CA, &original).await.unwrap();
+        let found = certon::account::get_account_by_key(&storage, CA, &original.private_key_pem)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(public_identity(&found), public_identity(&original));
+        assert_eq!(
+            certon::account::most_recent_account_email(&storage, CA)
+                .await
+                .unwrap()
+                .as_deref(),
+            (!email.is_empty()).then_some(email)
+        );
+    }
+}
+
+#[tokio::test]
+async fn migration_retry_preserves_current_destination_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let original = account("https://ca.example:8443/account/old");
+    old_account(storage.as_ref(), CA, EMAIL, &original).await;
+    migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original)
+        .await
+        .unwrap();
+    let mut current = original.clone();
+    current.status = "updated-since-migration".into();
+    current
+        .contact
+        .push("mailto:extra-contact@example.com".into());
+    save_account(storage.as_ref(), CA, &current).await.unwrap();
+    migrate_account_ca_identity(storage.clone(), CA, EMAIL, &original)
+        .await
+        .unwrap();
+    let loaded = get_account(storage.as_ref(), CA, EMAIL)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.status, current.status);
+    assert_eq!(loaded.contact, current.contact);
+    assert_eq!(public_identity(&loaded), public_identity(&original));
+}

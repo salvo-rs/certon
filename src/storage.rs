@@ -953,27 +953,46 @@ mod tests {
 
     #[test]
     fn issuer_key_from_url() {
+        let url = "https://example.com/acme-ca/directory";
+        assert_eq!(legacy_issuer_key(url), "example.com-acme-ca-directory");
         assert_eq!(
-            issuer_key("https://example.com/acme-ca/directory"),
-            "example.com-acme-ca-directory"
+            issuer_key(url),
+            format!(
+                "_certon-ca-v2/{}",
+                storage_identity_hash(&format!("certon-acme-directory-v2\0url\0{url}"))
+            )
         );
     }
 
     #[test]
     fn issuer_key_no_path() {
-        assert_eq!(issuer_key("https://acme.example.com"), "acme.example.com");
+        assert_eq!(
+            issuer_key("https://acme.example.com"),
+            issuer_key("https://ACME.EXAMPLE.COM:443/")
+        );
+        assert_eq!(
+            legacy_issuer_key("https://acme.example.com"),
+            "acme.example.com"
+        );
     }
 
     #[test]
     fn issuer_key_non_url() {
-        assert_eq!(issuer_key("not-a-url"), "not-a-url");
+        assert_eq!(
+            issuer_key("not-a-url"),
+            format!(
+                "_certon-ca-v2/{}",
+                storage_identity_hash("certon-acme-directory-v2\0invalid\0not-a-url")
+            )
+        );
+        assert_eq!(legacy_issuer_key("not-a-url"), "not-a-url");
     }
 
     // -- key path builders -------------------------------------------------
 
     #[test]
     fn site_cert_key_format() {
-        let ik = issuer_key("https://example.com/acme-ca/directory");
+        let ik = legacy_issuer_key("https://example.com/acme-ca/directory");
         // base = "certificates/example.com-acme-ca-directory"
         assert_eq!(
             site_cert_key(&ik, "example.com"),
@@ -983,7 +1002,7 @@ mod tests {
 
     #[test]
     fn site_key_key_format() {
-        let ik = issuer_key("https://example.com/acme-ca/directory");
+        let ik = legacy_issuer_key("https://example.com/acme-ca/directory");
         assert_eq!(
             site_private_key(&ik, "example.com"),
             "certificates/example.com-acme-ca-directory/example.com/example.com.key"
@@ -992,7 +1011,7 @@ mod tests {
 
     #[test]
     fn site_meta_key_format() {
-        let ik = issuer_key("https://example.com/acme-ca/directory");
+        let ik = legacy_issuer_key("https://example.com/acme-ca/directory");
         assert_eq!(
             site_meta_key(&ik, "example.com"),
             "certificates/example.com-acme-ca-directory/example.com/example.com.json"
@@ -1001,7 +1020,7 @@ mod tests {
 
     #[test]
     fn wildcard_key_format() {
-        let ik = issuer_key("https://example.com/acme-ca/directory");
+        let ik = legacy_issuer_key("https://example.com/acme-ca/directory");
         let base = "certificates/example.com-acme-ca-directory";
         assert_eq!(
             site_cert_key(&ik, "*.example.com"),
@@ -1019,7 +1038,7 @@ mod tests {
 
     #[test]
     fn traversal_key_sanitized() {
-        let ik = issuer_key("https://example.com/acme-ca/directory");
+        let ik = legacy_issuer_key("https://example.com/acme-ca/directory");
         let base = "certificates/example.com-acme-ca-directory";
 
         // "a/../../../foo" -> safe -> "afoo"
