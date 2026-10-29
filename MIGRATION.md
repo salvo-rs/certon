@@ -716,3 +716,16 @@ Default, finite and zero durations keep their existing meaning: cleanup deletes
 an asset only when its expiration or modification time plus retention is strictly
 before the cleanup run's timestamp. The public options and result counters are
 unchanged. Callers must still coordinate cleanup with writers as documented.
+
+## Public ACME polling budgets
+
+The timeout passed to `AcmeClient::poll_authorization` or `poll_order` now
+bounds the complete operation, including an in-flight request, nonce retry,
+response-body read and backoff. Timeout errors retain the `Error::Timeout`
+classification; terminal ACME statuses and their error details are unchanged.
+A timed-out request is cancelled, and a subsequent call can reuse the client.
+Large duration budgets do not use unchecked `Instant` addition.
+
+The existing high-level issuer deadline remains in place. Callers of these
+lower-level polling APIs now receive their requested total budget even when
+a CA stalls before headers or while sending the response body.
