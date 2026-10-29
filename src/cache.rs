@@ -143,7 +143,11 @@ pub struct CacheOptions {
 
     /// Maximum number of certificates allowed in the cache. When the cache
     /// reaches capacity, a random managed certificate is evicted to make room.
-    /// A value of `0` means unlimited.
+    /// Reducing this limit immediately evicts managed entries until the cache
+    /// fits or only unmanaged entries remain. Unmanaged entries are protected:
+    /// they can exceed the limit, and a subsequent insertion can still add one
+    /// entry while evicting an older managed entry if available.
+    /// A value of `0` means unlimited and does not evict existing entries.
     pub capacity: usize,
 
     /// Optional callback invoked when a cache event occurs (add, remove,
@@ -233,6 +237,9 @@ pub struct CertCache {
 
 #[derive(Default)]
 struct CacheState {
+    // Authoritative at publication, including after asynchronous preparation
+    // or an earlier clone of the event/configuration options.
+    capacity: usize,
     certificates: HashMap<String, CachedCertificate>,
     index: HashMap<String, Vec<String>>,
     /// Live chain hashes grouped by leaf, independent of SAN or managed state.
@@ -590,12 +597,20 @@ impl CacheState {
             .collect()
     }
 
+    fn evict_managed(&mut self) -> Option<CacheEvent> {
+        if self.managed_hashes.is_empty() {
+            return None;
+        }
+        let index = rand::rng().random_range(0..self.managed_hashes.len());
+        let hash = self.managed_hashes[index].clone();
+        self.remove(&hash)
+    }
+
     fn add(
         &mut self,
         cert: Certificate,
         key: PreparedKey,
         leaf_hash: Option<String>,
-        options: &CacheOptions,
         events: &mut Vec<CacheEvent>,
     ) {
         if leaf_hash
@@ -660,15 +675,11 @@ impl CacheState {
             self.change_ocsp_deadline(&hash, old_deadline, new_deadline);
             return;
         }
-        if options.capacity > 0
-            && self.certificates.len() >= options.capacity
-            && !self.managed_hashes.is_empty()
+        if self.capacity > 0
+            && self.certificates.len() >= self.capacity
+            && let Some(event) = self.evict_managed()
         {
-            let index = rand::rng().random_range(0..self.managed_hashes.len());
-            let hash = self.managed_hashes[index].clone();
-            if let Some(event) = self.remove(&hash) {
-                events.push(event);
-            }
+            events.push(event);
         }
         for name in &cert.names {
             self.index
@@ -740,9 +751,13 @@ impl CertCache {
     pub fn new(options: CacheOptions) -> Arc<Self> {
         let (stop_tx, _) = watch::channel(false);
         let (done_tx, _) = watch::channel(true);
+        let options = normalize_options(options);
         Arc::new(Self {
-            state: RwLock::new(CacheState::default()),
-            options: RwLock::new(normalize_options(options)),
+            state: RwLock::new(CacheState {
+                capacity: options.capacity,
+                ..Default::default()
+            }),
+            options: RwLock::new(options),
             stop_tx,
             done_tx,
             maintenance_count: Mutex::new(0),
@@ -753,8 +768,31 @@ impl CertCache {
     }
 
     /// Update cache options; zero intervals are replaced with their defaults.
+    /// A finite capacity immediately evicts managed entries until the cache
+    /// fits or only protected unmanaged entries remain. Removal callbacks run
+    /// after releasing the configuration and certificate locks.
     pub async fn set_options(&self, options: CacheOptions) {
-        *self.options.write().unwrap_or_else(|e| e.into_inner()) = normalize_options(options);
+        let options = normalize_options(options);
+        let mut events = Vec::new();
+        let previous = {
+            // The only combined lock order is options -> state. Publishers
+            // release their options snapshot before taking the state lock.
+            let mut configured = self.options.write().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            state.capacity = options.capacity;
+            while state.capacity > 0 && state.certificates.len() > state.capacity {
+                let Some(event) = state.evict_managed() else {
+                    break;
+                };
+                events.push(event);
+            }
+            std::mem::replace(&mut *configured, options.clone())
+        };
+        // Dropping the previous callback/configuration can run user-owned
+        // destructors, so it must not retain either cache lock either.
+        drop(previous);
+        self.notify_ocsp_schedule();
+        dispatch_events(&options, events);
     }
 
     /// Persist a stop request, including when maintenance has not subscribed yet.
@@ -1336,7 +1374,7 @@ impl CertCache {
             {
                 events.push(event);
             }
-            state.add(cert, key, leaf_hash, &options, &mut events);
+            state.add(cert, key, leaf_hash, &mut events);
             if domain.is_some()
                 && let Some(entry) = state
                     .certificates
@@ -1872,7 +1910,7 @@ impl CertCache {
                     }
                 }
             }
-            state.add(cert, key, leaf_hash, &options, &mut events);
+            state.add(cert, key, leaf_hash, &mut events);
         }
         self.notify_ocsp_schedule();
         dispatch_events(&options, events);
@@ -3154,6 +3192,173 @@ pub(crate) mod tests {
         // All three should be present because eviction only targets managed
         // certs and there were none to evict.
         assert_eq!(cache.count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn capacity_resize_reclaims_all_indices_and_dispatches_outside_both_locks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = CertCache::new(CacheOptions::default());
+        let mut originals = Vec::new();
+        for _ in 0..6 {
+            let (mut cert, issuer) = signed_certificate();
+            cert.managed = true;
+            cert.ocsp_response = Some(signed_staple(&cert, &issuer, 3600));
+            originals.push(cert.clone());
+            cache.add(cert).await;
+        }
+        let removed = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&cache);
+        cache
+            .set_options(CacheOptions {
+                capacity: 1,
+                on_event: Some(Arc::new({
+                    let removed = removed.clone();
+                    move |event| {
+                        assert!(matches!(event, CacheEvent::Removed { .. }));
+                        let cache = weak.upgrade().unwrap();
+                        // Both guards must have been released before invoking
+                        // user code, which can re-enter configuration and TLS.
+                        assert_eq!(
+                            cache
+                                .options
+                                .try_read()
+                                .expect("options lock retained")
+                                .capacity,
+                            1
+                        );
+                        assert!(cache.state.try_read().is_ok(), "state lock retained");
+                        assert!(cache.resolve("ocsp.example.com").is_some());
+                        removed.fetch_add(1, Ordering::SeqCst);
+                    }
+                })),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(removed.load(Ordering::SeqCst), 5);
+        let current = cache.get_all().await;
+        assert_eq!(current.len(), 1);
+        assert_eq!(cache.maintenance_snapshot(true).len(), 1);
+        assert_cache_indices(&cache);
+        {
+            let state = cache.state.read().unwrap();
+            assert_eq!(state.index["ocsp.example.com"].len(), 1);
+            assert_eq!(state.chains_by_leaf.len(), 1);
+            assert_eq!(
+                state
+                    .ocsp_deadlines
+                    .values()
+                    .map(HashSet::len)
+                    .sum::<usize>(),
+                1
+            );
+            for hashes in state
+                .chains_by_leaf
+                .values()
+                .chain(state.ocsp_deadlines.values())
+            {
+                assert!(
+                    hashes
+                        .iter()
+                        .all(|hash| state.certificates.contains_key(hash))
+                );
+            }
+        }
+        let surviving = &current[0];
+        assert_eq!(
+            signed_cache_handshake(cache.clone(), surviving.cert_chain[1].clone())
+                .await
+                .unwrap(),
+            surviving.cert_chain[0].as_ref()
+        );
+        // Evicted leaves have no stale reverse membership; their quarantine
+        // cannot remove an unrelated survivor or leave dangling deadlines.
+        cache
+            .set_options(CacheOptions {
+                capacity: 1,
+                ..Default::default()
+            })
+            .await;
+        for cert in originals.iter().filter(|cert| cert.hash != surviving.hash) {
+            let leaf = crate::storage::certificate_leaf_hash(cert).unwrap();
+            cache.deny_revoked_certificate(&leaf).await;
+        }
+        assert!(cache.get_by_hash(&surviving.hash).await.is_some());
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn prepared_admission_uses_current_capacity_after_an_old_options_snapshot() {
+        let cache = CertCache::new(CacheOptions::default());
+        for hash in ["first", "second", "third"] {
+            cache.add(make_cert(&["example.com"], hash, true)).await;
+        }
+        let (mut incoming, _) = signed_certificate();
+        incoming.managed = true;
+        let root = incoming.cert_chain[1].clone();
+        let hash = incoming.hash.clone();
+        let prepared = PreparedKey::for_certificate(&incoming).await;
+        let leaf_hash = crate::storage::certificate_leaf_hash(&incoming);
+        // Capture precisely the publication boundary that can race resizing:
+        // key preparation and the callback/options snapshot are complete, but
+        // publication has not acquired the certificate write lock yet.
+        let old_options = cache.options.read().unwrap().clone();
+        assert_eq!(old_options.capacity, 0);
+        cache
+            .set_options(CacheOptions {
+                capacity: 1,
+                ..Default::default()
+            })
+            .await;
+        let mut events = Vec::new();
+        cache
+            .state
+            .write()
+            .unwrap()
+            .add(incoming, prepared, leaf_hash, &mut events);
+        cache.notify_ocsp_schedule();
+        dispatch_events(&old_options, events);
+        assert_eq!(cache.count().await, 1);
+        assert!(cache.get_by_hash(&hash).await.is_some());
+        assert_cache_indices(&cache);
+        assert!(signed_cache_handshake(cache, root).await.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_resize_and_publication_keep_the_latest_finite_bound() {
+        let cache = CertCache::new(CacheOptions::default());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let publisher = tokio::spawn({
+            let cache = cache.clone();
+            let barrier = barrier.clone();
+            async move {
+                for index in 0..128 {
+                    barrier.wait().await;
+                    cache
+                        .add(make_cert(
+                            &["example.com"],
+                            &format!("concurrent-{index}"),
+                            true,
+                        ))
+                        .await;
+                    barrier.wait().await;
+                }
+            }
+        });
+        for index in 0..128 {
+            barrier.wait().await;
+            let capacity = 1 + index % 4;
+            cache
+                .set_options(CacheOptions {
+                    capacity,
+                    ..Default::default()
+                })
+                .await;
+            barrier.wait().await;
+            assert!(cache.count().await <= capacity);
+        }
+        publisher.await.unwrap();
+        assert_cache_indices(&cache);
     }
 
     #[tokio::test]
