@@ -116,6 +116,7 @@ struct Issuer {
     info: Mutex<Option<RenewalInfo>>,
     calls: AtomicUsize,
     issues: AtomicUsize,
+    issued: Notify,
     active: AtomicUsize,
     peak: AtomicUsize,
     gate: Semaphore,
@@ -123,6 +124,7 @@ struct Issuer {
     entered: Notify,
     upstream: Mutex<Option<Arc<crate::AcmeIssuer>>>,
     dynamic: AtomicBool,
+    short_window: AtomicBool,
 }
 
 impl Issuer {
@@ -131,6 +133,7 @@ impl Issuer {
             info: Mutex::new(info),
             calls: AtomicUsize::new(0),
             issues: AtomicUsize::new(0),
+            issued: Notify::new(),
             active: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             gate: Semaphore::new(0),
@@ -138,6 +141,7 @@ impl Issuer {
             entered: Notify::new(),
             upstream: Mutex::new(None),
             dynamic: AtomicBool::new(false),
+            short_window: AtomicBool::new(false),
         }
     }
 }
@@ -149,6 +153,7 @@ impl CertIssuer for Issuer {
     }
     async fn issue(&self, csr: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
         self.issues.fetch_add(1, Ordering::SeqCst);
+        self.issued.notify_one();
         let (_, csr) =
             x509_parser::certification_request::X509CertificationRequest::from_der(csr).unwrap();
         let public = Public(
@@ -189,7 +194,11 @@ impl CertIssuer for Issuer {
         if let Some(upstream) = upstream {
             return upstream.renewal_info(leaf).await;
         }
-        let mut info = self.info.lock().unwrap().clone();
+        let mut info = if self.short_window.load(Ordering::SeqCst) {
+            Some(info(2, 3))
+        } else {
+            self.info.lock().unwrap().clone()
+        };
         if self.dynamic.load(Ordering::SeqCst)
             && let Some(window) = info
                 .as_mut()
@@ -511,21 +520,70 @@ async fn maintenance_pool_is_bounded_and_stop_drops_all_pending_requests() {
 #[tokio::test]
 async fn selected_deadline_wakes_normal_maintenance_before_its_ten_minute_tick() {
     let storage = Arc::new(Memory::default());
-    let issuer = Arc::new(Issuer::new(Some(info(1, 2))));
-    let manager = manager(storage.clone(), issuer.clone(), false, None);
+    let issuer = Arc::new(Issuer::new(None));
+    issuer.short_window.store(true, Ordering::SeqCst);
+    let mut manager = manager(storage.clone(), issuer.clone(), false, None);
+    manager.policy.reuse_private_keys = true;
     let cert = cached(&manager, &resource("timer.example", 1, 90)).await;
     refresh(&manager, &cert).await;
+    let selected = manager
+        .cache
+        .get_by_hash(&cert.hash)
+        .await
+        .unwrap()
+        .ari
+        .unwrap()
+        .selected_time
+        .unwrap();
+    let attempts = observe_timer_renewal(&mut manager, &issuer, "timer.example");
+    assert!(selected > Utc::now());
+    assert!(attempts.lock().unwrap().is_empty());
     let task = crate::start_maintenance(&manager);
+    wait_for_issues(&issuer, 1).await;
+    manager.cache.stop();
+    task.await.unwrap();
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0] >= selected,
+        "renewal must not start before the selected point"
+    );
+    assert_eq!(issuer.issues.load(Ordering::SeqCst), 1);
+}
+
+// Record the actual manager entry and give its replacement a later window.
+// Otherwise reusing the same short mock window for every newly issued leaf can
+// cause repeated legitimate renewals before the test gets to stop maintenance.
+fn observe_timer_renewal(
+    manager: &mut CertManager,
+    issuer: &Arc<Issuer>,
+    name: &'static str,
+) -> Arc<Mutex<Vec<DateTime<Utc>>>> {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let observed = attempts.clone();
+    let issuer = issuer.clone();
+    manager.on_event = Some(Arc::new(move |event, data| {
+        if event == crate::manager::EVENT_CERT_OBTAINING
+            && data["identifier"] == name
+            && data["renewal"] == true
+        {
+            observed.lock().unwrap().push(Utc::now());
+            issuer.short_window.store(false, Ordering::SeqCst);
+            *issuer.info.lock().unwrap() = Some(info(86400, 86400 * 2));
+        }
+        Ok(())
+    }));
+    attempts
+}
+
+async fn wait_for_issues(issuer: &Issuer, expected: usize) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while issuer.issues.load(Ordering::SeqCst) == 0 {
-            tokio::task::yield_now().await;
+        while issuer.issues.load(Ordering::SeqCst) < expected {
+            issuer.issued.notified().await;
         }
     })
     .await
     .unwrap();
-    manager.cache.stop();
-    task.await.unwrap();
-    assert_eq!(issuer.issues.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -949,22 +1007,35 @@ async fn a_new_leaf_published_after_the_initial_scan_gets_its_short_window_timer
     let storage = Arc::new(Memory::default());
     let issuer = Arc::new(Issuer::new(None));
     issuer.gated.store(true, Ordering::SeqCst);
-    let manager = manager(storage, issuer.clone(), false, None);
+    let mut manager = manager(storage.clone(), issuer.clone(), false, None);
+    manager.policy.reuse_private_keys = true;
     cached(&manager, &resource("initial-scan.example", 1, 90)).await;
+    let attempts = observe_timer_renewal(&mut manager, &issuer, "new-after-scan.example");
     let task = crate::start_maintenance(&manager);
     issuer.entered.notified().await; // Initial membership scan has completed.
     issuer.gated.store(false, Ordering::SeqCst);
-    *issuer.info.lock().unwrap() = Some(info(1, 2));
+    // Generate the recommendation when its real fetch returns, rather than
+    // before initial issuance can wait on the shared key generation budget.
+    issuer.short_window.store(true, Ordering::SeqCst);
     manager.obtain("new-after-scan.example").await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while issuer.issues.load(Ordering::SeqCst) < 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert_eq!(issuer.issues.load(Ordering::SeqCst), 1);
+    let cert = manager
+        .cache
+        .get_by_name("new-after-scan.example")
+        .await
+        .unwrap();
+    let selected = cert.ari.unwrap().selected_time.unwrap();
+    assert!(selected > Utc::now());
+    assert!(attempts.lock().unwrap().is_empty());
+    wait_for_issues(&issuer, 2).await;
     manager.cache.stop();
     task.await.unwrap();
+    let attempts = attempts.lock().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0] >= selected,
+        "the new leaf's timer must not fire early"
+    );
     assert_eq!(issuer.issues.load(Ordering::SeqCst), 2);
     assert_eq!(issuer.active.load(Ordering::SeqCst), 0);
 }
