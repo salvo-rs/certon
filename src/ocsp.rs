@@ -586,13 +586,16 @@ async fn fetch_issuer_cert(url: &str) -> Result<Vec<u8>> {
 
     let response = client.get(url).send().await.map_err(|e| {
         CertError::OcspFailed(format!(
-            "failed to fetch issuer certificate from {url}: {e}"
+            "failed to fetch issuer certificate from {}: {}",
+            diagnostic_endpoint(url),
+            e.without_url()
         ))
     })?;
 
     if !response.status().is_success() {
         return Err(CertError::OcspFailed(format!(
-            "issuer certificate fetch from {url} returned HTTP {}",
+            "issuer certificate fetch from {} returned HTTP {}",
+            diagnostic_endpoint(url),
             response.status()
         ))
         .into());
@@ -649,12 +652,12 @@ pub(crate) async fn parse_ocsp_response_for_cert_chain(
         for url in &issuer_urls {
             match fetch_issuer_cert(url).await {
                 Ok(der_bytes) => {
-                    debug!(url = %url, "fetched issuer certificate from AIA extension");
+                    debug!(endpoint = %diagnostic_endpoint(url), "fetched issuer certificate from AIA extension");
                     downloaded = Some(der_bytes);
                     break;
                 }
                 Err(e) => {
-                    debug!(url = %url, error = %e, "failed to fetch issuer from AIA URL");
+                    debug!(endpoint = %diagnostic_endpoint(url), error = %e, "failed to fetch issuer from AIA URL");
                 }
             }
         }
@@ -725,12 +728,12 @@ async fn get_ocsp_for_cert_chain(
         for url in &issuer_urls {
             match fetch_issuer_cert(url).await {
                 Ok(der_bytes) => {
-                    debug!(url = %url, "fetched issuer certificate from AIA extension");
+                    debug!(endpoint = %diagnostic_endpoint(url), "fetched issuer certificate from AIA extension");
                     downloaded = Some(der_bytes);
                     break;
                 }
                 Err(e) => {
-                    debug!(url = %url, error = %e, "failed to fetch issuer from AIA URL");
+                    debug!(endpoint = %diagnostic_endpoint(url), error = %e, "failed to fetch issuer from AIA URL");
                 }
             }
         }
@@ -768,7 +771,7 @@ async fn get_ocsp_for_cert_chain(
 
     // Extract OCSP responder URL from the leaf (used as fallback).
     let ocsp_url: String = if let Some(url) = override_url {
-        debug!(url = %url, "using responder override URL");
+        debug!(endpoint = %diagnostic_endpoint(&url), "using responder override URL");
         url
     } else {
         let ocsp_urls = extract_ocsp_urls_from_parsed(&leaf)?;
@@ -932,6 +935,18 @@ fn hash_issuer_public_key(issuer: &X509Certificate<'_>) -> Result<Vec<u8>> {
 // OCSP HTTP transport
 // ---------------------------------------------------------------------------
 
+/// Diagnostics need an endpoint identity, never credentials or routing tokens.
+/// Even the path may contain a secret. Invalid input is intentionally not echoed
+/// through either its original value or a URL parser error.
+fn diagnostic_endpoint(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => {
+            url.origin().ascii_serialization()
+        }
+        _ => "<invalid or non-HTTP endpoint>".into(),
+    }
+}
+
 /// Send an OCSP request to the given responder URL via HTTP POST.
 async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
     let client = crate::http::client()?;
@@ -943,7 +958,13 @@ async fn send_ocsp_request(url: &str, request_der: &[u8]) -> Result<Vec<u8>> {
         .body(request_der.to_vec())
         .send()
         .await
-        .map_err(|e| CertError::OcspFailed(format!("OCSP HTTP request to {url} failed: {e}")))?;
+        .map_err(|e| {
+            CertError::OcspFailed(format!(
+                "OCSP HTTP request to {} failed: {}",
+                diagnostic_endpoint(url),
+                e.without_url()
+            ))
+        })?;
 
     if !response.status().is_success() {
         return Err(CertError::OcspFailed(format!(
@@ -964,11 +985,9 @@ async fn read_limited_response(mut response: reqwest::Response, limit: usize) ->
         return Err(CertError::OcspFailed(format!("response exceeds {limit} byte limit")).into());
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| CertError::OcspFailed(format!("failed to read response body: {e}")))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        CertError::OcspFailed(format!("failed to read response body: {}", e.without_url()))
+    })? {
         if chunk.len() > limit.saturating_sub(body.len()) {
             return Err(
                 CertError::OcspFailed(format!("response exceeds {limit} byte limit")).into(),
