@@ -400,7 +400,8 @@ impl Certificate {
 /// This function loads the certificate PEM and private key PEM from storage
 /// using the standard key paths for the given `issuer_key` and `domain`,
 /// parses them into a [`Certificate`], marks it as managed, and replaces
-/// any existing certificate for those SANs in the cache.
+/// an existing certificate only when the replacement covers all its actual
+/// DNS/IP SANs. Partial replacements keep the old entry for its other names.
 ///
 /// This is useful after an external renewal (e.g. by another cluster node)
 /// has written a new certificate to shared storage.
@@ -408,9 +409,12 @@ impl Certificate {
 /// # Errors
 ///
 /// Returns an error if the certificate or key cannot be loaded from storage,
-/// if the PEM data is invalid, or if the certificate is outside its validity
-/// period, or a required Must-Staple response is unavailable. Invalid
-/// replacements leave the existing cached certificate intact.
+/// if the PEM data is invalid, if the actual SANs do not cover `domain`, if
+/// the private key does not match the leaf, if the certificate is outside its
+/// validity period, or if a required Must-Staple response is unavailable. Invalid
+/// replacements leave the existing cached certificate intact. Persisted
+/// revocation intent still quarantines its matching cached leaf, including
+/// when the replacement's private key or identity would otherwise be rejected.
 pub async fn reload_managed_certificate(
     cache: &crate::cache::CertCache,
     storage: &dyn crate::storage::Storage,
@@ -418,7 +422,7 @@ pub async fn reload_managed_certificate(
     issuer_key: &str,
 ) -> Result<()> {
     let resource = crate::storage::load_certificate(storage, issuer_key, domain).await?;
-    let mut cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
+    let cert = Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
     if let Some(leaf_hash) = crate::storage::certificate_leaf_hash(&cert)
         && crate::storage::load_revocation(storage, &leaf_hash)
             .await?
@@ -436,21 +440,29 @@ pub async fn reload_managed_certificate(
     if cert.expired() {
         return Err(crate::error::CertError::Expired(domain.to_owned()).into());
     }
-    cert.managed = true;
-    cert.issuer_key = issuer_key.to_owned();
+    // This helper historically addressed OCSP by the PEM's first name, which
+    // can be its CN. Preserve that lookup without using it to authorize TLS.
+    let ocsp_lookup_names = cert.names.clone();
+    let mut cert =
+        crate::manager::CertManager::validate_managed_certificate(cert, domain, issuer_key)?;
     crate::ari::attach_cached(storage, cache, &mut cert, false).await;
     if crate::ocsp::requires_ocsp_staple(&cert)? {
-        crate::ocsp::staple_ocsp(storage, &mut cert, &crate::ocsp::OcspConfig::default()).await?;
+        let canonical_names = std::mem::replace(&mut cert.names, ocsp_lookup_names);
+        let result =
+            crate::ocsp::staple_ocsp(storage, &mut cert, &crate::ocsp::OcspConfig::default()).await;
+        cert.names = canonical_names;
+        result?;
     }
 
     // Find the existing certificate in the cache for replacement.
     let existing = cache.get_by_name(domain).await;
     match existing {
-        Some(old_cert) => {
+        Some(old_cert) if crate::manager::CertManager::covers_certificate(&cert, &old_cert) => {
             cache.replace_managed(&old_cert.hash, cert, domain).await?;
         }
-        None => {
-            // No existing cert to replace; just add it.
+        _ => {
+            // Keep an overlapping old leaf if it still supplies other SANs.
+            // Invalid input has already been rejected before either mutation.
             cache.add_managed(cert, domain).await?;
         }
     }
@@ -1248,6 +1260,61 @@ mod tests {
             )
             .await
             .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_reload_keeps_legacy_cn_ocsp_cache_without_losing_the_storage_alias() {
+        use crate::storage::{CertificateResource, Storage, ocsp_key, store_certificate};
+        let domain = "ocsp.example.com";
+        let (cert, issuer) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        assert_ne!(
+            cert.names[0], domain,
+            "fixture must exercise a distinct legacy CN"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::FileStorage::new(directory.path());
+        let resource = CertificateResource {
+            sans: vec![domain.into()],
+            certificate_pem: cert
+                .cert_chain
+                .iter()
+                .map(|der| ::pem::encode(&::pem::Pem::new("CERTIFICATE", der.as_ref())))
+                .collect::<String>()
+                .into_bytes(),
+            private_key_pem: ::pem::encode(&::pem::Pem::new(
+                "PRIVATE KEY",
+                cert.private_key_der.clone().unwrap(),
+            ))
+            .into_bytes(),
+            issuer_key: "test-ca".into(),
+            issuer_data: None,
+        };
+        store_certificate(&storage, "test-ca", &resource)
+            .await
+            .unwrap();
+        let raw = crate::cache::tests::signed_staple(&cert, &issuer, 4 * 3600);
+        let legacy_key = ocsp_key(&cert.names[0], &cert.hash);
+        let canonical_key = ocsp_key(domain, &cert.hash);
+        storage.store(&legacy_key, &raw).await.unwrap();
+        assert!(!storage.exists(&canonical_key).await.unwrap());
+        // There is no responder AIA or canonical cache entry. Only the existing
+        // signed legacy cache can satisfy this certificate's real Must-Staple.
+        let cache = crate::CertCache::new(crate::CacheOptions::default());
+        reload_managed_certificate(&cache, &storage, domain, "test-ca")
+            .await
+            .unwrap();
+        let served = cache.resolve(domain).unwrap();
+        assert_eq!(served.key.ocsp.as_ref(), Some(&raw));
+        let managed = cache.get_by_hash(&cert.hash).await.unwrap();
+        assert!(managed.managed);
+        assert_eq!(managed.issuer_key, "test-ca");
+        assert_eq!(managed.names[0], domain);
+        assert!(managed.names.contains(&cert.names[0]));
+        assert_eq!(storage.load(&legacy_key).await.unwrap(), raw);
+        assert!(
+            !storage.exists(&canonical_key).await.unwrap(),
+            "reload must not migrate or duplicate the OCSP cache"
         );
     }
 
