@@ -849,3 +849,50 @@ This affects logs and error text only. Requests still use the configured URL
 and credentials, and retain their existing timeout, size-limit, signature and
 serving-admission behavior. Error categories, HTTP statuses and operation labels
 remain available for troubleshooting.
+
+## Full ACME directory storage identities
+
+ACME `issuer_key()` now identifies the complete normalized directory URL with
+`_certon-ca-v2/<sha256>`. Scheme, non-default port, user information, path and
+query distinguish endpoints; fragments do not, and URL-equivalent host case,
+default ports and dot segments normalize together. Certificate and account
+storage use an additional versioned directory level, so an old URL-derived
+slug cannot masquerade as a new digest identity. Account locks use that same
+separate namespace. Ordinary custom issuer keys and fixed ZeroSSL wrapper keys
+are unchanged.
+
+Existing ACME accounts and certificate resources are **not automatically
+adopted**. Old records do not identify which full directory endpoint owned their
+lossy namespace. If only old resources are found, management and account loading
+return a migration error rather than silently sharing them or creating another
+account/certificate. Review the full original URL and configured account identity
+before upgrading, especially when directories differed by port, query or a path
+whose separators collapsed to hyphens. Stop old certon versions first.
+
+After confirming ownership, migrate an account with
+`account::migrate_account_ca_identity(storage.clone(), directory_url, email,
+&original_account).await?`. Supply the original registered account's key and
+registration URI, obtained from your trusted backup/export. Matching that
+generation protects against stale migration input; it does not prove which CA
+owned an ambiguous old slot. A different destination account is never replaced.
+The new private snapshot binds both the normalized directory and configured email
+independently of mutable CA contacts. Missing bindings are errors; an explicit
+`null` configured identity represents the no-email account.
+
+Migration retains the old record and writes a private, source-generation receipt.
+That receipt lets later account-missing recovery retire the known old account
+without resurrecting it or blocking re-registration. A changed old generation,
+malformed receipt or backend error still fails closed. Migration succeeds only
+after both new snapshot and receipt are stored. A failure/cancellation can leave
+the complete new snapshot; retry the migration with the same verified account
+to finish its receipt. Do not remove legacy records until all old readers are
+retired and you have retained an appropriate backup.
+
+For certificates, use `issuer.legacy_issuer_key()` (or
+`storage::legacy_issuer_key(directory_url)`) to load the operator-confirmed old
+resource through your `CertStore`, then save it under `issuer.issuer_key()`.
+Check an existing destination before copying and never overwrite another leaf.
+The manager intentionally performs no such ownership decision. ARI advice is
+fetched again for the new issuer identity; do not blindly copy old CA advice.
+Global leaf revocation markers remain unchanged and still block revoked leaves
+across all namespaces and chains.

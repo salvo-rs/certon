@@ -22,7 +22,9 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result, StorageError};
-use crate::storage::{KeyInfo, Storage, safe_key, storage_identity_hash};
+#[cfg(test)]
+use crate::storage::safe_key;
+use crate::storage::{KeyInfo, Storage, storage_identity_hash};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -270,7 +272,7 @@ impl FileStorage {
 
     /// Return the path to a specific lock file.
     fn lock_filename(&self, name: &str) -> PathBuf {
-        let identity = safe_key(name);
+        let identity = crate::storage::lock_storage_identity(name);
         let filename = format!("{identity}.lock");
         if filename.len() <= 255 {
             self.lock_dir().join(filename)

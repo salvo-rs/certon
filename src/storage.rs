@@ -348,7 +348,35 @@ fn path_join(parts: &[&str]) -> String {
 ///
 /// Example: `"certificates/<safe_issuer_key>"`
 pub fn certs_prefix(issuer_key: &str) -> String {
-    path_join(&[PREFIX_CERTS, &safe_key(issuer_key)])
+    path_join(&[PREFIX_CERTS, &issuer_namespace(issuer_key)])
+}
+
+fn ca_identity_digest(issuer: &str) -> Option<&str> {
+    issuer.strip_prefix("_certon-ca-v2/").filter(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn issuer_namespace(issuer: &str) -> String {
+    match ca_identity_digest(issuer) {
+        Some(hash) => format!("_certon-ca-v2/{hash}"),
+        None => safe_key(issuer),
+    }
+}
+
+pub(crate) fn lock_storage_identity(name: &str) -> String {
+    // A slash-bearing v2 identity has a distinct lock namespace too: an old
+    // URL-derived slug must not alias it after generic filename sanitization.
+    match name
+        .strip_prefix("acme_account_")
+        .and_then(ca_identity_digest)
+    {
+        Some(hash) => format!("_certon-ca-v2/acme_account_{hash}"),
+        None => safe_key(name),
+    }
 }
 
 /// Return the storage key prefix for a specific site (domain) under a given
@@ -484,18 +512,36 @@ pub(crate) async fn load_ocsp_cache(
     }
 }
 
-/// Sanitize a CA URL into a storage-safe issuer key.
+/// Return a bounded identity for the complete ACME directory endpoint.
 ///
-/// The URL is parsed and reduced to `host` + a hyphen-collapsed path
-/// component:
-///
-/// ```text
-/// "https://acme.example.com/v2/directory"
-///     -> "acme.example.com-v2-directory"
-/// ```
-///
-/// If the URL cannot be parsed, the raw string is returned as-is.
+/// URL parsing normalizes host/scheme case, default ports and dot path segments.
+/// Non-default ports, user information, path and query remain significant; a
+/// fragment is omitted because it is never part of an HTTP request. The digest
+/// keeps credentials out of filenames and bounds every derived path component.
+/// Invalid URL input uses a separate digest domain and is still rejected by
+/// the HTTP transport when used. It cannot alias a parsed endpoint identity.
 pub fn issuer_key(ca_url: &str) -> String {
+    let (kind, identity) = match canonical_ca_url(ca_url) {
+        Some(url) => ("url", url),
+        None => ("invalid", ca_url.to_owned()),
+    };
+    format!(
+        "_certon-ca-v2/{}",
+        storage_identity_hash(&format!("certon-acme-directory-v2\0{kind}\0{identity}"))
+    )
+}
+
+pub(crate) fn canonical_ca_url(ca_url: &str) -> Option<String> {
+    let mut parsed = url::Url::parse(ca_url).ok()?;
+    parsed.set_fragment(None);
+    Some(parsed.into())
+}
+
+/// Return the pre-v2, lossy issuer key for explicit operator migration only.
+///
+/// This value is not an endpoint identity: different ports, queries and paths
+/// can share it. Never use it to automatically adopt an old account or resource.
+pub fn legacy_issuer_key(ca_url: &str) -> String {
     match url::Url::parse(ca_url) {
         Ok(parsed) => {
             let host = parsed.host_str().unwrap_or(ca_url);
@@ -520,13 +566,19 @@ pub fn issuer_key(ca_url: &str) -> String {
 ///
 /// Example: `"acme/<safe_issuer_key>"`
 pub fn acme_ca_prefix(issuer_key: &str) -> String {
-    path_join(&[PREFIX_ACME, &safe_key(issuer_key)])
+    path_join(&[PREFIX_ACME, &issuer_namespace(issuer_key)])
 }
 
 /// Return the storage key prefix for accounts under a given issuer.
 ///
 /// Example: `"acme/<safe_issuer_key>/users/<safe_email>"`
 pub fn account_key_prefix(issuer_key: &str, email: &str) -> String {
+    legacy_account_key_prefix(issuer_key, email)
+}
+
+/// The exact old layout, kept separate from the current account namespace for
+/// explicit legacy migration. Do not replace its email encoding on upgrades.
+pub(crate) fn legacy_account_key_prefix(issuer_key: &str, email: &str) -> String {
     let email = if email.is_empty() { "default" } else { email };
     path_join(&[&acme_ca_prefix(issuer_key), "users", &safe_key(email)])
 }
@@ -535,7 +587,7 @@ pub fn account_key_prefix(issuer_key: &str, email: &str) -> String {
 ///
 /// Example: `"locks/<safe_name>"`
 pub fn locks_key(name: &str) -> String {
-    path_join(&[PREFIX_LOCKS, &safe_key(name)])
+    path_join(&[PREFIX_LOCKS, &lock_storage_identity(name)])
 }
 
 // ---------------------------------------------------------------------------
