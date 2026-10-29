@@ -1008,6 +1008,8 @@ pub struct CleanStorageOptions {
     /// at least 24 hours after their `notAfter` time has passed. This
     /// grace period avoids deleting certificates that might still be
     /// referenced by in-flight TLS sessions.
+    /// Unrepresentable durations or expiration-plus-grace timestamps retain
+    /// the certificate instead of shortening the retention period.
     pub expired_cert_grace_period: Duration,
 
     /// Delete OCSP staples that have not been modified in longer than
@@ -1015,6 +1017,8 @@ pub struct CleanStorageOptions {
     ///
     /// Defaults to 14 days, which is generous enough to cover even
     /// long-lived OCSP responses.
+    /// Unrepresentable durations or modification-plus-age timestamps retain
+    /// the staple instead of shortening the retention period.
     pub ocsp_max_age: Duration,
 }
 
@@ -1061,6 +1065,11 @@ pub struct CleanStorageResult {
 /// - Lists all entries under `ocsp/`.
 /// - Deletes those whose `modified` timestamp is older than `ocsp_max_age`.
 ///
+/// Deletion requires a representable retention deadline strictly before the
+/// run's timestamp. Duration conversion or timestamp arithmetic overflow retains
+/// the affected asset; a large configured duration never falls back to a shorter
+/// default. Zero duration makes an asset eligible only after its base timestamp.
+///
 /// For ARI state:
 /// - Deletes identity-matching version-1 sidecars only after their recorded leaf `notAfter` plus
 ///   `expired_cert_grace_period` is strictly in the past.
@@ -1090,8 +1099,6 @@ pub async fn clean_storage(
     };
 
     let now = chrono::Utc::now();
-    let grace_period = chrono::Duration::from_std(options.expired_cert_grace_period)
-        .unwrap_or_else(|_| chrono::Duration::hours(24));
 
     // Group old three-file layouts and new private snapshots by site. Always
     // inspect the canonical resource: a stale legacy .crt must not cause a
@@ -1169,7 +1176,7 @@ pub async fn clean_storage(
             Err(_) => continue,
         };
 
-        if now <= not_after + grace_period {
+        if !retention_has_elapsed(not_after, options.expired_cert_grace_period, now) {
             continue;
         }
 
@@ -1221,16 +1228,13 @@ pub async fn clean_storage(
         }
     };
 
-    let max_age = chrono::Duration::from_std(options.ocsp_max_age)
-        .unwrap_or_else(|_| chrono::Duration::days(14));
-
     for entry in &ocsp_entries {
         let stat = match storage.stat(entry).await {
             Ok(s) => s,
             Err(_) => continue,
         };
 
-        if now > stat.modified + max_age {
+        if retention_has_elapsed(stat.modified, options.ocsp_max_age, now) {
             if let Err(e) = storage.delete(entry).await {
                 warn!(
                     path = entry.as_str(),
@@ -1256,6 +1260,18 @@ pub async fn clean_storage(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Unknown or unrepresentable deletion deadlines are not expiry evidence.
+fn retention_has_elapsed(
+    since: chrono::DateTime<chrono::Utc>,
+    retention: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    chrono::Duration::from_std(retention)
+        .ok()
+        .and_then(|retention| since.checked_add_signed(retention))
+        .is_some_and(|deadline| deadline < now)
+}
 
 /// Ensure an interval duration is non-zero, falling back to the provided
 /// default.
@@ -1283,6 +1299,48 @@ mod tests {
     use super::*;
     use crate::cache::CacheOptions;
     use crate::certificates::{Certificate, PrivateKeyKind};
+
+    #[test]
+    fn cleanup_retention_deadlines_are_strict_and_preserve_overflow() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let retention = Duration::from_secs(60);
+        let boundary = now - ChronoDuration::seconds(60);
+        assert!(!retention_has_elapsed(boundary, retention, now));
+        assert!(retention_has_elapsed(
+            boundary - ChronoDuration::nanoseconds(1),
+            retention,
+            now
+        ));
+        assert!(!retention_has_elapsed(
+            boundary + ChronoDuration::nanoseconds(1),
+            retention,
+            now
+        ));
+        assert!(!retention_has_elapsed(now, Duration::ZERO, now));
+        assert!(retention_has_elapsed(
+            now - ChronoDuration::nanoseconds(1),
+            Duration::ZERO,
+            now
+        ));
+        assert!(!retention_has_elapsed(boundary, Duration::MAX, now));
+        assert!(!retention_has_elapsed(
+            boundary,
+            Duration::from_secs(10_000_000_000_000),
+            now
+        ));
+        let maximum = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        assert!(!retention_has_elapsed(
+            maximum,
+            Duration::from_nanos(1),
+            maximum
+        ));
+        assert!(!retention_has_elapsed(maximum, Duration::ZERO, maximum));
+        assert!(retention_has_elapsed(
+            maximum - ChronoDuration::nanoseconds(1),
+            Duration::ZERO,
+            maximum
+        ));
+    }
 
     /// Pause the actual OCSP cache read while another lifecycle operation runs.
     struct GatedOcspStorage {

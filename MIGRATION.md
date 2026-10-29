@@ -703,3 +703,16 @@ pairs in either slot first receive an atomic snapshot, so interruption between
 deleting their old files retains the complete proof needed for a retry.
 Use upgraded writers for consistent
 recovery; older versions still remove accounts using their primary contact.
+
+## Storage cleanup retention overflow
+
+`clean_storage` now retains certificate and OCSP assets when their configured
+retention duration or resulting deletion timestamp cannot be represented.
+Very large durations such as `Duration::MAX` no longer silently use the shorter
+default retention period, and timestamp arithmetic no longer panics. This
+matches the conservative overflow behavior already used for ARI sidecars.
+
+Default, finite and zero durations keep their existing meaning: cleanup deletes
+an asset only when its expiration or modification time plus retention is strictly
+before the cleanup run's timestamp. The public options and result counters are
+unchanged. Callers must still coordinate cleanup with writers as documented.
