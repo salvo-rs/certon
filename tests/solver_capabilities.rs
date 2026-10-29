@@ -238,7 +238,13 @@ fn assert_certificate_key_match(pem: &[u8], key: &[u8]) {
     let (_, leaf) =
         x509_parser::certificate::X509Certificate::from_der(certificate.cert_chain[0].as_ref())
             .unwrap();
-    let private = KeyPair::from_pem(std::str::from_utf8(key).unwrap()).unwrap();
+    let decoded =
+        certon::crypto::decode_private_key_pem(std::str::from_utf8(key).unwrap()).unwrap();
+    let private = KeyPair::from_pkcs8_der_and_sign_algo(
+        &rustls::pki_types::PrivatePkcs8KeyDer::from(decoded.pkcs8_der()),
+        &rcgen::PKCS_ECDSA_P256_SHA256,
+    )
+    .unwrap();
     assert_eq!(
         leaf.public_key().subject_public_key.data.as_ref(),
         private.der_bytes()
