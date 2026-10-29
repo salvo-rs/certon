@@ -234,6 +234,30 @@ async fn canonical_urls_and_versioned_paths_keep_legacy_slugs_distinct() {
     );
     let directory = tempfile::tempdir().unwrap();
     let storage = FileStorage::new(directory.path());
+    let legacy_account = account("https://legacy.example/account/original");
+    let legacy_bytes = old_account(&storage, &old_endpoint, EMAIL, &legacy_account).await;
+    let current_ca = "https://ca.example/directory?tenant=one";
+    assert!(
+        get_account(&storage, current_ca, EMAIL)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let current = account("https://ca.example/account/current");
+    save_account(&storage, current_ca, &current).await.unwrap();
+    assert_eq!(
+        storage.load(&old_key(&old_endpoint, EMAIL)).await.unwrap(),
+        legacy_bytes
+    );
+    assert_eq!(
+        public_identity(
+            &get_account(&storage, current_ca, EMAIL)
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        public_identity(&current)
+    );
     let new_lock = format!("acme_account_{first}");
     let old_lock = format!("acme_account_{old_slug}");
     storage.lock(&new_lock).await.unwrap();
