@@ -280,6 +280,16 @@ pub async fn save_account(
     account: &AcmeAccount,
 ) -> Result<()> {
     let email = get_primary_contact(account);
+    save_account_for_email(storage, ca_url, &email, account).await
+}
+
+/// Issuer persistence uses the configured identity rather than mutable contacts.
+pub(crate) async fn save_account_for_email(
+    storage: &dyn Storage,
+    ca_url: &str,
+    email: &str,
+    account: &AcmeAccount,
+) -> Result<()> {
     let issuer_key = crate::storage::issuer_key(ca_url);
 
     let snapshot = AccountSnapshot {
@@ -290,7 +300,7 @@ pub async fn save_account(
     let bytes = serde_json::to_vec(&snapshot)
         .map_err(|e| AcmeError::Account(format!("failed to serialise account snapshot: {e}")))?;
     storage
-        .store(&storage_key_account_snapshot(&issuer_key, &email), &bytes)
+        .store(&storage_key_account_snapshot(&issuer_key, email), &bytes)
         .await?;
 
     debug!(
@@ -300,6 +310,59 @@ pub async fn save_account(
     );
 
     Ok(())
+}
+
+pub(crate) fn same_account_slot(ca_url: &str, first: &str, second: &str) -> bool {
+    let issuer = crate::storage::issuer_key(ca_url);
+    storage_key_account_snapshot(&issuer, first) == storage_key_account_snapshot(&issuer, second)
+}
+
+/// ACME uses P-256 account keys. Compare their public JWK identities, so
+/// equivalent SEC1/PKCS#8 PEM encodings are not mistaken for different accounts.
+pub(crate) fn same_account_key(first: &AcmeAccount, second: &AcmeAccount) -> Result<bool> {
+    let first = decode_private_key_pem(&first.private_key_pem)?;
+    let second = decode_private_key_pem(&second.private_key_pem)?;
+    Ok(
+        crate::acme_client::key_authorization("account-identity", &first)?
+            == crate::acme_client::key_authorization("account-identity", &second)?,
+    )
+}
+
+pub(crate) fn same_registered_account(first: &AcmeAccount, second: &AcmeAccount) -> Result<bool> {
+    Ok(first.location == second.location && same_account_key(first, second)?)
+}
+
+/// Called only after the configured slot was absent, under the CA account lock.
+/// A matching contact alone is insufficient evidence to adopt an old account.
+pub(crate) async fn migrate_contact_account(
+    storage: &dyn Storage,
+    ca_url: &str,
+    email: &str,
+    candidate: &AcmeAccount,
+) -> Result<Option<AcmeAccount>> {
+    let contact = get_primary_contact(candidate);
+    if same_account_slot(ca_url, email, &contact) {
+        return Ok(None);
+    }
+    let Some(legacy) = get_account(storage, ca_url, &contact).await? else {
+        return Ok(None);
+    };
+    if !same_account_slot(ca_url, &contact, &get_primary_contact(&legacy)) {
+        return Err(AcmeError::Account("callback contact points to another identity-bound account; migrate the account explicitly".into()).into());
+    }
+    if legacy.location.is_empty() || !matches!(legacy.status.as_str(), "" | "valid") {
+        return Err(AcmeError::Account(
+            "legacy account under callback contact is not an active registered account".into(),
+        )
+        .into());
+    }
+    if !same_account_key(candidate, &legacy)? {
+        return Err(AcmeError::Account("legacy account under callback contact has a different key; configure its original account_key_pem or migrate the account explicitly".into()).into());
+    }
+    save_account_for_email(storage, ca_url, email, &legacy).await?;
+    // Keep the old alias for compatibility. Confirmed accountDoesNotExist
+    // recovery removes aliases proven to identify that same invalid account.
+    Ok(Some(legacy))
 }
 
 /// Create a new ACME account in memory.
@@ -386,17 +449,25 @@ pub async fn delete_account_locally(
     account: &AcmeAccount,
 ) -> Result<()> {
     let email = get_primary_contact(account);
+    delete_account_for_email(storage, ca_url, &email).await
+}
+
+pub(crate) async fn delete_account_for_email(
+    storage: &dyn Storage,
+    ca_url: &str,
+    email: &str,
+) -> Result<()> {
     let issuer_key = crate::storage::issuer_key(ca_url);
 
-    let reg_key = storage_key_user_reg(&issuer_key, &email);
-    let pk_key = storage_key_user_private_key(&issuer_key, &email);
+    let reg_key = storage_key_user_reg(&issuer_key, email);
+    let pk_key = storage_key_user_private_key(&issuer_key, email);
 
     // Remove legacy resources first to prevent resurrection after a partial
     // deletion. The current snapshot remains usable until the final delete.
     for key in [
         reg_key,
         pk_key,
-        storage_key_account_snapshot(&issuer_key, &email),
+        storage_key_account_snapshot(&issuer_key, email),
     ] {
         match storage.delete(&key).await {
             Ok(()) | Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
