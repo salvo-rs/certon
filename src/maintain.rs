@@ -288,7 +288,9 @@ pub fn start_maintenance(
 
 /// Start maintenance using the manager's certificate store and renewal policy.
 /// Each loop has an independent four-execution, 68-admitted expiration-renewal
-/// budget, including each job's storage preflight. OCSP uses eight concurrent refreshes and an
+/// budget, including each job's own revocation-marker read and storage preflight.
+/// Full-cache marker scans coalesce independently with up to eight concurrent reads.
+/// OCSP uses eight concurrent refreshes and an
 /// independent force-renewal queue with four executions and 64 waiting requests. Saturation is
 /// logged and retried on the certificate's next OCSP deadline. Stopping drops in-flight
 /// refreshes and force-renewals, then awaits expiration jobs' cleanup.
@@ -439,6 +441,8 @@ async fn maintenance_loop(
     renew_ticker.tick().await;
     ocsp_ticker.tick().await;
 
+    let (marker_requests, mut marker_receiver) = tokio::sync::mpsc::channel(1);
+    let renewal_marker_requests = marker_requests.clone();
     // These futures persist independently. A saturated renewal scan may wait
     // for admission for a long time without starving the OCSP ticker.
     let renewals = async {
@@ -449,16 +453,16 @@ async fn maintenance_loop(
                 _ = ari_changed.changed() => {}
             }
             debug!("maintenance: running renewal check");
-            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
-                warn!(%error, "maintenance: failed to refresh revocation intent");
-            }
+            // The global scan is independent of renewal progress. Each bounded
+            // job checks its own leaf before any preflight or callback instead
+            // of waiting for an unrelated slow marker in this full-cache scan.
+            let _ = renewal_marker_requests.try_send(());
             check_renewals_with_policy(&cache, &policy, &job_queue).await;
         }
     };
-    let (marker_requests, mut marker_receiver) = tokio::sync::mpsc::channel(1);
     let revocations = async {
-        // Coalesce periodic requests while a marker scan is running. Its
-        // backend waits must not stop polling admitted OCSP responses.
+        // Coalesce renewal/ARI and OCSP periodic requests in one eight-read
+        // scan. Backend waits must not block renewal, OCSP or ARI scheduling.
         while marker_receiver.recv().await.is_some() {
             if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
                 warn!(%error, "maintenance: failed to refresh revocation intent");
@@ -702,6 +706,12 @@ async fn check_renewals_with_policy(
         job_queue
             .submit(job_name, move || async move {
                 let Some(current) = current_renewal_candidate(&cache, &snapshot, &domain, &policy) else { return; };
+                if !renewal_marker_allows(&cache, policy.revocations.as_ref(), &current, &domain).await {
+                    return;
+                }
+                // The marker read can await a backend while management or
+                // eligibility changes. Do not begin preflight for stale work.
+                let Some(current) = current_renewal_candidate(&cache, &current, &domain, &policy) else { return; };
                 // Check cross-instance replacements only after taking an
                 // execution slot. Publication rechecks management atomically.
                 if try_reload_from_storage(
@@ -729,6 +739,30 @@ async fn check_renewals_with_policy(
                 }
             })
             .await;
+    }
+}
+
+async fn renewal_marker_allows(
+    cache: &CertCache,
+    storage: &dyn Storage,
+    cert: &Certificate,
+    domain: &str,
+) -> bool {
+    let Some(leaf) = crate::storage::certificate_leaf_hash(cert) else {
+        // Low-level metadata-only entries have no leaf to query, as in the
+        // global scan. Managed credentials loaded by CertManager have a DER leaf.
+        return true;
+    };
+    match crate::storage::load_revocation(storage, &leaf).await {
+        Ok(None) => true,
+        Ok(Some(_)) => {
+            cache.deny_revoked_certificate(&leaf).await;
+            false
+        }
+        Err(error) => {
+            warn!(%domain, %leaf, %error, "maintenance: cannot verify renewal leaf revocation intent; skipping renewal");
+            false
+        }
     }
 }
 
