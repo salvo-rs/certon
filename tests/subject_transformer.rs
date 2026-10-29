@@ -57,11 +57,24 @@ impl Storage for TrackedStorage {
 }
 
 impl TrackedStorage {
-    async fn wait_for_locks(&self, count: usize) {
+    // Only issue_cert_<subject> serializes certificate lifecycle operations.
+    // ARI/account/challenge locks are independent and must not satisfy either
+    // this wait condition or the alias-deduplication counts below.
+    fn issuance_locks(&self) -> Vec<String> {
+        self.locks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|name| name.starts_with("issue_cert_"))
+            .cloned()
+            .collect()
+    }
+
+    async fn wait_for_issuance_locks(&self, count: usize) {
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let changed = self.changed.notified();
-                if self.locks.lock().unwrap().len() >= count {
+                if self.issuance_locks().len() >= count {
                     return;
                 }
                 changed.await;
@@ -241,12 +254,16 @@ async fn aliases_share_the_canonical_lock_and_issue_only_one_wildcard() {
     tokio::time::timeout(Duration::from_secs(3), fixture.issuer.entered.notified())
         .await
         .unwrap();
+    // An unrelated real lock must not count as the second alias's lifecycle
+    // attempt or become one of the two names compared below.
+    fixture.storage.lock("ari_fixture_probe").await.unwrap();
+    fixture.storage.unlock("ari_fixture_probe").await.unwrap();
     let b = tokio::spawn({
         let manager = fixture.manager.clone();
         async move { manager.obtain("b.example.com").await }
     });
-    fixture.storage.wait_for_locks(2).await;
-    let locks = fixture.storage.locks.lock().unwrap().clone();
+    fixture.storage.wait_for_issuance_locks(2).await;
+    let locks = fixture.storage.issuance_locks();
     // Release before assertions so a deliberately broken implementation cannot
     // leave a worker or file lock behind during test teardown.
     fixture.issuer.release.add_permits(2);
@@ -281,7 +298,10 @@ async fn a_canonical_storage_hit_does_not_take_an_alias_lock_or_transform_twice(
     fixture.manager.obtain("a.example.com").await.unwrap();
     fixture.manager.obtain("b.example.com").await.unwrap();
     assert_eq!(fixture.transforms.load(Ordering::SeqCst), 2);
-    assert_eq!(fixture.storage.locks.lock().unwrap().len(), 1);
+    assert_eq!(
+        fixture.storage.issuance_locks(),
+        ["issue_cert_*.example.com"]
+    );
     assert_eq!(fixture.issuer.calls.load(Ordering::SeqCst), 1);
     fixture.handshake("b.example.com").await;
 }
@@ -412,8 +432,8 @@ async fn queued_aliases_are_deduplicated_before_taking_lifecycle_locks() {
         .unwrap();
     fixture.wait_for_certificate("a.example.com").await;
     assert_eq!(
-        fixture.storage.locks.lock().unwrap().len(),
-        1,
+        fixture.storage.issuance_locks(),
+        ["issue_cert_*.example.com"],
         "aliases occupied separate queued jobs"
     );
     assert_eq!(fixture.transforms.load(Ordering::SeqCst), 1001);

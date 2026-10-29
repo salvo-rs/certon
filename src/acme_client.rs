@@ -278,11 +278,12 @@ pub struct DirectoryMeta {
 // ACME Renewal Information (ARI) types — RFC 9773
 // ---------------------------------------------------------------------------
 
-/// ACME Renewal Information per RFC 9773 (draft-ietf-acme-ari).
+/// ACME Renewal Information per RFC 9773.
 ///
 /// Contains the server's suggested renewal window and an optional
 /// explanation URL. The `selected_time` field is computed locally by
-/// picking a random instant within the suggested window.
+/// deriving a stable, distributed instant from the leaf and suggested window.
+/// Managed certificates persist that local choice separately from wire JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RenewalInfo {
     /// Suggested renewal window (start and end timestamps).
@@ -298,9 +299,10 @@ pub struct RenewalInfo {
     #[serde(rename = "retryAfter")]
     pub retry_after: Option<u64>,
 
-    /// The selected renewal time (computed locally within the suggested
-    /// window). This is not serialized to/from JSON because it is a local
-    /// decision.
+    /// The locally selected renewal time within the suggested window.
+    /// This field is excluded from ACME wire JSON. Managed lifecycle state
+    /// persists it explicitly in an issuer/leaf sidecar; an unchanged window
+    /// keeps the same choice across refreshes and restarts.
     #[serde(skip)]
     pub selected_time: Option<DateTime<Utc>>,
 }
@@ -1755,11 +1757,17 @@ impl AcmeClient {
         _account_url: &str,
         cert_id: &str,
     ) -> Result<RenewalInfo> {
+        self.fetch_renewal_info(cert_id)
+            .await
+            .map(|info| info.unwrap_or_default())
+    }
+
+    pub(crate) async fn fetch_renewal_info(&self, cert_id: &str) -> Result<Option<RenewalInfo>> {
         let renewal_info_base = match &self.directory.renewal_info {
             Some(url) => url.clone(),
             None => {
                 debug!("ACME directory does not advertise renewalInfo endpoint");
-                return Ok(RenewalInfo::default());
+                return Ok(None);
             }
         };
 
@@ -1769,12 +1777,13 @@ impl AcmeClient {
             .map_err(|error| AcmeError::Certificate(error.to_string()))?;
         debug!(url = %url, "fetching ACME Renewal Information (ARI)");
 
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AcmeError::Certificate(format!("ARI request failed: {e}")))?;
+        let resp = self.http.get(&url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                crate::Error::Timeout("ARI request timed out".into())
+            } else {
+                AcmeError::Certificate(format!("ARI request failed: {}", e.without_url())).into()
+            }
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1785,9 +1794,14 @@ impl AcmeClient {
             warn!(
                 status = %status,
                 detail = %detail,
-                "ARI request returned non-success status; returning default"
+                "ARI request returned non-success status"
             );
-            return Ok(RenewalInfo::default());
+            if status.is_server_error() {
+                return Err(
+                    AcmeError::RenewalInfoTemporary(format!("server returned {status}")).into(),
+                );
+            }
+            return Ok(None);
         }
 
         let retry_after = resp
@@ -1821,7 +1835,7 @@ impl AcmeClient {
 
         debug!(?info, "ACME Renewal Information fetched");
 
-        Ok(info)
+        Ok(Some(info))
     }
 }
 

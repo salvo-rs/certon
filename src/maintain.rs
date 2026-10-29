@@ -127,6 +127,7 @@ struct RenewalPolicy {
     certificates: Arc<dyn CertStore>,
     revocations: Arc<dyn Storage>,
     ratio: f64,
+    ari_manager: Option<Arc<crate::CertManager>>,
 }
 
 struct ForcedRenewal {
@@ -302,7 +303,7 @@ pub fn start_maintenance_with_policy(
     certificates: Arc<dyn CertStore>,
     ratio: f64,
 ) -> JoinHandle<()> {
-    start_maintenance_with_observed_renewal(cache, config, renew, certificates, ratio, None)
+    start_maintenance_with_observed_renewal(cache, config, renew, certificates, ratio, None, None)
 }
 
 pub(crate) fn start_maintenance_with_observed_renewal(
@@ -312,6 +313,7 @@ pub(crate) fn start_maintenance_with_observed_renewal(
     certificates: Arc<dyn CertStore>,
     ratio: f64,
     observed_renew: Option<Arc<ObservedRenewFn>>,
+    ari_manager: Option<Arc<crate::CertManager>>,
 ) -> JoinHandle<()> {
     let policy = RenewalPolicy {
         renew,
@@ -319,6 +321,7 @@ pub(crate) fn start_maintenance_with_observed_renewal(
         certificates,
         revocations: config.storage.clone(),
         ratio,
+        ari_manager,
     };
     let renew_interval =
         normalize_interval(config.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
@@ -439,8 +442,12 @@ async fn maintenance_loop(
     // These futures persist independently. A saturated renewal scan may wait
     // for admission for a long time without starving the OCSP ticker.
     let renewals = async {
+        let mut ari_changed = cache.subscribe_ari();
         loop {
-            renew_ticker.tick().await;
+            tokio::select! {
+                _ = renew_ticker.tick() => {}
+                _ = ari_changed.changed() => {}
+            }
             debug!("maintenance: running renewal check");
             if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
                 warn!(%error, "maintenance: failed to refresh revocation intent");
@@ -468,6 +475,12 @@ async fn maintenance_loop(
     );
     // Stop remains selectable throughout storage work, callback awaits, and
     // admission backpressure. Cancelling an unadmitted submit is harmless.
+    let ari = async {
+        match &policy.ari_manager {
+            Some(manager) => crate::ari::run(manager).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     tokio::select! {
         biased;
         _ = stop_rx.wait_for(|stop| *stop) => {
@@ -477,6 +490,7 @@ async fn maintenance_loop(
         _ = ocsp => {}
         _ = force_renewals => {}
         _ = revocations => {}
+        _ = ari => {}
     }
     job_queue.shutdown().await;
 }
@@ -650,7 +664,16 @@ async fn check_renewals_with_policy(
     );
 
     for cert in &managed_certs {
-        if cert.not_before <= chrono::Utc::now() && !cert.needs_renewal(policy.ratio) {
+        if cert.not_before <= chrono::Utc::now()
+            && !crate::ari::needs_renewal(
+                cert,
+                policy.ratio,
+                policy
+                    .ari_manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.policy.disable_ari),
+            )
+        {
             continue;
         }
 
@@ -678,6 +701,10 @@ async fn check_renewals_with_policy(
             cert,
             &domain,
             policy.ratio,
+            policy
+                .ari_manager
+                .as_ref()
+                .is_some_and(|manager| manager.policy.disable_ari),
         )
         .await
         {
@@ -730,12 +757,13 @@ async fn try_reload_from_storage(
     cached_cert: &Certificate,
     domain: &str,
     renewal_ratio: f64,
+    disable_ari: bool,
 ) -> bool {
     let resource = match certificates.load(&cached_cert.issuer_key, domain).await {
         Ok(Some(resource)) => resource,
         _ => return false,
     };
-    let stored_cert =
+    let mut stored_cert =
         match crate::manager::CertManager::parse_managed_certificate(&resource, domain) {
             Ok(cert) => cert,
             Err(_) => return false,
@@ -754,12 +782,13 @@ async fn try_reload_from_storage(
             }
         }
     }
+    crate::ari::attach_cached(revocations, cache, &mut stored_cert, disable_ari).await;
     // If the stored cert has a different hash AND does not need renewal,
     // it was renewed by another instance — reload it into the cache.
     if stored_cert.hash != cached_cert.hash
         && stored_cert.not_before <= chrono::Utc::now()
         && !stored_cert.expired()
-        && !stored_cert.needs_renewal(renewal_ratio)
+        && !crate::ari::needs_renewal(&stored_cert, renewal_ratio, disable_ari)
         && crate::manager::CertManager::covers_certificate(&stored_cert, cached_cert)
     {
         info!(
@@ -1831,6 +1860,7 @@ mod tests {
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+                ari_manager: None,
             },
             &job_queue,
         )
@@ -1868,6 +1898,7 @@ mod tests {
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+                ari_manager: None,
             },
             &job_queue,
         )
@@ -1905,6 +1936,7 @@ mod tests {
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+                ari_manager: None,
             },
             &job_queue,
         )
@@ -1941,6 +1973,7 @@ mod tests {
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
                 ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
+                ari_manager: None,
             },
             &job_queue,
         )
@@ -2000,6 +2033,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let policy = RenewalPolicy {
+            ari_manager: None,
             observed_renew: None,
             revocations: Arc::new(DummyStorage),
             ratio: 0.5,
@@ -2037,6 +2071,7 @@ mod tests {
         let store = Arc::new(InMemory::default());
         store.save("ca", &resource).await.unwrap();
         let policy = RenewalPolicy {
+            ari_manager: None,
             observed_renew: None,
             revocations: Arc::new(DummyStorage),
             ratio: DEFAULT_RENEWAL_WINDOW_RATIO,

@@ -653,7 +653,11 @@ impl CertManager {
                 c.managed
                     && c.not_before <= chrono::Utc::now()
                     && !c.expired()
-                    && !c.needs_renewal(self.policy.renewal_window_ratio)
+                    && !crate::ari::needs_renewal(
+                        c,
+                        self.policy.renewal_window_ratio,
+                        self.policy.disable_ari,
+                    )
                     && c.ocsp_status != Some(OcspStatus::Revoked)
             });
             if already_managed {
@@ -744,8 +748,13 @@ impl CertManager {
                     cert.ocsp_status = Some(OcspStatus::Revoked);
                     cert.ocsp_response = None;
                 }
-                let mut needs_action =
-                    !current || cert.needs_renewal(self.policy.renewal_window_ratio) || revoked;
+                let mut needs_action = !current
+                    || crate::ari::needs_renewal(
+                        &cert,
+                        self.policy.renewal_window_ratio,
+                        self.policy.disable_ari,
+                    )
+                    || revoked;
                 if current {
                     // Readiness for serving is distinct from eligibility for
                     // renewal. Apply admission first so a known revocation
@@ -843,6 +852,13 @@ impl CertManager {
         let mut cert = self.validated_certificate(&cert_res, domain).await?;
         cert.managed = true;
         cert.issuer_key = cert_res.issuer_key.clone();
+        crate::ari::attach_cached(
+            self.storage.as_ref(),
+            &self.cache,
+            &mut cert,
+            self.policy.disable_ari,
+        )
+        .await;
         Ok(cert)
     }
 
@@ -1204,7 +1220,8 @@ impl CertManager {
                     let cert = self.validate_certificate_status(cert, domain).await?;
                     crate::ocsp::ensure_required_staple(&cert).await?;
                     self.certificates.save(&ik, &cert_res).await?;
-                    self.publish_certificate(cert, domain).await?;
+                    self.publish_certificate(cert.clone(), domain).await?;
+                    crate::ari::refresh(self, &cert).await;
 
                     info!(
                         domain = %domain,
@@ -1407,17 +1424,30 @@ impl CertManager {
         // Explicit forced renewal may use a quarantined resource only as the
         // source of its SANs/key policy. It is never republished, and validation
         // of the replacement still rejects the old leaf or another banned leaf.
-        let cert = if force {
+        let mut cert = if force {
             Self::parse_managed_certificate(&cert_res, domain)?
         } else {
             self.validated_certificate(&cert_res, domain).await?
         };
+        if !force && cert.ocsp_status != Some(OcspStatus::Revoked) {
+            crate::ari::attach_cached(
+                self.storage.as_ref(),
+                &self.cache,
+                &mut cert,
+                self.policy.disable_ari,
+            )
+            .await;
+        }
         // Maintenance may have rejected an unusable storage replacement. Do
         // not let its normal renewal callback republish a future certificate
         // through the "already renewed" shortcut below.
         let needs_renewal = cert.not_before > chrono::Utc::now()
             || cert.expired()
-            || cert.needs_renewal(self.policy.renewal_window_ratio);
+            || crate::ari::needs_renewal(
+                &cert,
+                self.policy.renewal_window_ratio,
+                self.policy.disable_ari,
+            );
 
         // Renew all actual DNS/IP SANs, including managed overlaps that would
         // otherwise lose coverage. CNs, URIs and email SANs are not TLS names.
@@ -1539,7 +1569,8 @@ impl CertManager {
                     let cert = self.validate_certificate_status(cert, domain).await?;
                     crate::ocsp::ensure_required_staple(&cert).await?;
                     self.certificates.save(&ik, &new_cert_res).await?;
-                    self.publish_certificate(cert, domain).await?;
+                    self.publish_certificate(cert.clone(), domain).await?;
+                    crate::ari::refresh(self, &cert).await;
 
                     info!(
                         domain = %domain,
