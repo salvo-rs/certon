@@ -729,3 +729,15 @@ Large duration budgets do not use unchecked `Instant` addition.
 The existing high-level issuer deadline remains in place. Callers of these
 lower-level polling APIs now receive their requested total budget even when
 a CA stalls before headers or while sending the response body.
+
+## Capacity when taking over imported certificates
+
+Promoting an existing unmanaged certificate to managed now reclaims older
+managed entries until the total cache count fits its finite capacity, or no
+other managed entry can be evicted. The newly promoted certificate and remaining
+unmanaged imports stay protected, matching the existing admission exception.
+Once no unmanaged entries remain, the cache converges to its configured limit.
+Promotion preserves the retained certificate's signing key, OCSP and ARI state,
+and merges management metadata as before. Evictions use the normal removal
+indexes and events; a metadata-only duplicate of an already managed entry does
+not gain a new eviction side effect. Zero capacity remains unlimited.
