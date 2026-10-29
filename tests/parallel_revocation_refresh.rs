@@ -230,7 +230,7 @@ async fn stopping_maintenance_drops_in_flight_marker_reads() {
                 ..Default::default()
             },
         },
-        Arc::new(|_| Box::pin(async { panic!("refresh must finish before the renewal scan") })),
+        Arc::new(|_| Box::pin(async { panic!("fresh certificates must not request renewal") })),
     );
     until(|| async { storage.active.load(Ordering::SeqCst) == 8 }).await;
     tokio::time::timeout(Duration::from_secs(5), manager.cache.stop_and_wait())

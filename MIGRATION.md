@@ -171,7 +171,10 @@ Certificate lifecycle corrections:
   `renew_in_background`, and arbitrary public `JobQueue::submit` futures keep
   their existing semantics.
 - Each maintenance loop has a separate four-execution, 68-admitted expiration
-  renewal budget, including storage preflight and per-domain deduplication.
+  renewal budget, including its own leaf's revocation-marker check, storage
+  preflight and per-domain deduplication. Marker read failures skip that job
+  without invoking renewal; a matching marker quarantines that leaf. Jobs
+  recheck management after the marker await before starting storage preflight.
   A slow preflight holds one execution slot rather than blocking the scan.
   Queued jobs recheck current management and renewal eligibility before doing
   I/O and before calling renewal; a withdrawn or replaced identity cannot be
@@ -376,6 +379,15 @@ concurrently. A slow marker no longer delays quarantine of other ready leaves;
 the refresh still waits for every read and returns the first snapshot-order
 error on partial failure. The success count is the number of revoked leaves,
 with alternate chains sharing one lookup and quarantine operation.
+
+The full-cache scan is independent of expiration/ARI renewal submission. Renewal
+ticks, ARI notifications and OCSP periodic checks coalesce requests into one
+scanner with at most one waiting scan; a slow unrelated marker cannot block a
+healthy domain's bounded renewal job. The scanner's eight reads and the renewal
+jobs' four execution slots are separate budgets, so at most twelve marker reads
+from these paths may be in flight in one maintenance loop. Each job still
+checks its own marker and fails closed on read errors. Explicit refresh calls
+retain their existing behavior of waiting for the complete scan.
 
 Cancelling a refresh or stopping maintenance drops all in-flight read futures;
 the scanner spawns no detached work. Renewal and OCSP refresh intervals are
