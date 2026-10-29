@@ -1244,7 +1244,7 @@ pub async fn clean_storage(
         // Delete every generation's legacy assets before any snapshot. This
         // keeps an old-layout authoritative snapshot available if deletion of
         // a newer-layout legacy import fails or is cancelled.
-        let mut sidecars = std::collections::BTreeSet::new();
+        let mut sidecars = Vec::new();
         let mut certificates = std::collections::BTreeSet::new();
         for physical_site in &physical_sites {
             for keys in [
@@ -1253,8 +1253,14 @@ pub async fn clean_storage(
             ] {
                 let [cert, key, meta] = keys;
                 certificates.insert(cert);
-                sidecars.insert(key);
-                sidecars.insert(meta);
+                // Preserve the legacy key-before-metadata deletion boundary:
+                // cancelling while the first key deletion waits still leaves
+                // the complete resource readable. Deduplicate without sorting.
+                for sidecar in [key, meta] {
+                    if !sidecars.contains(&sidecar) {
+                        sidecars.push(sidecar);
+                    }
+                }
             }
         }
         let mut sidecars_deleted = true;
