@@ -23,9 +23,10 @@
 //! avoids circular dependencies while still allowing the `CertManager` to wire up
 //! its `renew_cert` method as the renewal implementation.
 
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::task::JoinHandle;
@@ -38,6 +39,9 @@ use crate::certificates::{Certificate, DEFAULT_RENEWAL_WINDOW_RATIO};
 use crate::error::Result;
 use crate::ocsp::{self, OcspConfig};
 use crate::storage::Storage;
+
+#[cfg(test)]
+mod parallel_ocsp_tests;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,6 +56,9 @@ pub const DEFAULT_RENEW_CHECK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_OCSP_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 const REVOCATION_READ_CONCURRENCY: usize = 8;
+const OCSP_REFRESH_CONCURRENCY: usize = 8;
+const FORCED_RENEWAL_CONCURRENCY: usize = 4;
+const FORCED_RENEWAL_BACKLOG: usize = 64;
 
 // ---------------------------------------------------------------------------
 // MaintenanceConfig
@@ -110,12 +117,135 @@ pub enum RenewalReason {
 pub type ReasonedRenewFn =
     dyn Fn(String, RenewalReason) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
 
+pub(crate) type ObservedRenewFn =
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync;
+
 #[derive(Clone)]
 struct RenewalPolicy {
     renew: Arc<ReasonedRenewFn>,
+    observed_renew: Option<Arc<ObservedRenewFn>>,
     certificates: Arc<dyn CertStore>,
     revocations: Arc<dyn Storage>,
     ratio: f64,
+}
+
+struct ForcedRenewal {
+    hash: String,
+    leaf_hash: String,
+    domain: String,
+    _tracked: TrackedRenewal,
+}
+
+struct TrackedRenewal {
+    key: String,
+    tracked: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for TrackedRenewal {
+    fn drop(&mut self) {
+        self.tracked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
+struct ForcedRenewals {
+    sender: tokio::sync::mpsc::Sender<ForcedRenewal>,
+    tracked: Arc<Mutex<HashSet<String>>>,
+}
+
+impl ForcedRenewals {
+    fn new() -> (Self, tokio::sync::mpsc::Receiver<ForcedRenewal>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(FORCED_RENEWAL_BACKLOG);
+        (
+            Self {
+                sender,
+                tracked: Arc::new(Mutex::new(HashSet::new())),
+            },
+            receiver,
+        )
+    }
+
+    fn try_submit(&self, cert: &Certificate, domain: String) {
+        let leaf_hash = crate::storage::certificate_leaf_hash(cert).unwrap_or_default();
+        let key = if leaf_hash.is_empty() {
+            cert.hash.clone()
+        } else {
+            leaf_hash.clone()
+        };
+        {
+            let mut tracked = self.tracked.lock().unwrap_or_else(|e| e.into_inner());
+            if !tracked.insert(key.clone()) {
+                return;
+            }
+        }
+        let request = ForcedRenewal {
+            hash: cert.hash.clone(),
+            leaf_hash,
+            domain,
+            _tracked: TrackedRenewal {
+                key,
+                tracked: Arc::clone(&self.tracked),
+            },
+        };
+        if let Err(error) = self.sender.try_send(request) {
+            warn!(hash = %cert.hash, %error, "maintenance: force-renewal queue unavailable; retrying on next OCSP deadline");
+        }
+    }
+}
+
+async fn run_forced_renewals(
+    cache: &CertCache,
+    renew: &ReasonedRenewFn,
+    observed: Option<&ObservedRenewFn>,
+    mut receiver: tokio::sync::mpsc::Receiver<ForcedRenewal>,
+) {
+    let mut running: Vec<Pin<Box<dyn Future<Output = ()> + Send + '_>>> =
+        Vec::with_capacity(FORCED_RENEWAL_CONCURRENCY);
+    let mut closed = false;
+    loop {
+        if closed && running.is_empty() {
+            break;
+        }
+        tokio::select! {
+            request = receiver.recv(), if !closed && running.len() < FORCED_RENEWAL_CONCURRENCY => {
+                match request {
+                    Some(request) => running.push(Box::pin(async move {
+                        // Keep deduplication until the callback future is dropped,
+                        // including cancellation and unwinding.
+                        let _tracked = request._tracked;
+                        let Some(current) = cache.get_by_hash(&request.hash).await else { return };
+                        if !current.managed
+                            || current.ocsp_status != Some(ocsp::OcspStatus::Revoked)
+                            || current.names.first() != Some(&request.domain)
+                            || crate::storage::certificate_leaf_hash(&current).unwrap_or_default() != request.leaf_hash
+                        {
+                            return;
+                        }
+                        let result = match observed {
+                            Some(observed) => observed(request.domain.clone(), request.leaf_hash).await,
+                            None => renew(request.domain.clone(), RenewalReason::Revoked).await,
+                        };
+                        match result {
+                            Ok(()) => info!(name = %request.domain, "maintenance: revoked certificate force-renewal finished"),
+                            Err(error) => error!(name = %request.domain, %error, "maintenance: revoked certificate force-renewal failed"),
+                        }
+                    })),
+                    None => closed = true,
+                }
+            }
+            _ = std::future::poll_fn(|cx| {
+                for position in 0..running.len() {
+                    if running[position].as_mut().poll(cx).is_ready() {
+                        drop(running.swap_remove(position));
+                        return std::task::Poll::Ready(());
+                    }
+                }
+                std::task::Poll::Pending
+            }), if !running.is_empty() => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,8 +287,14 @@ pub fn start_maintenance(
 
 /// Start maintenance using the manager's certificate store and renewal policy.
 /// Each loop has an independent four-execution, 68-admitted expiration-renewal
-/// budget. Sequential OCSP force-renewals are independent. Stopping cancels
-/// admission waits and awaits its admitted jobs' cleanup.
+/// budget. OCSP uses eight concurrent refreshes and an independent force-renewal
+/// queue with four executions and 64 waiting requests. Saturation is logged and
+/// retried on the certificate's next OCSP deadline. Stopping drops in-flight
+/// refreshes and force-renewals, then awaits expiration jobs' cleanup.
+///
+/// Custom callbacks receive the domain observed at dispatch. They must recheck
+/// their own persistent resource after asynchronous lock waits before forcing a
+/// replacement; the manager's built-in callback performs that identity check.
 pub fn start_maintenance_with_policy(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
@@ -166,8 +302,20 @@ pub fn start_maintenance_with_policy(
     certificates: Arc<dyn CertStore>,
     ratio: f64,
 ) -> JoinHandle<()> {
+    start_maintenance_with_observed_renewal(cache, config, renew, certificates, ratio, None)
+}
+
+pub(crate) fn start_maintenance_with_observed_renewal(
+    cache: Arc<CertCache>,
+    config: MaintenanceConfig,
+    renew: Arc<ReasonedRenewFn>,
+    certificates: Arc<dyn CertStore>,
+    ratio: f64,
+    observed_renew: Option<Arc<ObservedRenewFn>>,
+) -> JoinHandle<()> {
     let policy = RenewalPolicy {
         renew,
+        observed_renew,
         certificates,
         revocations: config.storage.clone(),
         ratio,
@@ -272,6 +420,13 @@ async fn maintenance_loop(
     // Renewals have their own bounded budget; foreground manager families do
     // not consume these slots. The budget is per maintenance loop, not global.
     let job_queue = JobQueue::certificate_jobs("renewal");
+    let (forced, force_receiver) = ForcedRenewals::new();
+    let force_renewals = run_forced_renewals(
+        &cache,
+        policy.renew.as_ref(),
+        policy.observed_renew.as_deref(),
+        force_receiver,
+    );
 
     let mut renew_ticker = tokio::time::interval(renew_interval);
     let mut ocsp_ticker = tokio::time::interval(ocsp_interval);
@@ -293,46 +448,24 @@ async fn maintenance_loop(
             check_renewals_with_policy(&cache, &policy, &job_queue).await;
         }
     };
-    let ocsp = async {
-        // Subscribe before reading deadlines so a concurrent publication cannot
-        // be lost between computing the next wake-up and starting to wait.
-        let mut changed = cache.subscribe_ocsp();
-        loop {
-            let deadline = if config.ocsp.disable_stapling {
-                None
-            } else {
-                cache.next_ocsp_deadline()
-            };
-            let due = async {
-                match deadline {
-                    Some(deadline) => {
-                        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
-                        tokio::time::sleep(delay).await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            };
-            let periodic = tokio::select! {
-                _ = ocsp_ticker.tick() => true,
-                _ = due => false,
-                _ = changed.changed() => continue,
-            };
-            debug!("maintenance: running OCSP staple check");
-            if periodic
-                && let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await
-            {
+    let (marker_requests, mut marker_receiver) = tokio::sync::mpsc::channel(1);
+    let revocations = async {
+        // Coalesce periodic requests while a marker scan is running. Its
+        // backend waits must not stop polling admitted OCSP responses.
+        while marker_receiver.recv().await.is_some() {
+            if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
                 warn!(%error, "maintenance: failed to refresh revocation intent");
             }
-            update_ocsp_staples_for(
-                &cache,
-                config.storage.as_ref(),
-                &config.ocsp,
-                policy.renew.as_ref(),
-                periodic,
-            )
-            .await;
         }
     };
+    let ocsp = run_ocsp_refreshes(
+        &cache,
+        config.storage.as_ref(),
+        &config.ocsp,
+        &forced,
+        ocsp_ticker,
+        marker_requests,
+    );
     // Stop remains selectable throughout storage work, callback awaits, and
     // admission backpressure. Cancelling an unadmitted submit is harmless.
     tokio::select! {
@@ -342,8 +475,83 @@ async fn maintenance_loop(
         }
         _ = renewals => {}
         _ = ocsp => {}
+        _ = force_renewals => {}
+        _ = revocations => {}
     }
     job_queue.shutdown().await;
+}
+
+async fn run_ocsp_refreshes(
+    cache: &CertCache,
+    storage: &dyn Storage,
+    config: &OcspConfig,
+    forced: &ForcedRenewals,
+    mut ticker: tokio::time::Interval,
+    marker_requests: tokio::sync::mpsc::Sender<()>,
+) {
+    let mut changed = cache.subscribe_ocsp();
+    let mut tracked = HashSet::new();
+    let mut pending: VecDeque<Arc<Certificate>> = VecDeque::new();
+    let mut refreshes = Vec::with_capacity(OCSP_REFRESH_CONCURRENCY);
+    loop {
+        // Keep only one periodic snapshot, and borrow at most the available
+        // number of due-index entries. Publications during a slow request do
+        // not accumulate an unbounded queue of obsolete certificate snapshots.
+        if !config.disable_stapling {
+            let due = cache.due_ocsp_snapshot(&tracked, OCSP_REFRESH_CONCURRENCY - refreshes.len());
+            for cert in due.into_iter().rev() {
+                pending.push_front(cert);
+            }
+        }
+        while refreshes.len() < OCSP_REFRESH_CONCURRENCY {
+            let Some(cert) = pending.pop_front() else {
+                break;
+            };
+            if !cache.ocsp_refresh_due(&cert.hash) || !tracked.insert(cert.hash.clone()) {
+                continue;
+            }
+            let hash = cert.hash.clone();
+            refreshes.push(Box::pin(async move {
+                refresh_ocsp_certificate(cache, storage, config, forced, cert).await;
+                hash
+            }));
+        }
+        // At most seven in-flight hashes are skipped here. A full pool waits
+        // for completion instead of repeatedly selecting an unadmittable timer.
+        let deadline = if config.disable_stapling || refreshes.len() == OCSP_REFRESH_CONCURRENCY {
+            None
+        } else {
+            cache.next_ocsp_deadline_excluding(&tracked)
+        };
+        let due = async {
+            match deadline {
+                Some(deadline) => {
+                    let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                    tokio::time::sleep(delay).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = ticker.tick() => {
+                let _ = marker_requests.try_send(());
+                if !config.disable_stapling {
+                    pending = cache.ocsp_snapshot(true).into();
+                }
+            }
+            _ = due => {}
+            _ = changed.changed() => {}
+            hash = std::future::poll_fn(|cx| {
+                for position in 0..refreshes.len() {
+                    if let std::task::Poll::Ready(hash) = refreshes[position].as_mut().poll(cx) {
+                        drop(refreshes.swap_remove(position));
+                        return std::task::Poll::Ready(hash);
+                    }
+                }
+                std::task::Poll::Pending
+            }), if !refreshes.is_empty() => { tracked.remove(&hash); }
+        }
+    }
 }
 
 pub(crate) async fn refresh_revocations(cache: &CertCache, storage: &dyn Storage) -> Result<usize> {
@@ -592,14 +800,23 @@ async fn update_ocsp_staples(
     config: &OcspConfig,
     renew_func: &ReasonedRenewFn,
 ) {
-    update_ocsp_staples_for(cache, storage, config, renew_func, true).await;
+    let (forced, receiver) = ForcedRenewals::new();
+    let refresh = async {
+        update_ocsp_staples_for(cache, storage, config, &forced, true).await;
+        drop(forced);
+    };
+    tokio::join!(
+        refresh,
+        run_forced_renewals(cache, renew_func, None, receiver)
+    );
 }
 
+#[cfg(test)]
 async fn update_ocsp_staples_for(
     cache: &CertCache,
     storage: &dyn Storage,
     config: &OcspConfig,
-    renew_func: &ReasonedRenewFn,
+    forced: &ForcedRenewals,
     periodic: bool,
 ) {
     if config.disable_stapling {
@@ -619,66 +836,87 @@ async fn update_ocsp_staples_for(
         "maintenance: checking certificates for OCSP staple freshness",
     );
 
-    for cert in all_certs {
-        let needs_update = cache.ocsp_refresh_due(&cert.hash);
-
-        if !needs_update {
-            continue;
-        }
-
-        let first_name = cert.names.first().cloned().unwrap_or_default();
-        let old_hash = cert.hash.clone();
-
-        debug!(
-            name = %first_name,
-            hash = %old_hash,
-            "maintenance: refreshing OCSP staple",
-        );
-
-        let mut updated_cert = Arc::unwrap_or_clone(cert);
-        let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
-        // Publish removal of an unusable staple as well as successful refreshes.
-        // Otherwise a failed refresh keeps serving the expired response forever.
-        let Some(current) = cache
-            .update_ocsp_if_present(
-                &old_hash,
-                updated_cert.ocsp_status,
-                updated_cert.ocsp_response.clone(),
-            )
-            .await
-        else {
-            // Renewal or removal won while this response was in flight.
-            continue;
-        };
-        let first_name = current.first_name;
-        match outcome {
-            Ok(true) if current.ocsp_status == Some(ocsp::OcspStatus::Good) => {
-                debug!(name = %first_name, "maintenance: OCSP staple refreshed successfully");
-            }
-            Ok(_) => {
-                debug!(name = %first_name, "maintenance: no usable OCSP staple is available");
-            }
-            Err(e) => {
-                warn!(name = %first_name, error = %e, "maintenance: failed to refresh OCSP staple");
-            }
-        }
-        // Use policy and sticky status captured in the cache update, not the
-        // scan's earlier snapshot. This does not serialize later policy changes
-        // with the asynchronous renewal callback.
-        if current.ocsp_status == Some(ocsp::OcspStatus::Revoked)
-            && config.replace_revoked
-            && current.managed
-        {
-            warn!(name = %first_name, hash = %old_hash, "maintenance: OCSP status is Revoked; triggering force-renewal");
-            match renew_func(first_name.clone(), RenewalReason::Revoked).await {
-                Ok(()) => {
-                    info!(name = %first_name, "maintenance: revoked certificate force-renewed successfully");
-                }
-                Err(e) => {
-                    error!(name = %first_name, error = %e, "maintenance: revoked certificate force-renewal failed");
+    let mut seen = HashSet::new();
+    let mut certificates = all_certs
+        .into_iter()
+        .filter(|cert| seen.insert(cert.hash.clone()) && cache.ocsp_refresh_due(&cert.hash));
+    let mut refreshes = Vec::with_capacity(OCSP_REFRESH_CONCURRENCY);
+    for cert in certificates.by_ref().take(OCSP_REFRESH_CONCURRENCY) {
+        refreshes.push(Box::pin(refresh_ocsp_certificate(
+            cache, storage, config, forced, cert,
+        )));
+    }
+    while !refreshes.is_empty() {
+        std::future::poll_fn(|cx| {
+            for position in 0..refreshes.len() {
+                if refreshes[position].as_mut().poll(cx).is_ready() {
+                    drop(refreshes.swap_remove(position));
+                    return std::task::Poll::Ready(());
                 }
             }
+            std::task::Poll::Pending
+        })
+        .await;
+        if let Some(cert) = certificates.next() {
+            refreshes.push(Box::pin(refresh_ocsp_certificate(
+                cache, storage, config, forced, cert,
+            )));
         }
+    }
+}
+
+async fn refresh_ocsp_certificate(
+    cache: &CertCache,
+    storage: &dyn Storage,
+    config: &OcspConfig,
+    forced: &ForcedRenewals,
+    cert: Arc<Certificate>,
+) {
+    let first_name = cert.names.first().cloned().unwrap_or_default();
+    let old_hash = cert.hash.clone();
+
+    debug!(
+        name = %first_name,
+        hash = %old_hash,
+        "maintenance: refreshing OCSP staple",
+    );
+
+    let mut updated_cert = Arc::unwrap_or_clone(cert);
+    let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
+    // Publish removal of an unusable staple as well as successful refreshes.
+    // Otherwise a failed refresh keeps serving the expired response forever.
+    let Some(current) = cache
+        .update_ocsp_if_present(
+            &old_hash,
+            updated_cert.ocsp_status,
+            updated_cert.ocsp_response.clone(),
+        )
+        .await
+    else {
+        // Renewal or removal won while this response was in flight.
+        return;
+    };
+    let first_name = current.first_name;
+    match outcome {
+        Ok(true) if current.ocsp_status == Some(ocsp::OcspStatus::Good) => {
+            debug!(name = %first_name, "maintenance: OCSP staple refreshed successfully");
+        }
+        Ok(_) => {
+            debug!(name = %first_name, "maintenance: no usable OCSP staple is available");
+        }
+        Err(e) => {
+            warn!(name = %first_name, error = %e, "maintenance: failed to refresh OCSP staple");
+        }
+    }
+    // Use policy and sticky status captured in the cache update, not the
+    // scan's earlier snapshot. This does not serialize later policy changes
+    // with the asynchronous renewal callback.
+    if current.ocsp_status == Some(ocsp::OcspStatus::Revoked)
+        && config.replace_revoked
+        && current.managed
+    {
+        warn!(name = %first_name, hash = %old_hash, "maintenance: OCSP status is Revoked; triggering force-renewal");
+        forced.try_submit(&updated_cert, first_name);
     }
 }
 
@@ -1485,7 +1723,20 @@ mod tests {
                     .await
                     .unwrap();
             }
-            update_ocsp_staples(&cache, &storage, &OcspConfig::default(), renew.as_ref()).await;
+            // Exercise each refresh outcome directly. The production scanner
+            // now schedules even initially unscheduled revoked leaves with a
+            // retry deadline instead of immediately forcing them repeatedly.
+            let (forced, receiver) = ForcedRenewals::new();
+            refresh_ocsp_certificate(
+                &cache,
+                &storage,
+                &OcspConfig::default(),
+                &forced,
+                Arc::new(cache.get_by_hash(&hash).await.unwrap()),
+            )
+            .await;
+            drop(forced);
+            run_forced_renewals(&cache, renew.as_ref(), None, receiver).await;
             let actual = cache.get_by_hash(&hash).await.unwrap();
             assert_eq!(actual.ocsp_status, Some(ocsp::OcspStatus::Revoked));
             assert!(actual.ocsp_response.is_none());
@@ -1575,6 +1826,7 @@ mod tests {
         check_renewals_with_policy(
             &cache,
             &RenewalPolicy {
+                observed_renew: None,
                 renew: renew_func,
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
@@ -1611,6 +1863,7 @@ mod tests {
         check_renewals_with_policy(
             &cache,
             &RenewalPolicy {
+                observed_renew: None,
                 renew: renew_func,
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
@@ -1647,6 +1900,7 @@ mod tests {
         check_renewals_with_policy(
             &cache,
             &RenewalPolicy {
+                observed_renew: None,
                 renew: renew_func,
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
@@ -1682,6 +1936,7 @@ mod tests {
         check_renewals_with_policy(
             &cache,
             &RenewalPolicy {
+                observed_renew: None,
                 renew: renew_func,
                 revocations: Arc::new(DummyStorage),
                 certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
@@ -1745,6 +2000,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
         let policy = RenewalPolicy {
+            observed_renew: None,
             revocations: Arc::new(DummyStorage),
             ratio: 0.5,
             certificates: Arc::new(crate::cert_store::tests::InMemory::default()),
@@ -1781,6 +2037,7 @@ mod tests {
         let store = Arc::new(InMemory::default());
         store.save("ca", &resource).await.unwrap();
         let policy = RenewalPolicy {
+            observed_renew: None,
             revocations: Arc::new(DummyStorage),
             ratio: DEFAULT_RENEWAL_WINDOW_RATIO,
             certificates: store,

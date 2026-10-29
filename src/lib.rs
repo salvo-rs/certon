@@ -316,12 +316,18 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
 
     let renew_func = maintenance_renewal(config);
 
-    maintain::start_maintenance_with_policy(
+    let manager = Arc::new(config.detached("maintenance-ocsp"));
+    let observed: Arc<maintain::ObservedRenewFn> = Arc::new(move |domain, leaf| {
+        let manager = Arc::clone(&manager);
+        Box::pin(async move { manager.renew_observed_revocation(&domain, &leaf).await })
+    });
+    maintain::start_maintenance_with_observed_renewal(
         cache,
         maint_config,
         renew_func,
         config.certificates.clone(),
         config.policy.renewal_window_ratio,
+        Some(observed),
     )
 }
 

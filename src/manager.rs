@@ -1325,6 +1325,45 @@ impl CertManager {
             .await
     }
 
+    /// A delayed OCSP request may only force the leaf it actually observed.
+    /// Recheck shared storage after both lifecycle locks, since another manager
+    /// may have renewed it while this request waited in the maintenance queue.
+    pub(crate) async fn renew_observed_revocation(
+        &self,
+        domain: &str,
+        observed_leaf: &str,
+    ) -> Result<()> {
+        let _domain_lock = acquire(
+            self.storage.clone(),
+            &Self::lock_key(CERT_ISSUE_LOCK_OP, domain),
+        )
+        .await?;
+        loop {
+            let resource = self.load_cert_resource_for_operation(domain, true).await?;
+            let leaf = crate::storage::resource_leaf_hash(&resource)?;
+            let leaf_lock =
+                acquire(self.storage.clone(), &format!("certificate_leaf_{leaf}")).await?;
+            let current = self.load_cert_resource_for_operation(domain, true).await?;
+            if crate::storage::resource_leaf_hash(&current)? != leaf {
+                drop(leaf_lock);
+                continue;
+            }
+            if !self
+                .cache
+                .has_managed_ocsp_revoked_leaf(domain, observed_leaf)
+            {
+                return Ok(());
+            }
+            if leaf != observed_leaf {
+                self.cache_certificate(domain).await?;
+                return Ok(());
+            }
+            // Maintenance uses one foreground attempt, without long background
+            // retry/backoff while holding these locks.
+            return self.do_renew(domain, true).await;
+        }
+    }
+
     /// The caller already owns the domain lifecycle lock. Keep the same leaf
     /// lock and post-lock identity recheck for initial-load repair and renewal.
     async fn renew_with_domain_lock(

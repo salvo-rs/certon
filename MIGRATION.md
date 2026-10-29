@@ -403,3 +403,24 @@ Both methods revoke one selected stored resource. They do not revoke every
 issuer resource or an independently imported cache sibling, close existing TLS
 sessions, or invalidate exported keys. Applications that require a domain-wide
 shutdown must also stop issuance and explicitly handle all their credentials.
+
+## Concurrent OCSP maintenance
+
+Maintenance refreshes up to eight distinct certificate hashes concurrently. A
+slow responder no longer holds up the other admitted refreshes. Refresh futures
+are borrowed by the maintenance loop and are dropped when it stops or is aborted.
+
+Verified revocation is still published to the cache before requesting renewal.
+Force-renewal requests use an independent queue with four executions and at most
+64 waiting requests, deduplicated by leaf identity. Full admission is logged and
+retried on the next OCSP deadline (30 seconds for a revoked leaf); OCSP refreshes
+never wait for queue capacity or for a CA renewal. Shutdown cancels these requests
+and drops their callback futures before releasing their deduplication records.
+
+The built-in manager callback rechecks both the cached observation and shared
+storage after lifecycle lock waits. If another operation has replaced the leaf,
+it reloads the replacement safely instead of forcing another issuance. Custom
+`maintain::start_maintenance*` callbacks retain their existing signature and
+receive the domain observed at dispatch; they must recheck their own resource
+identity after asynchronous waits before forcing a replacement. Maintenance
+does not wrap a callback in a long retry/backoff loop.
