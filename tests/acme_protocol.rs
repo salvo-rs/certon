@@ -1510,3 +1510,123 @@ async fn polling_preserves_terminal_errors_and_accepts_a_large_ready_budget() {
         }
     }
 }
+
+#[tokio::test]
+async fn distinct_configured_email_issuers_keep_signers_separate_through_recovery_and_restart() {
+    let server = Server::start(false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(dir.path()));
+    let ca = format!("{}/directory", server.url);
+    let plus = "operator+prod@example.com";
+    let literal = "operator_plus_prod@example.com";
+    let plus_key = rcgen::KeyPair::generate().unwrap();
+    let literal_key = rcgen::KeyPair::generate().unwrap();
+    let replacement_key = rcgen::KeyPair::generate().unwrap();
+    let mut first = certon::account::new_account(plus, KeyType::EcdsaP256).unwrap();
+    first.status = "valid".into();
+    first.location = format!("{}/account/plus", server.url);
+    first.private_key_pem = plus_key.serialize_pem();
+    let mut second = certon::account::new_account(literal, KeyType::EcdsaP256).unwrap();
+    second.status = "valid".into();
+    second.location = format!("{}/account/literal", server.url);
+    second.private_key_pem = literal_key.serialize_pem();
+    certon::account::save_account(storage.as_ref(), &ca, &first)
+        .await
+        .unwrap();
+    certon::account::save_account(storage.as_ref(), &ca, &second)
+        .await
+        .unwrap();
+    let build = |email: &str| {
+        AcmeIssuer::builder()
+            .ca(&ca)
+            .test_ca(&ca)
+            .storage(Arc::new(FileStorage::new(dir.path())))
+            .email(email)
+            .agreed(true)
+            .account_key_pem(replacement_key.serialize_pem())
+            .build()
+    };
+    for email in [plus, literal] {
+        build(email)
+            .issue(b"csr", &["review.example.com".into()])
+            .await
+            .unwrap();
+    }
+    server.order_problem_responses.lock().unwrap().push_back((
+        400,
+        json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist"}).to_string(),
+    ));
+    build(plus)
+        .issue(b"csr", &["review.example.com".into()])
+        .await
+        .unwrap();
+    for email in [plus, literal] {
+        build(email)
+            .issue(b"csr", &["review.example.com".into()])
+            .await
+            .unwrap();
+    }
+    let kept = certon::account::get_account(storage.as_ref(), &ca, literal)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.location, second.location);
+    assert_eq!(
+        round9_account_thumbprint(&kept),
+        round9_account_thumbprint(&second)
+    );
+    let recovered = certon::account::get_account(storage.as_ref(), &ca, plus)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.location, format!("{}/account/new", server.url));
+    let mut expected = first.clone();
+    expected.private_key_pem = replacement_key.serialize_pem();
+    assert_eq!(
+        round9_account_thumbprint(&recovered),
+        round9_account_thumbprint(&expected)
+    );
+    assert_ne!(
+        round9_account_thumbprint(&recovered),
+        round9_account_thumbprint(&first)
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests.iter().filter(|r| r.path == "/new-account").count(),
+        1
+    );
+    let orders: Vec<_> = requests.iter().filter(|r| r.path == "/new-order").collect();
+    assert_eq!(orders.len(), 6);
+    for (request, wanted) in orders.iter().zip([
+        &first.location,
+        &second.location,
+        &first.location,
+        &recovered.location,
+        &recovered.location,
+        &second.location,
+    ]) {
+        assert_eq!(&request.protected["kid"], wanted);
+    }
+    #[cfg(feature = "aws-lc-rs")]
+    use aws_lc_rs as provider;
+    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    use ring as provider;
+    for request in requests.iter().filter(|r| r.method == "POST") {
+        let public = if request.path == "/new-account" {
+            replacement_key.public_key_raw()
+        } else if request.protected["kid"] == first.location {
+            plus_key.public_key_raw()
+        } else if request.protected["kid"] == second.location {
+            literal_key.public_key_raw()
+        } else {
+            assert_eq!(request.protected["kid"], recovered.location);
+            replacement_key.public_key_raw()
+        };
+        provider::signature::UnparsedPublicKey::new(
+            &provider::signature::ECDSA_P256_SHA256_FIXED,
+            public,
+        )
+        .verify(&request.signing_input, &request.signature)
+        .unwrap();
+    }
+}
