@@ -581,3 +581,12 @@ preparation, and stale Good refreshes cannot restore a revoked sibling. The
 Result-returning unmanaged import/replacement helpers reject such a leaf before
 removing any existing certificate. This does not change persistent explicit
 revocation intent or introduce a new lifetime deny-list for OCSP metadata.
+
+## ZeroSSL ACME renewal information
+
+`ZeroSslIssuer` now delegates renewal-information queries to its inner ACME
+issuer. An advertised ARI endpoint can supply a renewal window and retry delay
+without registering an account or provisioning new EAB credentials. Unsupported
+ARI still returns no recommendation, and temporary ARI errors retain the existing
+retry handling. This change applies to the ACME issuer; the separate ZeroSSL REST
+API issuer is unchanged.
