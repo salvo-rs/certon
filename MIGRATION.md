@@ -537,3 +537,17 @@ The complete original response remains the TLS staple. Its full ResponseData
 signature, responder authorization and the selected target's time/status checks
 are still validated; selection does not re-encode or sign a reduced response.
 No public API signatures or supported CertID hash algorithms change.
+
+## OCSP status across cached chains
+
+An authenticated OCSP Revoked result applies to every live cached encoding of
+that leaf, including unmanaged chains and different store aliases. Status and
+serving containers change atomically under the cache publication lock. Each
+retained affected chain receives its update notification and recovery deadline;
+unrelated leaves retain their own status and signing key.
+
+Managed and raw publication recheck live leaf evidence after asynchronous OCSP
+preparation, and stale Good refreshes cannot restore a revoked sibling. The
+Result-returning unmanaged import/replacement helpers reject such a leaf before
+removing any existing certificate. This does not change persistent explicit
+revocation intent or introduce a new lifetime deny-list for OCSP metadata.

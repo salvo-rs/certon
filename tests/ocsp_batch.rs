@@ -547,3 +547,114 @@ async fn must_staple_reload_accepts_the_target_from_a_cached_batch() {
         "the target's verified revocation must stop TLS serving"
     );
 }
+#[tokio::test]
+async fn verified_leaf_revocation_quarantines_all_cached_chain_encodings() {
+    use certon::Storage;
+    let server = Server::new().await;
+    let fixture = Fixture::new(&server.url);
+    let good = fixture.response(&[Single::new(Identity::Target)]);
+    let mut alternate_ca = CertificateParams::new(vec!["probe-ca".into()]).unwrap();
+    alternate_ca
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Batch OCSP CA");
+    alternate_ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    alternate_ca.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
+    alternate_ca.serial_number = Some(999u64.into());
+    let alternate = alternate_ca.self_signed(&fixture.key).unwrap();
+    let alternate_pem = format!(
+        "{}{}",
+        pem::encode(&pem::Pem::new("CERTIFICATE", fixture.target_der.clone())),
+        alternate.pem()
+    );
+    let mut a =
+        certon::Certificate::from_pem(&fixture.pem, fixture.target_key_pem.as_bytes()).unwrap();
+    let mut b =
+        certon::Certificate::from_pem(alternate_pem.as_bytes(), fixture.target_key_pem.as_bytes())
+            .unwrap();
+    assert_eq!(a.cert_chain[0], b.cert_chain[0]);
+    assert_ne!(a.hash, b.hash);
+    for certificate in [&mut a, &mut b] {
+        certificate.managed = true;
+        certificate.issuer_key = "batch-ca".into();
+        certificate.ocsp_response = Some(good.clone());
+    }
+    let cache = certon::CertCache::new(certon::CacheOptions::default());
+    cache.add(a.clone()).await;
+    assert!(
+        tls_works(cache.clone(), &fixture).await,
+        "chain A positive TLS control"
+    );
+    cache.remove(&a.hash).await;
+    cache.add(b.clone()).await;
+    assert!(
+        tls_works(cache.clone(), &fixture).await,
+        "chain B positive TLS control"
+    );
+    cache.add(a.clone()).await;
+    assert_eq!(cache.get_all().await.len(), 2);
+    let directory = tempfile::tempdir().unwrap();
+    let storage = certon::FileStorage::new(directory.path());
+    certon::storage::store_certificate(
+        &storage,
+        "batch-ca",
+        &certon::CertificateResource {
+            sans: vec!["target.example".into()],
+            certificate_pem: fixture.pem.clone(),
+            private_key_pem: fixture.target_key_pem.as_bytes().to_vec(),
+            issuer_key: "batch-ca".into(),
+            issuer_data: None,
+        },
+    )
+    .await
+    .unwrap();
+    let mut revoked = Single::new(Identity::Target);
+    revoked.status = 1;
+    storage
+        .store(
+            &certon::storage::ocsp_key(&a.names[0], &a.hash),
+            &fixture.response(&[revoked]),
+        )
+        .await
+        .unwrap();
+    let result = certon::certificates::reload_managed_certificate(
+        &cache,
+        &storage,
+        "target.example",
+        "batch-ca",
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(certon::Error::Cert(certon::error::CertError::OcspFailed(_)))
+    ));
+    assert_eq!(
+        cache.get_by_hash(&a.hash).await.unwrap().ocsp_status,
+        Some(certon::ocsp::OcspStatus::Revoked)
+    );
+    let sibling_status = cache.get_by_hash(&b.hash).await.unwrap().ocsp_status;
+    assert_eq!(sibling_status, Some(certon::ocsp::OcspStatus::Revoked));
+    assert!(
+        cache
+            .get_by_hash(&b.hash)
+            .await
+            .unwrap()
+            .ocsp_response
+            .is_none()
+    );
+    let still_serves = tls_works(cache.clone(), &fixture).await;
+    cache.remove(&b.hash).await;
+    assert!(
+        !tls_works(cache, &fixture).await,
+        "the updated A chain itself must be rejected"
+    );
+    eprintln!(
+        "same_leaf=true different_legal_chains=true a_revoked=true b_status={sibling_status:?} real_tls_after_verified_status={still_serves}"
+    );
+    assert!(
+        !still_serves,
+        "verified status for a leaf must apply to all cached chains of that same leaf"
+    );
+}
