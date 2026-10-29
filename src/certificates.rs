@@ -9,7 +9,8 @@
 //!
 //! - **Renewal window**: a certificate is considered due for renewal when the remaining fraction of
 //!   its total lifetime drops below a configurable ratio (default [`DEFAULT_RENEWAL_WINDOW_RATIO`]
-//!   = 1/3). An emergency renewal is also triggered when fewer than 24 hours remain.
+//!   = 1/3). The emergency window is the smaller of 24 hours and the default fraction of the
+//!   certificate's total lifetime, so newly issued short-lived credentials are not immediately due.
 //! - **Subject qualification**: helper functions such as [`subject_qualifies_for_cert`] and
 //!   [`subject_qualifies_for_public_cert`] validate domain names before attempting certificate
 //!   issuance, catching common typos and misconfigurations early.
@@ -62,10 +63,8 @@ pub enum PrivateKeyKind {
 /// day 60 (30 days before expiration).
 pub const DEFAULT_RENEWAL_WINDOW_RATIO: f64 = 1.0 / 3.0;
 
-/// Certificates expiring in fewer than this many hours trigger an emergency
-/// renewal regardless of the configured renewal window ratio. This safety
-/// net ensures that even certificates with very long lifetimes are renewed
-/// before expiration.
+/// Maximum emergency renewal window, capped further by the default lifetime
+/// ratio for certificates whose total validity is shorter than three days.
 const EMERGENCY_RENEWAL_HOURS: i64 = 24;
 
 // ---------------------------------------------------------------------------
@@ -188,29 +187,48 @@ impl Certificate {
     /// A valid ARI window uses its stable local selected time, in place of the
     /// ordinary lifetime ratio. Without usable ARI, `renewal_window_ratio` is
     /// the fraction of lifetime that should remain when renewal starts (pass
-    /// `0.0` for [`DEFAULT_RENEWAL_WINDOW_RATIO`]). The existing emergency rules
-    /// always apply: expiration, less than 24 hours remaining, or the final
-    /// 1/50 of the lifetime. Managers with [`crate::Policy::disable_ari`] ignore
-    /// ARI even when another manager shares their cache.
+    /// `0.0` for [`DEFAULT_RENEWAL_WINDOW_RATIO`]). Emergency renewal uses the
+    /// smaller of 24 hours and the default lifetime fraction (1/3), independent
+    /// of the configured ratio. Expiration and the final 1/50 of the lifetime
+    /// remain safety fallbacks; invalid validity intervals also need repair.
+    /// These guards override ARI. Managers with [`crate::Policy::disable_ari`]
+    /// ignore ARI even when another manager shares their cache.
     pub fn needs_renewal(&self, renewal_window_ratio: f64) -> bool {
         self.needs_renewal_with_ari(renewal_window_ratio, true)
     }
 
     pub(crate) fn needs_renewal_with_ari(&self, renewal_window_ratio: f64, use_ari: bool) -> bool {
-        // If already expired, definitely needs renewal.
-        if self.expired() {
+        self.needs_renewal_at(renewal_window_ratio, use_ari, Utc::now())
+    }
+
+    fn needs_renewal_at(
+        &self,
+        renewal_window_ratio: f64,
+        use_ari: bool,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let lifetime = self.lifetime();
+        if lifetime <= ChronoDuration::zero()
+            || self.not_before > now
+            || now > expires_at(self.not_after)
+        {
             return true;
         }
 
-        // Emergency: fewer than 24 hours remaining.
-        let remaining = expires_at(self.not_after) - Utc::now();
-        if remaining < ChronoDuration::hours(EMERGENCY_RENEWAL_HOURS) {
+        // Keep the existing safety override, but never start it before the
+        // default renewal window merely because the entire lifetime is short.
+        let default_window = ChronoDuration::seconds(
+            (lifetime.num_seconds() as f64 * DEFAULT_RENEWAL_WINDOW_RATIO) as i64,
+        );
+        let emergency_window = ChronoDuration::hours(EMERGENCY_RENEWAL_HOURS).min(default_window);
+        let remaining = expires_at(self.not_after) - now;
+        if remaining < emergency_window {
             return true;
         }
 
         // Also check an extremely tight ratio (1/50 of lifetime) as an
         // additional safety net for emergency renewal.
-        if currently_in_renewal_window(self.not_before, self.not_after, 1.0 / 50.0) {
+        if currently_in_renewal_window_at(self.not_before, self.not_after, 1.0 / 50.0, now) {
             return true;
         }
 
@@ -220,9 +238,9 @@ impl Certificate {
                 .as_ref()
                 .and_then(|info| crate::ari::selected_time(self, info))
         {
-            return Utc::now() >= time;
+            return now >= time;
         }
-        currently_in_renewal_window(self.not_before, self.not_after, renewal_window_ratio)
+        currently_in_renewal_window_at(self.not_before, self.not_after, renewal_window_ratio, now)
     }
 
     /// Returns `true` if `tag` is present in [`Certificate::tags`].
@@ -522,6 +540,15 @@ pub fn currently_in_renewal_window(
     not_after: DateTime<Utc>,
     renewal_window_ratio: f64,
 ) -> bool {
+    currently_in_renewal_window_at(not_before, not_after, renewal_window_ratio, Utc::now())
+}
+
+fn currently_in_renewal_window_at(
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    renewal_window_ratio: f64,
+    now: DateTime<Utc>,
+) -> bool {
     let lifetime = not_after - not_before;
     if lifetime.num_seconds() <= 0 {
         return false;
@@ -540,7 +567,7 @@ pub fn currently_in_renewal_window(
     let renewal_window = ChronoDuration::seconds(renewal_window_secs);
     let renewal_start = not_after - renewal_window;
 
-    Utc::now() > renewal_start
+    now > renewal_start
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +946,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod short_lifetime_tests;
 
 #[cfg(test)]
 mod tests {

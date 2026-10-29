@@ -443,6 +443,23 @@ identity after asynchronous waits before forcing a replacement. Maintenance
 does not wrap a callback in a long retry/backoff loop.
 
 
+## Emergency renewal for short-lived certificates
+
+The emergency window now uses the smaller of 24 hours and the default renewal
+fraction (1/3) of the certificate's total validity. A six-hour certificate enters
+this window with two hours left, a 24-hour certificate with eight hours left,
+and a 48-hour certificate with 16 hours left. Certificates valid for at least
+three days retain the existing 24-hour ceiling. Expiration and the final 1/50
+of the lifetime remain independent safety fallbacks.
+
+Fresh short-lived certificates no longer trigger repeated non-forced renewals
+merely because their entire lifetime is below 24 hours. The configured ordinary
+ratio and ARI selected time still apply before the emergency window. Emergency
+renewal continues to override a later ARI point or a smaller configured ratio;
+the cap uses the default ratio rather than weakening that safety rule. Future
+or nonpositive validity intervals need repair, while raw metadata APIs remain
+available for lifecycle planning.
+
 ## Automatic ARI renewal scheduling
 
 The default manager lifecycle now fetches RFC 9773 renewal information after
@@ -466,7 +483,8 @@ instances. A changed valid window selects a new point. Shared instances use the
 existing storage lock contract. Alternate chains of one leaf share this state.
 
 Valid ARI takes precedence over the ordinary renewal ratio, while expiration and
-the existing emergency rules (24 hours remaining or the final 1/50 of lifetime)
+the emergency rules (the smaller of 24 hours and the default lifetime fraction,
+or the final 1/50 of lifetime)
 remain safety fallbacks. Invalid/unavailable ARI uses the ordinary ratio. A
 transient refresh failure retains the previous valid point and backs off, reaching
 the six-hour fallback after eight failures. `Retry-After` is bounded to one minute
