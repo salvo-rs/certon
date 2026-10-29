@@ -837,15 +837,17 @@ impl AcmeIssuer {
     /// challenge list.
     ///
     /// Preference order:
-    /// 1. `dns-01` if a DNS solver is configured
+    /// 1. `dns-01` if a DNS solver is configured, for DNS identifiers only
     /// 2. `http-01` if not disabled
     /// 3. `tls-alpn-01` if not disabled
     fn select_challenge<'a>(
         &self,
         challenges: &'a [crate::acme_client::AcmeChallenge],
+        ip_identifier: bool,
     ) -> Result<&'a crate::acme_client::AcmeChallenge> {
         // Prefer dns-01 if a DNS solver is available.
-        if self.dns01_solver.is_some()
+        if !ip_identifier
+            && self.dns01_solver.is_some()
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_DNS01)
@@ -1031,7 +1033,8 @@ impl AcmeIssuer {
             }
 
             // Select challenge.
-            let challenge = self.select_challenge(&authz.challenges)?;
+            let challenge =
+                self.select_challenge(&authz.challenges, authz.identifier.id_type == "ip")?;
 
             debug!(
                 identifier = %authz.identifier.value,

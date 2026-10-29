@@ -9,6 +9,7 @@
 //! required by RFC 8555. ECDSA P-256 (ES256) is used for signing.
 
 use std::collections::{HashSet, VecDeque};
+use std::net::IpAddr;
 use std::time::Duration;
 
 #[cfg(feature = "aws-lc-rs")]
@@ -1247,7 +1248,11 @@ impl AcmeClient {
     // Order operations
     // -----------------------------------------------------------------------
 
-    /// Create a new ACME order for the specified domains.
+    /// Create a new ACME order for the specified DNS names or IP addresses.
+    ///
+    /// IP addresses use RFC 8738's `ip` identifier and canonical address text;
+    /// DNS values are passed through unchanged. The CA must support issuance
+    /// for the requested identifier types and any selected ACME profile.
     ///
     /// Returns the order object and the order URL (from `Location` header).
     pub async fn new_order(
@@ -1261,6 +1266,7 @@ impl AcmeClient {
     }
 
     /// Create an order including a profile and requested validity bounds.
+    /// DNS names and IP addresses are encoded as in [`Self::new_order`].
     pub async fn new_order_with_options(
         &self,
         account_key: &PrivateKey,
@@ -1279,9 +1285,15 @@ impl AcmeClient {
 
         let identifiers: Vec<AcmeIdentifier> = domains
             .iter()
-            .map(|d| AcmeIdentifier {
-                id_type: "dns".to_owned(),
-                value: d.clone(),
+            .map(|domain| match domain.parse::<IpAddr>() {
+                Ok(address) => AcmeIdentifier {
+                    id_type: "ip".to_owned(),
+                    value: address.to_string(),
+                },
+                Err(_) => AcmeIdentifier {
+                    id_type: "dns".to_owned(),
+                    value: domain.clone(),
+                },
             })
             .collect();
 

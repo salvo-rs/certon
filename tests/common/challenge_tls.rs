@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 
 #[derive(Debug)]
-struct ChallengeVerifier;
+pub(crate) struct ChallengeVerifier;
 impl rustls::client::danger::ServerCertVerifier for ChallengeVerifier {
     // Availability-only test: ACME leaves have a specialized critical
     // extension. This verifier does not assert certificate/signature safety.

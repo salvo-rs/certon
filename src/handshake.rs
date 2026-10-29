@@ -268,12 +268,17 @@ impl CertResolver {
     /// When a ClientHello arrives with ALPN containing `"acme-tls/1"` and
     /// a matching SNI, this challenge certificate will be returned instead
     /// of the normal certificate.
+    /// IP identifiers are registered under the RFC 8738 reverse-map SNI;
+    /// the supplied challenge certificate must still have the IP SAN.
     pub async fn set_challenge_cert(&self, domain: String, cert: Arc<CertifiedKey>) {
         let mut challenges = self
             .acme_challenges
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        challenges.insert(domain.to_lowercase(), cert);
+        challenges.insert(
+            crate::challenge::tls_alpn_server_name(&domain).to_lowercase(),
+            cert,
+        );
     }
 
     /// Remove a previously registered TLS-ALPN-01 challenge certificate.
@@ -282,7 +287,7 @@ impl CertResolver {
             .acme_challenges
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        challenges.remove(&domain.to_lowercase());
+        challenges.remove(&crate::challenge::tls_alpn_server_name(domain).to_lowercase());
     }
 
     /// Set the default (fallback) certificate.
