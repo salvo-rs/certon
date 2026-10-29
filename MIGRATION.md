@@ -775,3 +775,20 @@ only after an actual OS filename-length error, leaving permission and whole-path
 errors visible. Upgrade all FileStorage writers before using these long names;
 older versions do not understand the bounded layout or long lock paths. Existing
 atomic publication, private-file permissions and cancellation behavior are retained.
+
+## Exact ACME account-missing recovery
+
+The issuer deletes and recreates a stored account only when order creation
+returns HTTP 400 with the exact parsed problem type
+`urn:ietf:params:acme:error:accountDoesNotExist`. Human-readable details, request
+URLs, malformed JSON, nonstandard problem URIs and other HTTP statuses cannot
+trigger account replacement. This also applies after the one `badNonce` retry.
+The account lookup helper likewise recognizes only that exact HTTP 400 problem
+as an absent account.
+
+Public order methods keep returning their existing errors for account-missing
+responses; the issuer uses a private classified result to enter recovery. The
+existing shared account lock and newer-account identity checks remain in place,
+and order creation is retried only once after recovery. Other failures propagate
+without deleting the stored account. No public error variants or signatures
+change.

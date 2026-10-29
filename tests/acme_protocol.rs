@@ -8,6 +8,319 @@ use certon::{AcmeIssuer, CertIssuer, FileStorage, KeyType};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn round9_account_thumbprint(account: &certon::account::AcmeAccount) -> String {
+    let key = certon::crypto::decode_private_key_pem(&account.private_key_pem).unwrap();
+    certon::acme_client::key_authorization("identity", &key).unwrap()
+}
+
+#[tokio::test]
+async fn round9_only_the_exact_account_missing_problem_may_replace_a_persisted_account() {
+    let missing = "urn:ietf:params:acme:error:accountDoesNotExist";
+    let unauthorized = "urn:ietf:params:acme:error:unauthorized";
+    let cases = [
+        (
+            "unauthorized-control",
+            403,
+            unauthorized,
+            "policy rejected",
+            false,
+        ),
+        (
+            "unauthorized-detail",
+            403,
+            unauthorized,
+            "the prior accountDoesNotExist incident is unrelated to this policy rejection",
+            false,
+        ),
+        (
+            "server-error-detail",
+            500,
+            "urn:ietf:params:acme:error:serverInternal",
+            "accountDoesNotExist metrics unavailable; account remains valid",
+            false,
+        ),
+        (
+            "nonstandard-type",
+            400,
+            "urn:vendor:accountDoesNotExist",
+            "this is not the standard account missing error",
+            false,
+        ),
+        ("exact-type-on-403", 403, missing, "account removed", false),
+        ("exact-type-on-500", 500, missing, "account removed", false),
+        (
+            "exact-missing-control",
+            400,
+            missing,
+            "account removed",
+            true,
+        ),
+    ];
+    let mut violations = Vec::new();
+    let mut scenarios: Vec<_> = cases
+        .into_iter()
+        .map(|(label, status, problem_type, detail, may_replace)| {
+            (
+                label,
+                status,
+                json!({"type":problem_type,"detail":detail}).to_string(),
+                may_replace,
+                false,
+            )
+        })
+        .collect();
+    scenarios.extend([
+        (
+            "malformed-json-400",
+            400,
+            "not JSON: accountDoesNotExist".into(),
+            false,
+            false,
+        ),
+        (
+            "malformed-json-500",
+            500,
+            "not JSON: accountDoesNotExist".into(),
+            false,
+            false,
+        ),
+        (
+            "request-url-token",
+            403,
+            json!({"type":unauthorized,"detail":"policy rejected"}).to_string(),
+            false,
+            true,
+        ),
+    ]);
+    for (label, status, body, may_replace, token_in_url) in scenarios {
+        for bad_nonce_first in [false, true] {
+            let server = Server::start(false).await;
+            if token_in_url {
+                *server.order_path.lock().unwrap() = "/new-order/accountDoesNotExist".into();
+            }
+            {
+                let mut responses = server.order_problem_responses.lock().unwrap();
+                if bad_nonce_first {
+                    responses.push_back((400,json!({"type":"urn:ietf:params:acme:error:badNonce","detail":"retry nonce"}).to_string()));
+                }
+                responses.push_back((status, body.clone()));
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let storage = Arc::new(FileStorage::new(directory.path()));
+            let ca = format!("{}/directory", server.url);
+            let mut original =
+                certon::account::new_account("review@example.com", KeyType::EcdsaP256).unwrap();
+            original.location = format!("{}/account/old", server.url);
+            original.status = "valid".into();
+            certon::account::save_account(storage.as_ref(), &ca, &original)
+                .await
+                .unwrap();
+            let old_thumbprint = round9_account_thumbprint(&original);
+            let supplied = rcgen::KeyPair::generate().unwrap().serialize_pem();
+            let issuer = AcmeIssuer::builder()
+                .ca(&ca)
+                .test_ca(&ca)
+                .storage(storage.clone())
+                .email("review@example.com")
+                .agreed(true)
+                .account_key_pem(supplied.clone())
+                .build();
+            let outcome = issuer.issue(b"csr", &["review.example.com".into()]).await;
+            let current = certon::account::get_account(storage.as_ref(), &ca, "review@example.com")
+                .await
+                .unwrap()
+                .unwrap();
+            let current_thumbprint = round9_account_thumbprint(&current);
+            let key_changed = current_thumbprint != old_thumbprint;
+            let location_changed = current.location != original.location;
+            let registrations_before_restart = server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path == "/new-account")
+                .count();
+            // Recreating the issuer proves this is persistent account replacement,
+            // rather than an in-memory account-cache observation.
+            drop(issuer);
+            let recreated = AcmeIssuer::builder()
+                .ca(&ca)
+                .test_ca(&ca)
+                .storage(storage.clone())
+                .email("review@example.com")
+                .agreed(true)
+                .account_key_pem(supplied)
+                .build();
+            recreated
+                .issue(b"csr", &["review.example.com".into()])
+                .await
+                .unwrap();
+            let reloaded =
+                certon::account::get_account(storage.as_ref(), &ca, "review@example.com")
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(round9_account_thumbprint(&reloaded), current_thumbprint);
+            assert_eq!(reloaded.location, current.location);
+            let requests = server.requests.lock().unwrap();
+            let registrations = requests
+                .iter()
+                .filter(|request| request.path == "/new-account")
+                .count();
+            assert_eq!(registrations, registrations_before_restart);
+            let orders = requests
+                .iter()
+                .filter(|request| request.path.starts_with("/new-order"))
+                .count();
+            assert_eq!(
+                orders,
+                2 + usize::from(bad_nonce_first) + usize::from(may_replace),
+                "{label}, bad_nonce_first={bad_nonce_first}: only one nonce retry and one exact missing-account recovery are allowed"
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                may_replace,
+                "{label}, bad_nonce_first={bad_nonce_first}: non-target errors must propagate"
+            );
+            eprintln!(
+                "case={label} status={status} bad_nonce_first={bad_nonce_first} initial_issue_ok={} persisted_key_changed={key_changed} persisted_location_changed={location_changed} registrations={registrations} new_orders_including_restart={orders} restart_preserved_current_identity=true",
+                outcome.is_ok()
+            );
+            if key_changed != may_replace
+                || location_changed != may_replace
+                || registrations != usize::from(may_replace)
+            {
+                violations.push(label);
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "non-authoritative error text replaced valid persisted accounts: {violations:?}"
+    );
+}
+
+#[tokio::test]
+async fn public_new_order_still_reports_account_missing_as_an_order_error() {
+    for bad_nonce_first in [false, true] {
+        let server = Server::start(false).await;
+        {
+            let mut responses = server.order_problem_responses.lock().unwrap();
+            if bad_nonce_first {
+                responses.push_back((400,json!({"type":"urn:ietf:params:acme:error:badNonce","detail":"fresh nonce required"}).to_string()));
+            }
+            responses.push_back((400,json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist","detail":"public-error-detail"}).to_string()));
+        }
+        let client = AcmeClient::new(&format!("{}/directory", server.url))
+            .await
+            .unwrap();
+        let key = certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+        let error = client
+            .new_order(
+                &key,
+                &format!("{}/account/existing", server.url),
+                &["review.example.com".into()],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error,
+            certon::Error::Acme(certon::error::AcmeError::Order(_))
+        ));
+        assert!(
+            error.to_string().contains("accountDoesNotExist")
+                && error.to_string().contains("public-error-detail")
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path == "/new-order")
+                .count(),
+            1 + usize::from(bad_nonce_first)
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path == "/new-account")
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_recovery_retries_order_creation_only_once() {
+    let server = Server::start(false).await;
+    for _ in 0..2 {
+        server.order_problem_responses.lock().unwrap().push_back((400,json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist","detail":"account removed"}).to_string()));
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let ca = format!("{}/directory", server.url);
+    let mut original =
+        certon::account::new_account("review@example.com", KeyType::EcdsaP256).unwrap();
+    original.location = format!("{}/account/old", server.url);
+    original.status = "valid".into();
+    certon::account::save_account(storage.as_ref(), &ca, &original)
+        .await
+        .unwrap();
+    let issuer = AcmeIssuer::builder()
+        .ca(&ca)
+        .test_ca(&ca)
+        .email("review@example.com")
+        .agreed(true)
+        .storage(storage.clone())
+        .build();
+    let error = issuer
+        .issue(b"csr", &["review.example.com".into()])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("accountDoesNotExist"));
+    let current = certon::account::get_account(storage.as_ref(), &ca, "review@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        round9_account_thumbprint(&current),
+        round9_account_thumbprint(&original)
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/new-order")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/new-account")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn account_lookup_accepts_only_the_exact_missing_account_problem() {
+    for (status,body,missing) in [
+        (400,json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist","detail":"missing"}).to_string(),true),
+        (400,json!({"type":"urn:vendor:accountDoesNotExist","detail":"foreign problem"}).to_string(),false),
+        (400,json!({"type":"urn:ietf:params:acme:error:unauthorized","detail":"accountDoesNotExist text is unrelated"}).to_string(),false),
+        (400,"accountDoesNotExist is not JSON".into(),false),
+        (403,json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist","detail":"wrong status"}).to_string(),false),
+    ] {
+        let server=Server::start(false).await;
+        server.lookup_responses.lock().unwrap().push_back((status,body));
+        let client=AcmeClient::new(&format!("{}/directory",server.url)).await.unwrap();
+        let key=certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+        let result=client.find_account(&key).await;
+        if missing { assert!(matches!(result,Ok(None))); }
+        else { assert!(matches!(result,Err(certon::Error::Acme(certon::error::AcmeError::Account(_))))); }
+        // Ordinary account lookup remains a public successful Option result.
+        assert!(client.find_account(&key).await.unwrap().is_some());
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Request {
     method: String,
@@ -23,6 +336,9 @@ struct Server {
     requests: Arc<Mutex<Vec<Request>>>,
     task: tokio::task::JoinHandle<()>,
     revoke_responses: Arc<Mutex<std::collections::VecDeque<(u16, Value)>>>,
+    order_problem_responses: Arc<Mutex<std::collections::VecDeque<(u16, String)>>>,
+    lookup_responses: Arc<Mutex<std::collections::VecDeque<(u16, String)>>>,
+    order_path: Arc<Mutex<String>>,
 }
 
 trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
@@ -57,6 +373,17 @@ impl Server {
         let revoke_responses =
             Arc::new(Mutex::new(std::collections::VecDeque::<(u16, Value)>::new()));
         let responses = revoke_responses.clone();
+        let order_problem_responses = Arc::new(Mutex::new(std::collections::VecDeque::<(
+            u16,
+            String,
+        )>::new()));
+        let order_problems = order_problem_responses.clone();
+        let lookup_responses = Arc::new(Mutex::new(
+            std::collections::VecDeque::<(u16, String)>::new(),
+        ));
+        let account_lookups = lookup_responses.clone();
+        let order_path = Arc::new(Mutex::new("/new-order".to_string()));
+        let response_order_path = order_path.clone();
         let task = tokio::spawn(async move {
             let mut orders = 0;
             loop {
@@ -122,17 +449,24 @@ impl Server {
                 let body = match path.as_str() {
                     "/directory" => json!({
                         "newNonce": format!("{base}/nonce"), "newAccount": format!("{base}/new-account"),
-                        "newOrder": format!("{base}/new-order"), "revokeCert": format!("{base}/revoke"),
+                        "newOrder": format!("{base}{}",response_order_path.lock().unwrap()), "revokeCert": format!("{base}/revoke"),
                         "keyChange": format!("{base}/key-change"), "renewalInfo": format!("{base}/ari")
                     }).to_string(),
                     "/nonce" => String::new(),
                     "/new-account" => {
-                        extra = format!("Location: {base}/account/new\r\n");
-                        json!({"status":"valid", "contact":["mailto:review@example.com"]}).to_string()
+                        let response=account_lookups.lock().unwrap().pop_front();
+                        if let Some((code,body))=response { status=code;body } else {
+                            extra = format!("Location: {base}/account/new\r\n");
+                            json!({"status":"valid", "contact":["mailto:review@example.com"]}).to_string()
+                        }
                     }
-                    "/new-order" => {
+                    path if path.starts_with("/new-order") => {
                         orders += 1;
-                        if recover && orders == 1 {
+                        let problem = order_problems.lock().unwrap().pop_front();
+                        if let Some((code, body)) = problem {
+                            status = code;
+                            body
+                        } else if recover && orders == 1 {
                             status = 400;
                             json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist", "detail":"account removed"}).to_string()
                         } else {
@@ -194,6 +528,9 @@ impl Server {
             requests,
             task,
             revoke_responses,
+            order_problem_responses,
+            lookup_responses,
+            order_path,
         }
     }
 }

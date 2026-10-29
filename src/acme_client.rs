@@ -468,6 +468,15 @@ impl std::fmt::Display for AcmeProblem {
     }
 }
 
+const ACCOUNT_DOES_NOT_EXIST: &str = "urn:ietf:params:acme:error:accountDoesNotExist";
+
+/// Issuer-only classification; public order APIs keep returning the existing
+/// error type even for an account-missing response.
+pub(crate) enum NewOrderOutcome {
+    Created(Box<AcmeOrder>, String),
+    AccountDoesNotExist,
+}
+
 // ---------------------------------------------------------------------------
 // Account response
 // ---------------------------------------------------------------------------
@@ -1054,7 +1063,27 @@ impl AcmeClient {
         url: &str,
         payload: Option<&str>,
     ) -> Result<(T, Option<String>)> {
-        let resp = self.acme_post(account_key, kid, url, payload).await?;
+        self.acme_post_json_accepting_problem(account_key, kid, url, payload, None)
+            .await?
+            .ok_or_else(|| AcmeError::Order("unexpected accepted ACME problem".into()).into())
+    }
+
+    /// Preserve an explicitly accepted HTTP 400 problem before its body is
+    /// consumed, including the response after the single badNonce retry.
+    async fn acme_post_json_accepting_problem<T: serde::de::DeserializeOwned>(
+        &self,
+        account_key: &PrivateKey,
+        kid: Option<&str>,
+        url: &str,
+        payload: Option<&str>,
+        accepted_problem: Option<&str>,
+    ) -> Result<Option<(T, Option<String>)>> {
+        let Some(resp) = self
+            .acme_post_accepting_problem(account_key, kid, url, payload, accepted_problem)
+            .await?
+        else {
+            return Ok(None);
+        };
 
         let status = resp.status();
         let location = resp
@@ -1083,7 +1112,7 @@ impl AcmeClient {
         let parsed: T = serde_json::from_slice(&body)
             .map_err(|e| AcmeError::Order(format!("failed to parse response JSON: {e}")))?;
 
-        Ok((parsed, location))
+        Ok(Some((parsed, location)))
     }
 
     // -----------------------------------------------------------------------
@@ -1204,7 +1233,7 @@ impl AcmeClient {
                 .await
                 .map_err(|e| AcmeError::Account(e.to_string()))?;
             if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&body_bytes)
-                && problem.problem_type.contains("accountDoesNotExist")
+                && problem.problem_type == ACCOUNT_DOES_NOT_EXIST
             {
                 return Ok(None);
             }
@@ -1274,6 +1303,38 @@ impl AcmeClient {
         domains: &[String],
         options: &OrderOptions,
     ) -> Result<(AcmeOrder, String)> {
+        match self
+            .new_order_inner(account_key, account_url, domains, options, false)
+            .await?
+        {
+            NewOrderOutcome::Created(order, url) => Ok((*order, url)),
+            NewOrderOutcome::AccountDoesNotExist => {
+                Err(AcmeError::Order("unexpected accepted ACME problem".into()).into())
+            }
+        }
+    }
+
+    /// Only the issuer's initial order attempt may interpret this exact
+    /// protocol response as permission to enter account recovery.
+    pub(crate) async fn new_order_for_issuer(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        domains: &[String],
+        options: &OrderOptions,
+    ) -> Result<NewOrderOutcome> {
+        self.new_order_inner(account_key, account_url, domains, options, true)
+            .await
+    }
+
+    async fn new_order_inner(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        domains: &[String],
+        options: &OrderOptions,
+        recognize_missing_account: bool,
+    ) -> Result<NewOrderOutcome> {
         debug!(?domains, "creating new ACME order");
 
         #[derive(Serialize)]
@@ -1304,14 +1365,18 @@ impl AcmeClient {
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Order(format!("failed to serialize order request: {e}")))?;
 
-        let (order, location): (AcmeOrder, _) = self
-            .acme_post_json(
+        let response: Option<(AcmeOrder, _)> = self
+            .acme_post_json_accepting_problem(
                 account_key,
                 Some(account_url),
                 &self.directory.new_order,
                 Some(&payload),
+                recognize_missing_account.then_some(ACCOUNT_DOES_NOT_EXIST),
             )
             .await?;
+        let Some((order, location)) = response else {
+            return Ok(NewOrderOutcome::AccountDoesNotExist);
+        };
 
         let order_url = location.ok_or_else(|| {
             AcmeError::Order("no Location header in order creation response".into())
@@ -1323,7 +1388,7 @@ impl AcmeClient {
             "ACME order created"
         );
 
-        Ok((order, order_url))
+        Ok(NewOrderOutcome::Created(Box::new(order), order_url))
     }
 
     // -----------------------------------------------------------------------
