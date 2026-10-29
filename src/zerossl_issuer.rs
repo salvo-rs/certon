@@ -168,10 +168,17 @@ impl ZeroSslIssuer {
 // CertIssuer trait
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+mod ari_tests;
+
 #[async_trait]
 impl CertIssuer for ZeroSslIssuer {
     async fn issue(&self, csr_der: &[u8], domains: &[String]) -> Result<IssuedCertificate> {
         self.inner.issue(csr_der, domains).await
+    }
+
+    async fn renewal_info(&self, leaf_der: &[u8]) -> Result<Option<crate::RenewalInfo>> {
+        self.inner.renewal_info(leaf_der).await
     }
 
     fn issuer_key(&self) -> String {
