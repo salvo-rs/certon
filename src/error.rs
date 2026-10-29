@@ -60,6 +60,10 @@ pub enum AcmeError {
     #[error("certificate download failed: {0}")]
     Certificate(String),
 
+    /// An ARI endpoint is temporarily unavailable (for example HTTP 5xx).
+    #[error("temporary ARI failure: {0}")]
+    RenewalInfoTemporary(String),
+
     /// The CA rate-limited the request.
     #[error("rate limited by CA (retry after {retry_after:?}): {message}")]
     RateLimited {

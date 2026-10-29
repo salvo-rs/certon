@@ -133,9 +133,10 @@ pub struct Certificate {
 
     /// ACME Renewal Information (ARI), if available from the issuer.
     ///
-    /// When set, the suggested renewal window and selected renewal time
-    /// from ARI take precedence over the standard time-based renewal
-    /// check.
+    /// Managed lifecycle restores the stable local choice from an issuer/leaf
+    /// sidecar. It takes precedence over the ordinary renewal ratio while the
+    /// emergency expiration guards still apply. A manager with `disable_ari`
+    /// ignores the suggestion without erasing a shared cache's metadata.
     pub ari: Option<RenewalInfo>,
 }
 
@@ -184,49 +185,20 @@ impl Certificate {
 
     /// Returns `true` if the certificate needs to be renewed.
     ///
-    /// The decision is based on:
-    /// 1. Whether the current time falls within the renewal window determined by
-    ///    `renewal_window_ratio` (fraction of lifetime that should remain when renewal starts).
-    ///    Pass `0.0` to use [`DEFAULT_RENEWAL_WINDOW_RATIO`].
-    /// 2. Whether fewer than 24 hours remain before expiration (emergency renewal).
-    /// 3. Whether the certificate is already expired.
+    /// A valid ARI window uses its stable local selected time, in place of the
+    /// ordinary lifetime ratio. Without usable ARI, `renewal_window_ratio` is
+    /// the fraction of lifetime that should remain when renewal starts (pass
+    /// `0.0` for [`DEFAULT_RENEWAL_WINDOW_RATIO`]). The existing emergency rules
+    /// always apply: expiration, less than 24 hours remaining, or the final
+    /// 1/50 of the lifetime. Managers with [`crate::Policy::disable_ari`] ignore
+    /// ARI even when another manager shares their cache.
     pub fn needs_renewal(&self, renewal_window_ratio: f64) -> bool {
+        self.needs_renewal_with_ari(renewal_window_ratio, true)
+    }
+
+    pub(crate) fn needs_renewal_with_ari(&self, renewal_window_ratio: f64, use_ari: bool) -> bool {
         // If already expired, definitely needs renewal.
         if self.expired() {
-            return true;
-        }
-
-        // Check ARI (ACME Renewal Information) if available.
-        if let Some(ref ari) = self.ari {
-            if let Some(selected_time) = ari.selected_time {
-                // If a specific renewal time was selected, check against it.
-                if Utc::now() >= selected_time {
-                    return true;
-                }
-            } else if let Some(ref window) = ari.suggested_window {
-                // If we have a window but no selected time, pick a random
-                // time within the window and check if we are past it.
-                if let (Ok(start), Ok(end)) = (
-                    DateTime::parse_from_rfc3339(&window.start),
-                    DateTime::parse_from_rfc3339(&window.end),
-                ) {
-                    let start_utc = start.with_timezone(&Utc);
-                    let end_utc = end.with_timezone(&Utc);
-                    if start_utc < end_utc {
-                        use rand::RngExt;
-                        let range_secs = (end_utc - start_utc).num_seconds().max(1);
-                        let offset = rand::rng().random_range(0..range_secs);
-                        let random_time = start_utc + ChronoDuration::seconds(offset);
-                        if Utc::now() >= random_time {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Check the configured renewal window.
-        if currently_in_renewal_window(self.not_before, self.not_after, renewal_window_ratio) {
             return true;
         }
 
@@ -242,7 +214,15 @@ impl Certificate {
             return true;
         }
 
-        false
+        if use_ari
+            && let Some(time) = self
+                .ari
+                .as_ref()
+                .and_then(|info| crate::ari::selected_time(self, info))
+        {
+            return Utc::now() >= time;
+        }
+        currently_in_renewal_window(self.not_before, self.not_after, renewal_window_ratio)
     }
 
     /// Returns `true` if `tag` is present in [`Certificate::tags`].
@@ -458,6 +438,7 @@ pub async fn reload_managed_certificate(
     }
     cert.managed = true;
     cert.issuer_key = issuer_key.to_owned();
+    crate::ari::attach_cached(storage, cache, &mut cert, false).await;
     if crate::ocsp::requires_ocsp_staple(&cert)? {
         crate::ocsp::staple_ocsp(storage, &mut cert, &crate::ocsp::OcspConfig::default()).await?;
     }
@@ -501,10 +482,13 @@ pub async fn managed_cert_in_storage_needs_renewal(
         Ok(resource) => resource,
         Err(_) => return Ok(true), // preserve the helper's documented retry policy
     };
-    let cert = match Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem) {
+    let mut cert = match Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)
+    {
         Ok(cert) => cert,
         Err(_) => return Ok(true),
     };
+    cert.issuer_key = issuer_key.to_owned();
+    crate::ari::attach(storage, &mut cert, false).await;
 
     Ok(cert.needs_renewal(renewal_window_ratio))
 }

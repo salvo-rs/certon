@@ -192,6 +192,12 @@ impl std::fmt::Debug for CacheOptions {
 // CertCache
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+pub(crate) struct AriChange {
+    pub hash: String,
+    pub reload: bool,
+}
+
 /// An in-memory certificate cache that indexes certificates by subject name
 /// for efficient TLS handshake lookups.
 ///
@@ -216,6 +222,8 @@ pub struct CertCache {
     done_tx: watch::Sender<bool>,
     maintenance_count: Mutex<usize>,
     ocsp_changed: watch::Sender<u64>,
+    ari_changed: watch::Sender<u64>,
+    ari_schedule_changed: tokio::sync::broadcast::Sender<AriChange>,
 }
 
 #[derive(Default)]
@@ -242,6 +250,7 @@ struct CachedCertificate {
     ocsp_retry_after: Option<DateTime<Utc>>,
     must_staple: bool,
     managed_index: Option<usize>,
+    ari_unpersisted: Option<Option<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -662,6 +671,7 @@ impl CacheState {
                 ocsp_retry_after: retry_after,
                 must_staple: key.must_staple,
                 managed_index,
+                ari_unpersisted: None,
             },
         );
     }
@@ -690,6 +700,8 @@ impl CertCache {
             done_tx,
             maintenance_count: Mutex::new(0),
             ocsp_changed: watch::channel(0).0,
+            ari_changed: watch::channel(0).0,
+            ari_schedule_changed: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -706,6 +718,141 @@ impl CertCache {
     /// Subscribe to shutdown. Check the current value before waiting for changes.
     pub fn subscribe_stop(&self) -> watch::Receiver<bool> {
         self.stop_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_ari_schedule(&self) -> tokio::sync::broadcast::Receiver<AriChange> {
+        self.ari_schedule_changed.subscribe()
+    }
+
+    pub(crate) fn has_unpersisted_ari(&self, hash: &str, issuer: &str) -> bool {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .certificates
+            .get(hash)
+            .is_some_and(|entry| {
+                entry.certificate.managed
+                    && entry.certificate.issuer_key == issuer
+                    && entry.ari_unpersisted.is_some()
+            })
+    }
+
+    /// A failed write may override only the record observed before that write.
+    /// A different successfully persisted record wins over the local fallback.
+    pub(crate) fn reconcile_ari(
+        &self,
+        hash: &str,
+        issuer: &str,
+        loaded: Option<(Option<String>, Option<crate::RenewalInfo>)>,
+    ) -> Option<crate::RenewalInfo> {
+        let mut changed = false;
+        let result = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            let current = state.certificates.get_mut(hash).filter(|entry| {
+                entry.certificate.managed && entry.certificate.issuer_key == issuer
+            });
+            match (current, loaded) {
+                (Some(current), Some((fingerprint, info))) if current.ari_unpersisted.is_some() => {
+                    if fingerprint.is_none()
+                        || current.ari_unpersisted.as_ref() == Some(&fingerprint)
+                    {
+                        current.certificate.ari.clone()
+                    } else {
+                        current.ari_unpersisted = None;
+                        Arc::make_mut(&mut current.certificate).ari = info.clone();
+                        changed = true;
+                        info
+                    }
+                }
+                (Some(current), None) if current.ari_unpersisted.is_some() => {
+                    current.certificate.ari.clone()
+                }
+                (_, Some((_, info))) => info,
+                _ => None,
+            }
+        };
+        if changed {
+            let _ = self.ari_schedule_changed.send(AriChange {
+                hash: hash.to_owned(),
+                reload: true,
+            });
+            self.notify_ari();
+        }
+        result
+    }
+
+    pub(crate) fn ari_certificate(&self, hash: &str) -> Option<Arc<Certificate>> {
+        self.state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .certificates
+            .get(hash)
+            .filter(|entry| entry.certificate.managed)
+            .map(|entry| entry.certificate.clone())
+    }
+
+    pub(crate) fn subscribe_ari(&self) -> watch::Receiver<u64> {
+        self.ari_changed.subscribe()
+    }
+
+    pub(crate) fn notify_ari(&self) {
+        self.ari_changed
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    /// Apply only advisory metadata to live managed chains of the same leaf.
+    /// This never republishes a key or changes OCSP/quarantine state.
+    pub(crate) fn update_ari(
+        &self,
+        issuer: &str,
+        leaf: &str,
+        info: Option<crate::RenewalInfo>,
+        unpersisted: Option<Option<String>>,
+    ) {
+        let mut scheduled = None;
+        let changed = {
+            let mut state = self
+                .state
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            let hashes = state.chains_by_leaf.get(leaf).cloned().unwrap_or_default();
+            let mut changed = false;
+            for hash in hashes {
+                if let Some(entry) = state.certificates.get_mut(&hash)
+                    && entry.certificate.managed
+                    && entry.certificate.issuer_key == issuer
+                    && !entry.certificate.expired()
+                {
+                    let old = entry
+                        .certificate
+                        .ari
+                        .as_ref()
+                        .and_then(|info| crate::ari::selected_time(&entry.certificate, info));
+                    let new = info
+                        .as_ref()
+                        .and_then(|info| crate::ari::selected_time(&entry.certificate, info));
+                    Arc::make_mut(&mut entry.certificate).ari = info.clone();
+                    entry.ari_unpersisted = unpersisted.clone();
+                    if old != new {
+                        scheduled.get_or_insert_with(|| hash.clone());
+                    }
+                    changed |= old != new && new.is_none_or(|time| time <= Utc::now());
+                }
+            }
+            changed
+        };
+        if let Some(hash) = scheduled {
+            let _ = self.ari_schedule_changed.send(AriChange {
+                hash,
+                reload: false,
+            });
+        }
+        if changed {
+            self.notify_ari();
+        }
     }
 
     pub(crate) fn subscribe_ocsp(&self) -> watch::Receiver<u64> {
@@ -950,6 +1097,8 @@ impl CertCache {
             .certificates
             .get(&cert.hash)
             .map(|entry| Arc::clone(&entry.certificate));
+        let published_hash = cert.hash.clone();
+        let published_issuer = cert.issuer_key.clone();
         let mut key = PreparedKey::for_certificate(&cert).await;
         if let Some(status) = key.verified_status {
             if cert.ocsp_status != Some(crate::ocsp::OcspStatus::Revoked) {
@@ -977,6 +1126,26 @@ impl CertCache {
                 if now >= cert.not_after {
                     return Err(crate::error::CertError::Expired(domain.to_owned()).into());
                 }
+            }
+            // A manager that ignores ARI must not erase another manager's
+            // advisory state when reloading the same live identity.
+            let ari_unpersisted = state
+                .certificates
+                .get(&cert.hash)
+                .filter(|entry| entry.certificate.issuer_key == cert.issuer_key)
+                .and_then(|entry| entry.ari_unpersisted.clone());
+            if domain.is_some()
+                && let Some(current) = state
+                    .certificates
+                    .get(&cert.hash)
+                    .filter(|entry| entry.certificate.issuer_key == cert.issuer_key)
+                && (cert.ari.is_none()
+                    || current.ari_unpersisted.is_some()
+                    || original
+                        .as_ref()
+                        .is_some_and(|original| !Arc::ptr_eq(original, &current.certificate)))
+            {
+                cert.ari = current.certificate.ari.clone();
             }
             if leaf_hash
                 .as_ref()
@@ -1052,6 +1221,14 @@ impl CertCache {
                 events.push(event);
             }
             state.add(cert, key, leaf_hash, &options, &mut events);
+            if domain.is_some()
+                && let Some(entry) = state
+                    .certificates
+                    .get_mut(&published_hash)
+                    .filter(|entry| entry.certificate.issuer_key == published_issuer)
+            {
+                entry.ari_unpersisted = ari_unpersisted;
+            }
             Ok(())
         })();
         // A later managed-readiness guard may reject publication after an
@@ -1065,6 +1242,12 @@ impl CertCache {
         }
         self.notify_ocsp_schedule();
         dispatch_events(&options, events);
+        if publication.is_ok() && domain.is_some() {
+            let _ = self.ari_schedule_changed.send(AriChange {
+                hash: published_hash,
+                reload: true,
+            });
+        }
         publication
     }
 

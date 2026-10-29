@@ -424,3 +424,53 @@ it reloads the replacement safely instead of forcing another issuance. Custom
 receive the domain observed at dispatch; they must recheck their own resource
 identity after asynchronous waits before forcing a replacement. Maintenance
 does not wrap a callback in a long retry/backoff loop.
+
+
+## Automatic ARI renewal scheduling
+
+The default manager lifecycle now fetches RFC 9773 renewal information after
+successfully saving and publishing a newly issued certificate. Maintenance also
+refreshes existing managed leaves at the CA's `Retry-After` deadline, independently
+of the normal ten-minute renewal scan. This integrates renewal scheduling only;
+ACME order `replaces` support is not included.
+
+`CertIssuer::renewal_info` is an optional async extension with a default `None`
+implementation, so existing custom issuers continue to work. `AcmeIssuer` uses an
+unauthenticated GET and does not register an account just to read ARI. HTTPS and
+response limits are the same as other ACME endpoints. `AcmeError` adds the
+`RenewalInfoTemporary` variant to classify temporary ARI server failures;
+exhaustive matches on that enum must account for the new variant.
+
+Local state lives at `ari/<sha256-issuer>/<leaf-hash>/state.json` in `Storage`,
+independently of `CertificateResource` and issuer-specific metadata. The selected
+time is stably derived from the leaf and normalized window and is explicitly
+persisted; unchanged windows retain their point across refreshes, restarts and
+instances. A changed valid window selects a new point. Shared instances use the
+existing storage lock contract. Alternate chains of one leaf share this state.
+
+Valid ARI takes precedence over the ordinary renewal ratio, while expiration and
+the existing emergency rules (24 hours remaining or the final 1/50 of lifetime)
+remain safety fallbacks. Invalid/unavailable ARI uses the ordinary ratio. A
+transient refresh failure retains the previous valid point and backs off, reaching
+the six-hour fallback after eight failures. `Retry-After` is bounded to one minute
+through one day; unsupported/invalid responses use a six-hour negative cache.
+
+All advisory refresh work has a 30-second total deadline, including lock/storage
+waits; its endpoint request has a 20-second deadline so timeouts can persist their
+backoff. The initial best-effort fetch runs after publication and may add up to
+30 seconds to a successful obtain/renew call. Sidecar reads while planning are
+bounded to five seconds, and forced/revoked renewal planning bypasses them.
+Maintenance owns at most four concurrent ARI refreshes and cancels them on stop.
+
+ARI failures never turn an already saved certificate into a failed issuance or
+cause a duplicate CA order. A failed sidecar write keeps the current process's
+accepted point across reload/renew, but a subsequently changed persisted record
+from another instance wins. Late responses are bound to their original issuer
+and leaf and cannot modify a replacement's schedule. Certificate storage,
+validation and revocation-marker failures retain their existing error behavior.
+
+`Policy::disable_ari` now fully bypasses fetching, sidecar I/O and ARI decisions,
+including previously cached suggestions. It does not erase suggestions needed by
+another enabled manager sharing the cache. The public low-level
+`Certificate::needs_renewal` has no policy argument and continues to use attached
+ARI, with a stable derived point if a valid window has no explicit local choice.

@@ -50,6 +50,7 @@ pub fn install_default_crypto_provider() {
 pub mod account;
 pub mod acme_client;
 pub mod acme_issuer;
+mod ari;
 pub mod async_jobs;
 pub mod cache;
 pub mod cert_store;
@@ -239,9 +240,21 @@ async fn ensure_default_agreement(
                 break;
             }
             Some(resource) => {
-                let certificate =
+                let mut certificate =
                     Certificate::from_pem(&resource.certificate_pem, &resource.private_key_pem)?;
-                if certificate.needs_renewal(manager.policy.renewal_window_ratio) {
+                certificate.issuer_key = issuer.clone();
+                ari::attach_cached(
+                    manager.storage.as_ref(),
+                    &manager.cache,
+                    &mut certificate,
+                    manager.policy.disable_ari,
+                )
+                .await;
+                if ari::needs_renewal(
+                    &certificate,
+                    manager.policy.renewal_window_ratio,
+                    manager.policy.disable_ari,
+                ) {
                     needs_account = true;
                     break;
                 }
@@ -317,8 +330,9 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
     let renew_func = maintenance_renewal(config);
 
     let manager = Arc::new(config.detached("maintenance-ocsp"));
+    let observed_manager = Arc::clone(&manager);
     let observed: Arc<maintain::ObservedRenewFn> = Arc::new(move |domain, leaf| {
-        let manager = Arc::clone(&manager);
+        let manager = Arc::clone(&observed_manager);
         Box::pin(async move { manager.renew_observed_revocation(&domain, &leaf).await })
     });
     maintain::start_maintenance_with_observed_renewal(
@@ -328,6 +342,7 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
         config.certificates.clone(),
         config.policy.renewal_window_ratio,
         Some(observed),
+        Some(manager),
     )
 }
 

@@ -150,6 +150,13 @@ pub trait CertIssuer: Send + Sync {
     /// different issuers do not collide.
     fn issuer_key(&self) -> String;
 
+    /// Fetch advisory renewal information for this issuer's leaf certificate.
+    /// The default means unsupported. Implementations must not require account
+    /// registration: ARI uses an unauthenticated request.
+    async fn renewal_info(&self, _leaf_der: &[u8]) -> Result<Option<crate::RenewalInfo>> {
+        Ok(None)
+    }
+
     /// Return this issuer as a [`Revoker`], if it supports certificate
     /// revocation.
     ///
@@ -1346,6 +1353,11 @@ impl CertIssuer for AcmeIssuer {
                     self.cert_obtain_timeout
                 ))
             })?
+    }
+
+    async fn renewal_info(&self, leaf_der: &[u8]) -> Result<Option<crate::RenewalInfo>> {
+        let id = crate::acme_client::ari_cert_id(leaf_der)?;
+        self.get_client(false).await?.fetch_renewal_info(&id).await
     }
 
     fn issuer_key(&self) -> String {
