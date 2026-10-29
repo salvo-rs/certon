@@ -439,16 +439,49 @@ impl CacheState {
         })
     }
 
-    fn has_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
-        self.matching(name).into_iter().any(|entry| {
-            entry.leaf_hash.as_deref() == Some(leaf_hash)
-                && entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+    fn has_ocsp_revoked_leaf(&self, leaf_hash: &str) -> bool {
+        self.chains_by_leaf.get(leaf_hash).is_some_and(|hashes| {
+            hashes.iter().any(|hash| {
+                self.certificates.get(hash).is_some_and(|entry| {
+                    entry.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                })
+            })
         })
     }
 
     /// A verified response authenticates the leaf even when duplicate admission
     /// will retain this entry's existing signing key and management metadata.
-    fn record_verified_revocation(&mut self, hash: &str) -> Option<CacheEvent> {
+    fn record_verified_revocation(
+        &mut self,
+        hash: &str,
+        incoming_leaf: Option<&str>,
+    ) -> Vec<CacheEvent> {
+        // A CertID authenticates the leaf, not one encoding of its chain or
+        // its current store alias. Keep all live chains consistent under the
+        // same publication lock, including unmanaged siblings.
+        let leaf = incoming_leaf.or_else(|| {
+            self.certificates
+                .get(hash)
+                .and_then(|entry| entry.leaf_hash.as_deref())
+        });
+        let mut hashes = leaf
+            .and_then(|leaf| self.chains_by_leaf.get(leaf))
+            .cloned()
+            .unwrap_or_default();
+        if self
+            .certificates
+            .get(hash)
+            .is_some_and(|entry| leaf.is_none() || entry.leaf_hash.as_deref() == leaf)
+        {
+            hashes.insert(hash.to_owned());
+        }
+        hashes
+            .into_iter()
+            .filter_map(|hash| self.record_chain_revocation(&hash))
+            .collect()
+    }
+
+    fn record_chain_revocation(&mut self, hash: &str) -> Option<CacheEvent> {
         let current = self.certificates.get_mut(hash)?;
         if current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked) {
             return None;
@@ -459,7 +492,8 @@ impl CacheState {
         cert.ocsp_response = None;
         current.key = current.unstapled_key.clone();
         current.ocsp_validity = None;
-        current.ocsp_retry_after = old_deadline.map(|_| Utc::now() + chrono::Duration::seconds(30));
+        current.ocsp_retry_after = (cert.managed || old_deadline.is_some())
+            .then(|| Utc::now() + chrono::Duration::seconds(30));
         let new_deadline = current.ocsp_deadline();
         let event = CacheEvent::Updated {
             names: current.certificate.names.clone(),
@@ -1175,7 +1209,7 @@ impl CertCache {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let mut events = Vec::new();
-        let mut quarantine_event = None;
+        let mut quarantine_events = Vec::new();
         let publication: Result<bool> = (|| {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
             if let Some(domain) = domain {
@@ -1218,11 +1252,11 @@ impl CertCache {
             }
             // Reject invalid managed input before removing the old working leaf.
             // A different chain can authenticate the same revoked leaf. Check
-            // managed admission at its write-lock linearization point, including
-            // revocation received while preparation awaited AIA. This uses only
-            // existing matching metadata, without a global deny-list policy.
-            if let (Some(domain), Some(leaf_hash)) = (domain, leaf_hash.as_deref())
-                && state.has_ocsp_revoked_leaf(domain, leaf_hash)
+            // every admission at its write-lock linearization point, including
+            // revocation received while preparation awaited AIA. This uses live
+            // leaf membership, without a new lifetime deny-list policy.
+            if let Some(leaf_hash) = leaf_hash.as_deref()
+                && state.has_ocsp_revoked_leaf(leaf_hash)
             {
                 cert.ocsp_status = Some(crate::ocsp::OcspStatus::Revoked);
                 cert.ocsp_response = None;
@@ -1232,7 +1266,8 @@ impl CertCache {
             // `staple_ocsp` already clears raw bytes after verifying Revoked;
             // preserve that trusted status as well as evidence parsed here.
             if cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked) {
-                quarantine_event = state.record_verified_revocation(&cert.hash);
+                quarantine_events =
+                    state.record_verified_revocation(&cert.hash, leaf_hash.as_deref());
             }
             if let (Some(domain), Some(observation)) = (domain, observation) {
                 let still_managed = match observation {
@@ -1316,11 +1351,21 @@ impl CertCache {
         // authenticated revocation has quarantined the existing entry. Still
         // publish that status/deadline change. Successful add/replace already
         // emits its normal events, without an extra duplicate Updated event.
-        if !matches!(&publication, Ok(true))
-            && let Some(event) = quarantine_event
-        {
-            events.push(event);
-        }
+        let quarantine_events: Vec<_> = quarantine_events
+            .into_iter()
+            .filter(|event| {
+                let CacheEvent::Updated { hash, .. } = event else {
+                    return true;
+                };
+                // The ordinary publication already reports the target, and a
+                // removed/evicted sibling needs only its removal notification.
+                !(matches!(&publication, Ok(true)) && hash == &published_hash)
+                    && !events.iter().any(|event| {
+                        matches!(event, CacheEvent::Removed { hash: removed, .. } if removed == hash)
+                    })
+            })
+            .collect();
+        events.extend(quarantine_events);
         self.notify_ocsp_schedule();
         dispatch_events(&options, events);
         if matches!(&publication, Ok(true)) && domain.is_some() {
@@ -1365,6 +1410,8 @@ impl CertCache {
     /// A new certificate hash is installed through the ordinary `replace` API.
     /// Returns the current policy/status at that same linearization point,
     /// including when an older response cannot replace sticky revocation.
+    /// A verified revocation still updates live sibling chains if the original
+    /// hash was removed while issuer verification awaited I/O; it is not readded.
     /// Later metadata changes are not serialized with the renewal callback.
     pub(crate) async fn update_ocsp_if_present(
         &self,
@@ -1372,9 +1419,10 @@ impl CertCache {
         status: Option<crate::ocsp::OcspStatus>,
         response: Option<Vec<u8>>,
     ) -> Option<OcspUpdateState> {
-        let certificate = {
+        let (certificate, observed_leaf) = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(&state.certificates.get(hash)?.certificate)
+            let entry = state.certificates.get(hash)?;
+            (Arc::clone(&entry.certificate), entry.leaf_hash.clone())
         };
         let verified = match &response {
             Some(raw) => VerifiedOcsp::for_response(raw, &certificate).await,
@@ -1404,59 +1452,78 @@ impl CertCache {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let (event, published) = {
+        let (events, published) = {
             let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
-            let current = state.certificates.get_mut(hash)?;
-            let old_deadline = current.ocsp_deadline();
-            let was_scheduled = old_deadline.is_some();
-            let keep_revoked = current.certificate.ocsp_status
-                == Some(crate::ocsp::OcspStatus::Revoked)
-                && status != Some(crate::ocsp::OcspStatus::Revoked);
-            if !keep_revoked {
-                let certificate = Arc::make_mut(&mut current.certificate);
-                certificate.ocsp_status = status;
-                certificate.ocsp_response = response.clone();
-                current.key = current.unstapled_key.as_ref().map(|key| {
-                    if validity.is_none() {
-                        return Arc::clone(key);
-                    }
-                    let mut container = key.as_ref().clone();
-                    container.ocsp = response;
-                    Arc::new(container)
-                });
-                current.ocsp_validity = validity;
-            }
-            // Even a rejected stale response consumed a refresh attempt. Keep
-            // sticky revocation, but move its due timer forward to avoid an
-            // immediate retry loop when the responder fails or returns Good.
-            let validity = current.ocsp_validity;
-            current.ocsp_retry_after = if validity.is_some()
-                || was_scheduled
-                || current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
-            {
-                let now = Utc::now();
-                let delay = validity.map_or(chrono::Duration::seconds(30), |validity| {
-                    ((validity.expires_at - now) / 2)
-                        .clamp(chrono::Duration::seconds(1), chrono::Duration::seconds(30))
-                });
-                Some(now + delay)
+            let mut events = if status == Some(crate::ocsp::OcspStatus::Revoked) {
+                state.record_verified_revocation(hash, observed_leaf.as_deref())
             } else {
-                None
+                Vec::new()
             };
-            let new_deadline = current.ocsp_deadline();
-            let result = (
-                CacheEvent::Updated {
-                    names: current.certificate.names.clone(),
-                    hash: hash.to_owned(),
-                },
-                OcspUpdateState::from(current.certificate.as_ref()),
-            );
-            state.change_ocsp_deadline(hash, old_deadline, new_deadline);
-            result
+            events.retain(|event| !matches!(event, CacheEvent::Updated { hash: changed, .. } if changed == hash));
+            let update = state
+                .certificates
+                .get_mut(hash)
+                .filter(|entry| entry.leaf_hash == observed_leaf)
+                .map(|current| {
+                    let old_deadline = current.ocsp_deadline();
+                    let was_scheduled = old_deadline.is_some();
+                    let keep_revoked = current.certificate.ocsp_status
+                        == Some(crate::ocsp::OcspStatus::Revoked)
+                        && status != Some(crate::ocsp::OcspStatus::Revoked);
+                    if !keep_revoked {
+                        let certificate = Arc::make_mut(&mut current.certificate);
+                        certificate.ocsp_status = status;
+                        certificate.ocsp_response = response.clone();
+                        current.key = current.unstapled_key.as_ref().map(|key| {
+                            if validity.is_none() {
+                                return Arc::clone(key);
+                            }
+                            let mut container = key.as_ref().clone();
+                            container.ocsp = response;
+                            Arc::new(container)
+                        });
+                        current.ocsp_validity = validity;
+                    }
+                    // Even a rejected stale response consumed a refresh attempt. Keep
+                    // sticky revocation, but move its due timer forward to avoid an
+                    // immediate retry loop when the responder fails or returns Good.
+                    let validity = current.ocsp_validity;
+                    current.ocsp_retry_after = if validity.is_some()
+                        || was_scheduled
+                        || current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                    {
+                        let now = Utc::now();
+                        let delay = validity.map_or(chrono::Duration::seconds(30), |validity| {
+                            ((validity.expires_at - now) / 2)
+                                .clamp(chrono::Duration::seconds(1), chrono::Duration::seconds(30))
+                        });
+                        Some(now + delay)
+                    } else {
+                        None
+                    };
+                    let new_deadline = current.ocsp_deadline();
+                    let event = CacheEvent::Updated {
+                        names: current.certificate.names.clone(),
+                        hash: hash.to_owned(),
+                    };
+                    (
+                        old_deadline,
+                        new_deadline,
+                        event,
+                        OcspUpdateState::from(current.certificate.as_ref()),
+                    )
+                });
+            if let Some((old_deadline, new_deadline, event, published)) = update {
+                state.change_ocsp_deadline(hash, old_deadline, new_deadline);
+                events.push(event);
+                (events, Some(published))
+            } else {
+                (events, None)
+            }
         };
         self.notify_ocsp_schedule();
-        dispatch_events(&options, vec![event]);
-        Some(published)
+        dispatch_events(&options, events);
+        published
     }
 
     /// Get the best exact or single leftmost-label wildcard match.
@@ -1479,11 +1546,11 @@ impl CertCache {
 
     /// Read local OCSP evidence for this managed identity across alternate
     /// chains. A different replacement leaf remains independent.
-    pub(crate) fn has_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
+    pub(crate) fn has_ocsp_revoked_leaf(&self, _name: &str, leaf_hash: &str) -> bool {
         self.state
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .has_ocsp_revoked_leaf(name, leaf_hash)
+            .has_ocsp_revoked_leaf(leaf_hash)
     }
 
     pub(crate) fn has_managed_ocsp_revoked_leaf(&self, name: &str, leaf_hash: &str) -> bool {
@@ -1508,10 +1575,9 @@ impl CertCache {
 
     /// Recheck after asynchronous marker reads, including a quarantine that
     /// already removed its metadata and OCSP evidence on an alternate chain.
-    pub(crate) fn client_leaf_is_revoked(&self, name: &str, leaf_hash: &str) -> bool {
+    pub(crate) fn client_leaf_is_revoked(&self, _name: &str, leaf_hash: &str) -> bool {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
-        state.revoked_leaf_hashes.contains(leaf_hash)
-            || state.has_ocsp_revoked_leaf(name, leaf_hash)
+        state.revoked_leaf_hashes.contains(leaf_hash) || state.has_ocsp_revoked_leaf(leaf_hash)
     }
 
     /// Lifecycle shortcuts must not treat an unusable Must-Staple or revoked
@@ -1785,10 +1851,9 @@ impl CertCache {
                 .state
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            if leaf_hash
-                .as_ref()
-                .is_some_and(|hash| state.revoked_leaf_hashes.contains(hash))
-            {
+            if leaf_hash.as_ref().is_some_and(|hash| {
+                state.revoked_leaf_hashes.contains(hash) || state.has_ocsp_revoked_leaf(hash)
+            }) {
                 return Err(crate::error::CertError::Revoked(
                     "certificate leaf is quarantined in this cache".into(),
                 )
@@ -1864,6 +1929,9 @@ fn normalize_options(mut opts: CacheOptions) -> CacheOptions {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod leaf_revocation_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
