@@ -143,6 +143,32 @@ impl Server {
                     "/authz" => if pending {
                         json!({"status":"pending", "identifier":{"type":"dns", "value":"review.example.com"}, "challenges":[{"type":"http-01", "url":format!("{base}/challenge"), "token":"token"}]}).to_string()
                     } else { json!({"status":"valid", "identifier":{"type":"dns", "value":"review.example.com"}}).to_string() },
+                    "/poll-stalled-authz" | "/poll-stalled-order" | "/poll-body-authz" | "/poll-body-order" => {
+                        if path.contains("body") {
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nReplay-Nonce: poll-body\r\nContent-Length: 8192\r\nConnection: close\r\n\r\n{").await.unwrap();
+                        }
+                        let mut eof = [0; 1];
+                        while stream.read(&mut eof).await.unwrap_or(0) != 0 {}
+                        continue;
+                    }
+                    "/poll-retry-authz" | "/poll-retry-order" | "/poll-progress-authz" | "/poll-progress-order" => {
+                        let count = recorded.lock().unwrap().iter().filter(|request| request.path == path).count();
+                        if count == 1 && path.contains("retry") {
+                            status = 400;
+                            json!({"type":"urn:ietf:params:acme:error:badNonce", "detail":"try a new nonce"}).to_string()
+                        } else if count == 1 {
+                            if path.ends_with("authz") {
+                                json!({"status":"pending", "identifier":{"type":"dns","value":"review.example.com"}}).to_string()
+                            } else { json!({"status":"pending"}).to_string() }
+                        } else {
+                            let mut eof = [0; 1];
+                            while stream.read(&mut eof).await.unwrap_or(0) != 0 {}
+                            continue;
+                        }
+                    }
+                    "/poll-valid-order" => json!({"status":"valid", "certificate":format!("{base}/cert")}).to_string(),
+                    "/poll-invalid-authz" => json!({"status":"invalid", "identifier":{"type":"dns","value":"review.example.com"}, "challenges":[{"type":"http-01", "url":format!("{base}/challenge"), "token":"token", "error":{"type":"urn:ietf:params:acme:error:unauthorized", "detail":"proof rejected"}}]}).to_string(),
+                    "/poll-invalid-order" => json!({"status":"invalid", "error":{"type":"urn:ietf:params:acme:error:rejectedIdentifier", "detail":"order rejected"}}).to_string(),
                     "/finalize" => json!({"status":"valid", "certificate":format!("{base}/cert")}).to_string(),
                     "/cert" => "test certificate chain".into(),
                     "/revoke" => {
@@ -893,4 +919,164 @@ async fn identity_concurrent_issuers_with_changed_contacts_share_one_registratio
             .count(),
         1
     );
+}
+
+async fn assert_poll_timeout(authorization: bool, mode: &str) {
+    let server = Server::start(false).await;
+    let client = AcmeClient::new(&format!("{}/directory", server.url))
+        .await
+        .unwrap();
+    let key = certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+    let account = format!("{}/account/1", server.url);
+    let valid = if authorization {
+        "/authz"
+    } else {
+        "/poll-valid-order"
+    };
+    let poll = |url: String, budget| {
+        let client = &client;
+        let key = &key;
+        let account = &account;
+        async move {
+            if authorization {
+                client
+                    .poll_authorization(key, account, &url, budget)
+                    .await
+                    .map(|_| ())
+            } else {
+                client
+                    .poll_order(key, account, &url, budget)
+                    .await
+                    .map(|_| ())
+            }
+        }
+    };
+    poll(format!("{}{valid}", server.url), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let path = format!(
+        "/poll-{mode}-{}",
+        if authorization { "authz" } else { "order" }
+    );
+    let (budget, outer) = if mode == "progress" {
+        (Duration::from_millis(2500), Duration::from_millis(3500))
+    } else {
+        (Duration::from_millis(500), Duration::from_secs(3))
+    };
+    let result = tokio::time::timeout(outer, poll(format!("{}{path}", server.url), budget))
+        .await
+        .expect("polling missed its total deadline");
+    assert!(
+        matches!(result, Err(certon::Error::Timeout(_))),
+        "{result:?}"
+    );
+    let count = server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.path == path)
+        .count();
+    assert_eq!(
+        count,
+        if matches!(mode, "retry" | "progress") {
+            2
+        } else {
+            1
+        },
+        "test must reach the stalled POST"
+    );
+    // Cancellation must release the stalled connection so the same serial
+    // mock and client can complete another request, including nonce recovery.
+    poll(format!("{}{valid}", server.url), Duration::from_secs(2))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn polling_deadlines_include_stalled_http_requests() {
+    for authorization in [true, false] {
+        assert_poll_timeout(authorization, "stalled").await;
+    }
+}
+#[tokio::test]
+async fn polling_deadlines_include_stalled_response_bodies() {
+    for authorization in [true, false] {
+        assert_poll_timeout(authorization, "body").await;
+    }
+}
+#[tokio::test]
+async fn polling_deadlines_cover_bad_nonce_retries() {
+    for authorization in [true, false] {
+        assert_poll_timeout(authorization, "retry").await;
+    }
+}
+#[tokio::test]
+async fn polling_deadlines_are_not_reset_after_pending_status() {
+    for authorization in [true, false] {
+        assert_poll_timeout(authorization, "progress").await;
+    }
+}
+#[tokio::test]
+async fn polling_preserves_terminal_errors_and_accepts_a_large_ready_budget() {
+    use certon::error::{AcmeError, Error};
+    for authorization in [true, false] {
+        let server = Server::start(false).await;
+        let client = AcmeClient::new(&format!("{}/directory", server.url))
+            .await
+            .unwrap();
+        let key = certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+        let account = format!("{}/account/1", server.url);
+        if authorization {
+            assert_eq!(
+                client
+                    .poll_authorization(
+                        &key,
+                        &account,
+                        &format!("{}/authz", server.url),
+                        Duration::MAX
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                "valid"
+            );
+            let error = client
+                .poll_authorization(
+                    &key,
+                    &account,
+                    &format!("{}/poll-invalid-authz", server.url),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, Error::Acme(AcmeError::Authorization(_))));
+            assert!(error.to_string().contains("proof rejected"));
+        } else {
+            assert_eq!(
+                client
+                    .poll_order(
+                        &key,
+                        &account,
+                        &format!("{}/poll-valid-order", server.url),
+                        Duration::MAX
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                "valid"
+            );
+            let error = client
+                .poll_order(
+                    &key,
+                    &account,
+                    &format!("{}/poll-invalid-order", server.url),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(&error, Error::Acme(AcmeError::Order(_))));
+            assert!(error.to_string().contains("order rejected"));
+        }
+    }
 }

@@ -1380,8 +1380,28 @@ impl AcmeClient {
     }
 
     /// Poll an authorization URL until its status is `valid`, `invalid`, or
-    /// the timeout expires.
+    /// the timeout expires. The total budget includes HTTP requests, nonce
+    /// retries, response bodies and backoff waits.
     pub async fn poll_authorization(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        authz_url: &str,
+        timeout: Duration,
+    ) -> Result<AcmeAuthorization> {
+        tokio::time::timeout(
+            timeout,
+            self.poll_authorization_until_terminal(account_key, account_url, authz_url, timeout),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::Error::Timeout(format!(
+                "authorization polling timed out after {timeout:?}"
+            ))
+        })?
+    }
+
+    async fn poll_authorization_until_terminal(
         &self,
         account_key: &PrivateKey,
         account_url: &str,
@@ -1390,7 +1410,7 @@ impl AcmeClient {
     ) -> Result<AcmeAuthorization> {
         debug!(authz_url, ?timeout, "polling authorization");
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
         let mut interval = Duration::from_secs(2);
         let max_interval = Duration::from_secs(30);
 
@@ -1429,7 +1449,7 @@ impl AcmeClient {
                 }
             }
 
-            if tokio::time::Instant::now() + interval > deadline {
+            if started.elapsed().saturating_add(interval) > timeout {
                 return Err(crate::error::Error::Timeout(format!(
                     "authorization polling timed out after {timeout:?} (last status: {})",
                     authz.status
@@ -1478,8 +1498,26 @@ impl AcmeClient {
     }
 
     /// Poll an order URL until its status is `valid`, `invalid`, or the
-    /// timeout expires.
+    /// timeout expires. The total budget includes HTTP requests, nonce
+    /// retries, response bodies and backoff waits.
     pub async fn poll_order(
+        &self,
+        account_key: &PrivateKey,
+        account_url: &str,
+        order_url: &str,
+        timeout: Duration,
+    ) -> Result<AcmeOrder> {
+        tokio::time::timeout(
+            timeout,
+            self.poll_order_until_terminal(account_key, account_url, order_url, timeout),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::Error::Timeout(format!("order polling timed out after {timeout:?}"))
+        })?
+    }
+
+    async fn poll_order_until_terminal(
         &self,
         account_key: &PrivateKey,
         account_url: &str,
@@ -1488,7 +1526,7 @@ impl AcmeClient {
     ) -> Result<AcmeOrder> {
         debug!(order_url, ?timeout, "polling order");
 
-        let deadline = tokio::time::Instant::now() + timeout;
+        let started = tokio::time::Instant::now();
         let mut interval = Duration::from_secs(2);
         let max_interval = Duration::from_secs(30);
 
@@ -1516,7 +1554,7 @@ impl AcmeClient {
                 }
             }
 
-            if tokio::time::Instant::now() + interval > deadline {
+            if started.elapsed().saturating_add(interval) > timeout {
                 return Err(crate::error::Error::Timeout(format!(
                     "order polling timed out after {timeout:?} (last status: {})",
                     order.status
