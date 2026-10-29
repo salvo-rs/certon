@@ -222,6 +222,9 @@ pub struct CertCache {
 struct CacheState {
     certificates: HashMap<String, CachedCertificate>,
     index: HashMap<String, Vec<String>>,
+    /// Live chain hashes grouped by leaf, independent of SAN or managed state.
+    /// Lifetime quarantine below outlives membership in this reverse index.
+    chains_by_leaf: HashMap<String, HashSet<String>>,
     revoked_leaf_hashes: HashSet<String>,
     /// Dense managed-only sampling pool; each entry stores its back-reference.
     managed_hashes: Vec<String>,
@@ -478,6 +481,14 @@ impl CacheState {
 
     fn remove(&mut self, hash: &str) -> Option<CacheEvent> {
         let entry = self.certificates.remove(hash)?;
+        if let Some(leaf_hash) = &entry.leaf_hash
+            && let Some(chains) = self.chains_by_leaf.get_mut(leaf_hash)
+        {
+            chains.remove(hash);
+            if chains.is_empty() {
+                self.chains_by_leaf.remove(leaf_hash);
+            }
+        }
         self.change_ocsp_deadline(hash, entry.ocsp_deadline(), None);
         if let Some(index) = entry.managed_index {
             self.managed_hashes.swap_remove(index);
@@ -539,6 +550,8 @@ impl CacheState {
         }
         let hash = cert.hash.clone();
         if let Some(existing) = self.certificates.get_mut(&hash) {
+            // A duplicate merges metadata but retains the cached chain/leaf;
+            // its reverse membership must not follow the incoming metadata.
             let old_deadline = existing.ocsp_deadline();
             if cert.managed && !existing.certificate.managed {
                 let old_names = existing.certificate.names.clone();
@@ -632,6 +645,12 @@ impl CacheState {
                 .chain(retry_after)
                 .max(),
         );
+        if let Some(leaf_hash) = &leaf_hash {
+            self.chains_by_leaf
+                .entry(leaf_hash.clone())
+                .or_default()
+                .insert(hash.clone());
+        }
         self.certificates.insert(
             hash,
             CachedCertificate {
@@ -1063,15 +1082,13 @@ impl CertCache {
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
             state.revoked_leaf_hashes.insert(leaf_hash.to_owned());
-            let hashes: Vec<_> = state
-                .certificates
-                .iter()
-                .filter(|(_, entry)| entry.leaf_hash.as_deref() == Some(leaf_hash))
-                .map(|(hash, _)| hash.clone())
-                .collect();
+            // Taking the bucket avoids scanning unrelated certificates and
+            // transfers its chain hashes without cloning them. All removals
+            // still use the common SAN/managed/OCSP bookkeeping under this lock.
+            let hashes = state.chains_by_leaf.remove(leaf_hash).unwrap_or_default();
             hashes
-                .iter()
-                .filter_map(|hash| state.remove(hash))
+                .into_iter()
+                .filter_map(|hash| state.remove(&hash))
                 .collect()
         };
         self.notify_ocsp_schedule();
