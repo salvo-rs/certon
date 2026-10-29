@@ -890,13 +890,101 @@ the complete new snapshot; retry the migration with the same verified account
 to finish its receipt. Do not remove legacy records until all old readers are
 retired and you have retained an appropriate backup.
 
-For certificates, use `issuer.legacy_issuer_key()` (or
-`storage::legacy_issuer_key(directory_url)`) to load the operator-confirmed old
-resource through your `CertStore`, set its `resource.issuer_key` to the new
-`issuer.issuer_key()`, then save it under that key. Custom stores must preserve
-that metadata binding as well as the storage partition.
-Check an existing destination before copying and never overwrite another leaf.
-The manager intentionally performs no such ownership decision. ARI advice is
-fetched again for the new issuer identity; do not blindly copy old CA advice.
+For certificates, copying is **not a completed migration**. The operator must
+confirm the original full endpoint, pause **all** issuance, renewal, revocation
+and maintenance writers for the affected resources (including new managers),
+back up the complete old generation outside every active `CertStore`, verify
+the new copy and then retire the old active partition. Do not resume writers
+until retirement succeeds. Arbitrary public lock names do not coordinate
+certon's private lifecycle locks; the offline procedure below requires writers
+to stay paused, and its comparisons are not a cross-store compare-and-swap.
+
+Keeping an active old copy would make a later revoke delete only the new copy;
+the retained old copy would then correctly trigger the legacy guard and block
+another obtain. A complete migration avoids that recurring manual intervention.
+Do not bypass the guard for arbitrary old or revoked credentials. Keep a private
+backup, rather than the active old partition, for rollback or audit.
+
+This callable procedure uses existing APIs for both key-value and custom stores.
+Supply the exact, unmodified source resource you verified, its existing lookup
+name, a **separate protected backup backend**, and a generation-specific backup
+key ending in `.key`. `CertificateResource` serialization omits credential bytes,
+so the backup explicitly includes both PEM and private-key fields. Generic backup
+backends must protect those secrets; `FileStorage` uses private permissions for
+`.key` values on Unix and requires operator-configured Windows ACLs.
+Reserve that backup key exclusively for this migration; a preexisting different
+backup generation is an error, never an invitation to overwrite the backup.
+
+```rust
+use certon::{CertStore, CertificateResource, Error, Result, Storage};
+
+async fn migrate_certificate_offline(
+    store: &dyn CertStore, backup: &dyn Storage, backup_key: &str,
+    directory_url: &str, name: &str, expected: &CertificateResource,
+) -> Result<()> {
+    if !backup_key.ends_with(".key") {
+        return Err(Error::Config("private backup key must end in .key".into()));
+    }
+    let old = certon::storage::legacy_issuer_key(directory_url);
+    let new = certon::storage::issuer_key(directory_url);
+    let same = |a: &CertificateResource, b: &CertificateResource| {
+        a.sans == b.sans && a.certificate_pem == b.certificate_pem
+            && a.private_key_pem == b.private_key_pem
+            && a.issuer_data == b.issuer_data
+    };
+    let source = store.load(&old, name).await?;
+    let target = store.load(&new, name).await?;
+    if source.as_ref().is_some_and(|r| !same(r, expected)
+        || r.issuer_key != expected.issuer_key)
+        || target.as_ref().is_some_and(|r| !same(r, expected) || r.issuer_key != new)
+        || (source.is_none() && target.is_none())
+    {
+        return Err(Error::Config("migration generation mismatch".into()));
+    }
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "metadata": expected, "certificate_pem": expected.certificate_pem,
+        "private_key_pem": expected.private_key_pem,
+    })).map_err(|_| Error::Config("cannot encode private backup".into()))?;
+    match backup.load(backup_key).await {
+        Ok(existing) if existing != bytes => {
+            return Err(Error::Config("backup key contains another generation".into()));
+        }
+        Ok(_) => {}
+        Err(Error::Storage(certon::error::StorageError::NotFound(_))) => {
+            backup.store(backup_key, &bytes).await?;
+        }
+        Err(error) => return Err(error),
+    }
+    if target.is_none() {
+        let mut migrated = expected.clone();
+        migrated.issuer_key = new.clone(); // Required for custom stores too.
+        store.save(&new, &migrated).await?;
+    }
+    let current = store.load(&new, name).await?
+        .ok_or_else(|| Error::Config("migration destination disappeared".into()))?;
+    if !same(&current, expected) || current.issuer_key != new {
+        return Err(Error::Config("migration destination changed".into()));
+    }
+    if let Some(current) = store.load(&old, name).await? {
+        if !same(&current, expected) || current.issuer_key != expected.issuer_key {
+            return Err(Error::Config("migration source changed".into()));
+        }
+        store.remove(&old, name).await?;
+    }
+    if store.load(&old, name).await?.is_some() {
+        return Err(Error::Config("legacy retirement is incomplete".into()));
+    }
+    Ok(())
+}
+```
+
+Publication, backup or retirement errors and cancellation do not imply rollback:
+the complete new copy may already exist. Keep writers paused and retry this
+procedure with the same verified generation until it succeeds. A matching
+destination is reused, a different destination/source is never overwritten or
+retired, and an already retired source makes the final retry harmless. Preserve
+the backup after success; no active legacy record needs restoring for an ordinary
+later revoke or obtain. ARI advice is fetched again for the new issuer identity;
+do not blindly copy old CA advice.
 Global leaf revocation markers remain unchanged and still block revoked leaves
 across all namespaces and chains.
