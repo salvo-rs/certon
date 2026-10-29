@@ -654,3 +654,20 @@ metadata version still match. It retains the existing signing key and unrelated
 management metadata. A healthy current staple, concurrent status publication,
 verified revocation and leaf quarantine keep their existing protections. Raw
 metadata-only duplicate imports do not gain this recovery behavior.
+
+## DNS-01 provider zone discovery
+
+`Dns01Solver` now discovers the provider zone through SOA queries before creating
+TXT records. Queries use the solver's configured resolvers and absolute names,
+with a ten-second total discovery budget. Only an SOA owned by the queried name
+selects a zone. Missing SOA, invalid resolver configuration, transport failures
+and unrelated CNAME/SOA answers fail before any provider write; configure the
+challenge override domain explicitly for CNAME delegation. Cleanup uses the
+zone and relative name remembered at presentation, without another DNS lookup.
+
+The public synchronous zone helper remains a last-two-label heuristic, and the
+public asynchronous helper retains its best-effort fallback. Neither heuristic
+populates the confirmed SOA cache. Only successful system-resolver discoveries
+use that bounded five-minute cache; custom resolver views are uncached. Clear
+it with `clear_zone_cache` after system DNS configuration or delegation changes.
+Challenge names and overrides are normalized to lowercase fully qualified names.
