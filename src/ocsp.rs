@@ -1397,21 +1397,12 @@ fn parse_cert_status(
     }
 
     if tag.0 == CERT_STATUS_REVOKED as u32 {
-        // Try to extract revocation time from the content.
+        // IMPLICIT replaces the SEQUENCE tag: its content begins directly
+        // with GeneralizedTime, optionally followed by the explicit reason.
+        // Keep Revoked even when this best-effort timestamp is malformed.
         let revoked_at = get_context_content(obj).and_then(|bytes| {
-            // The content is a RevokedInfo SEQUENCE.
-            // First field is GeneralizedTime.
-            x509_parser::der_parser::parse_der(bytes)
-                .ok()
-                .and_then(|(_, inner)| {
-                    inner.as_sequence().ok().and_then(|seq| {
-                        if seq.is_empty() {
-                            None
-                        } else {
-                            parse_generalized_time_from_obj(&seq[0])
-                        }
-                    })
-                })
+            let (_, time) = x509_parser::der_parser::parse_der(bytes).ok()?;
+            parse_generalized_time_from_obj(&time)
         });
         return Ok((OcspStatus::Revoked, revoked_at));
     }
@@ -1808,6 +1799,9 @@ fn parse_generalized_time_from_bytes(bytes: &[u8]) -> Option<DateTime<Utc>> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod revoked_time_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

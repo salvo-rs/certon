@@ -122,11 +122,14 @@ impl Fixture {
             ]
             .concat(),
         );
-        let status = match spec.status {
-            0 => der(0x80, &[]),
-            1 => der(0xa1, &time(spec.start)),
-            _ => der(0x82, &[]),
-        };
+        let status = spec
+            .status_der
+            .clone()
+            .unwrap_or_else(|| match spec.status {
+                0 => der(0x80, &[]),
+                1 => der(0xa1, &time(spec.start)),
+                _ => der(0x82, &[]),
+            });
         let this_update = if spec.invalid_time {
             der(0x18, b"invalid-time")
         } else {
@@ -204,6 +207,7 @@ struct Single {
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     invalid_time: bool,
+    status_der: Option<Vec<u8>>,
 }
 impl Single {
     fn new(id: Identity) -> Self {
@@ -213,6 +217,7 @@ impl Single {
             start: Utc::now() - Duration::minutes(1),
             end: Utc::now() + Duration::hours(4),
             invalid_time: false,
+            status_der: None,
         }
     }
 }
@@ -447,6 +452,79 @@ async fn moderate_batch_preserves_one_original_raw_envelope() {
     let (_, response) = certon::ocsp::get_ocsp_for_cert(&fixture.pem).await.unwrap();
     assert_eq!(response.raw, raw);
     assert_eq!(response.status, certon::ocsp::OcspStatus::Good);
+}
+
+#[tokio::test]
+async fn signed_implicit_revoked_info_keeps_its_time_and_optional_reason() {
+    let server = Server::new().await;
+    let fixture = Fixture::new(&server.url);
+    let revoked_at = Utc::now() - Duration::days(1);
+    for reason in [None, Some(1), Some(6), Some(10)] {
+        let mut payload = time(revoked_at);
+        if let Some(reason) = reason {
+            payload.extend(der(0xa0, &der(0x0a, &[reason])));
+        }
+        let mut revoked = Single::new(Identity::Target);
+        revoked.status = 1;
+        revoked.status_der = Some(der(0xa1, &payload));
+        let raw = fixture.response(&[Single::new(Identity::Other), revoked]);
+        server.responses.lock().unwrap().push_back(raw.clone());
+        let (accepted, parsed) = certon::ocsp::get_ocsp_for_cert(&fixture.pem).await.unwrap();
+        assert_eq!(accepted, raw);
+        assert_eq!(parsed.raw, raw);
+        assert_eq!(parsed.status, certon::ocsp::OcspStatus::Revoked);
+        assert_eq!(
+            parsed.revoked_at.map(|time| time.timestamp()),
+            Some(revoked_at.timestamp())
+        );
+        assert_ne!(parsed.this_update.timestamp(), revoked_at.timestamp());
+    }
+}
+
+#[tokio::test]
+async fn signed_bad_revocation_time_still_retains_the_revoked_status() {
+    let server = Server::new().await;
+    let fixture = Fixture::new(&server.url);
+    for payload in [
+        Vec::new(),
+        der(0x05, &[]),
+        der(0x18, b"invalid-time"),
+        der(0x30, &time(Utc::now())),
+        vec![0x18, 0x0f, b'2'],
+    ] {
+        let mut revoked = Single::new(Identity::Target);
+        revoked.status = 1;
+        revoked.status_der = Some(der(0xa1, &payload));
+        server
+            .responses
+            .lock()
+            .unwrap()
+            .push_back(fixture.response(&[revoked]));
+        let (_, parsed) = certon::ocsp::get_ocsp_for_cert(&fixture.pem).await.unwrap();
+        assert_eq!(parsed.status, certon::ocsp::OcspStatus::Revoked);
+        assert_eq!(parsed.revoked_at, None);
+    }
+}
+
+#[tokio::test]
+async fn changing_the_revocation_time_without_resigning_is_rejected() {
+    let server = Server::new().await;
+    let fixture = Fixture::new(&server.url);
+    let revoked_at = Utc::now() - Duration::days(1);
+    let mut revoked = Single::new(Identity::Target);
+    revoked.status = 1;
+    revoked.status_der = Some(der(0xa1, &time(revoked_at)));
+    let original = fixture.tbs(&[revoked.clone()], false);
+    let signature = fixture.key.sign(&original).unwrap();
+    revoked.status_der = Some(der(0xa1, &time(revoked_at + Duration::seconds(1))));
+    let changed = fixture.tbs(&[revoked], false);
+    assert_ne!(changed, original);
+    server
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(fixture.envelope(changed, signature));
+    assert!(certon::ocsp::get_ocsp_for_cert(&fixture.pem).await.is_err());
 }
 
 async fn tls_works(cache: Arc<certon::CertCache>, fixture: &Fixture) -> bool {

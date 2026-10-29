@@ -631,3 +631,12 @@ above it; the existing insertion policy also permits a new entry while evicting
 one older managed entry when available. A capacity of zero remains unlimited
 and does not evict existing certificates. Raising the limit does not restore
 previously evicted entries.
+
+## OCSP revocation timestamps
+
+`OcspResponse::revoked_at` now reads the GeneralizedTime directly from RFC 6960's
+IMPLICIT RevokedInfo content, including responses with an optional revocation
+reason. An extra inner SEQUENCE is no longer mistaken for the required encoding.
+Missing or invalid time metadata remains `None` while the status stays Revoked.
+Certificate identity, full signed-envelope verification and freshness checks
+retain their existing behavior.
