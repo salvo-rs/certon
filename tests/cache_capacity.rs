@@ -112,3 +112,97 @@ async fn shrinking_preserves_unmanaged_entries_and_dispatches_removal_events() {
     assert!(cache.get_by_name("capacity-8.example").await.is_none());
     assert!(cache.get_by_name("capacity-9.example").await.is_some());
 }
+
+#[tokio::test]
+async fn taking_over_protected_imports_converges_to_the_configured_capacity() {
+    let cache = CertCache::new(CacheOptions {
+        capacity: 2,
+        ..Default::default()
+    });
+    let mut imported = Vec::new();
+    for index in 0..12 {
+        let cert = certificate(index, false);
+        cache.add(cert.clone()).await;
+        imported.push(cert);
+    }
+    assert_eq!(cache.count().await, 12, "imports retain their protection");
+    for (index, original) in imported.iter().enumerate() {
+        let mut managed = original.clone();
+        managed.managed = true;
+        managed.tags.push("taken-over".into());
+        cache.add(managed).await;
+        let current = cache.get_by_hash(&original.hash).await.unwrap();
+        assert!(current.managed, "the incoming takeover must be retained");
+        assert!(current.tags.iter().any(|tag| tag == "taken-over"));
+        for protected in &imported[index + 1..] {
+            assert!(cache.get_by_hash(&protected.hash).await.is_some());
+        }
+    }
+    assert_eq!(cache.count().await, 2, "no protected entries remain");
+    assert_eq!(cache.get_managed_certificates().await.len(), 2);
+    for index in 12..24 {
+        let incoming = certificate(index, true);
+        let hash = incoming.hash.clone();
+        cache.add(incoming).await;
+        assert_eq!(cache.count().await, 2);
+        assert!(cache.get_by_hash(&hash).await.is_some());
+    }
+}
+
+#[tokio::test]
+async fn mixed_takeover_evicts_older_managed_entries_but_keeps_protected_imports() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cache = CertCache::new(CacheOptions {
+        capacity: 2,
+        on_event: Some(Arc::new({
+            let events = events.clone();
+            move |event| events.lock().unwrap().push(event)
+        })),
+        ..Default::default()
+    });
+    let protected = certificate(0, false);
+    let first = certificate(1, false);
+    let second = certificate(2, false);
+    for cert in [&protected, &first, &second] {
+        cache.add(cert.clone()).await;
+    }
+    let mut first_managed = first.clone();
+    first_managed.managed = true;
+    cache.add(first_managed).await;
+    assert_eq!(
+        cache.count().await,
+        3,
+        "no older managed entry can make room"
+    );
+    events.lock().unwrap().clear();
+    let mut second_managed = second.clone();
+    second_managed.managed = true;
+    cache.add(second_managed.clone()).await;
+    assert_eq!(cache.count().await, 2);
+    assert!(cache.get_by_hash(&protected.hash).await.is_some());
+    assert!(cache.get_by_hash(&second.hash).await.unwrap().managed);
+    assert!(cache.get_by_hash(&first.hash).await.is_none());
+    assert!(cache.get_by_name(&first.names[0]).await.is_none());
+    let removed: Vec<_> = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            CacheEvent::Removed { hash, .. } => Some(hash.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(removed, vec![first.hash]);
+    // A further duplicate is metadata-only, not a new admission or eviction.
+    events.lock().unwrap().clear();
+    second_managed.tags.push("another-owner".into());
+    cache.add(second_managed).await;
+    assert_eq!(cache.count().await, 2);
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| matches!(event, CacheEvent::Updated { .. }))
+    );
+}

@@ -598,10 +598,23 @@ impl CacheState {
     }
 
     fn evict_managed(&mut self) -> Option<CacheEvent> {
-        if self.managed_hashes.is_empty() {
+        self.evict_managed_excluding(None)
+    }
+
+    fn evict_managed_excluding(&mut self, protected: Option<&str>) -> Option<CacheEvent> {
+        let protected = protected.and_then(|hash| {
+            self.certificates
+                .get(hash)
+                .and_then(|entry| entry.managed_index)
+        });
+        let eligible = self.managed_hashes.len() - usize::from(protected.is_some());
+        if eligible == 0 {
             return None;
         }
-        let index = rand::rng().random_range(0..self.managed_hashes.len());
+        let mut index = rand::rng().random_range(0..eligible);
+        if protected.is_some_and(|protected| index >= protected) {
+            index += 1;
+        }
         let hash = self.managed_hashes[index].clone();
         self.remove(&hash)
     }
@@ -624,7 +637,8 @@ impl CacheState {
             // A duplicate merges metadata but retains the cached chain/leaf;
             // its reverse membership must not follow the incoming metadata.
             let old_deadline = existing.ocsp_deadline();
-            if cert.managed && !existing.certificate.managed {
+            let promoted = cert.managed && !existing.certificate.managed;
+            if promoted {
                 let old_names = existing.certificate.names.clone();
                 let current = Arc::make_mut(&mut existing.certificate);
                 current.managed = true;
@@ -673,6 +687,18 @@ impl CacheState {
                 hash: hash.clone(),
             });
             self.change_ocsp_deadline(&hash, old_deadline, new_deadline);
+            if promoted {
+                // Taking responsibility for a protected import makes it count
+                // towards eviction again. Preserve this incoming entry just
+                // like fresh admission, reclaiming older managed entries first.
+                // Re-read its pool index after every swap removal.
+                while self.capacity > 0 && self.certificates.len() > self.capacity {
+                    let Some(event) = self.evict_managed_excluding(Some(&hash)) else {
+                        break;
+                    };
+                    events.push(event);
+                }
+            }
             return;
         }
         if self.capacity > 0
@@ -3349,6 +3375,148 @@ pub(crate) mod tests {
         // All three should be present because eviction only targets managed
         // certs and there were none to evict.
         assert_eq!(cache.count().await, 3);
+    }
+
+    #[tokio::test]
+    async fn promotion_reclaims_older_entries_without_changing_the_imported_credentials() {
+        let cache = CertCache::new(CacheOptions::default());
+        let mut older = Vec::new();
+        for _ in 0..6 {
+            let (mut cert, issuer) = signed_certificate();
+            cert.managed = true;
+            cert.not_after = Utc::now() + ChronoDuration::days(30);
+            cert.ocsp_response = Some(signed_staple(&cert, &issuer, 3600));
+            older.push(cert.clone());
+            cache.add(cert).await;
+        }
+        let (mut imported, issuer) = signed_certificate();
+        imported.tags = vec!["operator".into()];
+        imported.issuer_key = "managed-ca".into();
+        imported.ari = Some(crate::RenewalInfo {
+            suggested_window: Some(crate::acme_client::RenewalWindow {
+                start: (Utc::now() + ChronoDuration::days(10)).to_rfc3339(),
+                end: (Utc::now() + ChronoDuration::days(11)).to_rfc3339(),
+            }),
+            selected_time: Some(Utc::now() + ChronoDuration::hours(252)),
+            retry_after: Some(3600),
+            ..Default::default()
+        });
+        imported.ocsp_response = Some(signed_staple(&imported, &issuer, 3600));
+        let hash = imported.hash.clone();
+        cache.add(imported.clone()).await;
+        let (original, key, deadline) = {
+            let state = cache.state.read().unwrap();
+            let entry = &state.certificates[&hash];
+            (
+                entry.certificate.clone(),
+                entry.key.clone().unwrap(),
+                entry.ocsp_deadline(),
+            )
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        // Model an existing over-capacity working set at the publication
+        // boundary. This deliberately bypasses set_options' immediate resize
+        // so one promotion must reclaim several older managed entries.
+        {
+            let weak = Arc::downgrade(&cache);
+            let mut options = cache.options.write().unwrap();
+            options.capacity = 2;
+            options.on_event = Some(Arc::new({
+                let events = events.clone();
+                move |event| {
+                    let cache = weak.upgrade().unwrap();
+                    assert!(
+                        cache.state.try_read().is_ok(),
+                        "callback retained state lock"
+                    );
+                    assert!(
+                        cache.options.try_read().is_ok(),
+                        "callback retained options lock"
+                    );
+                    events.lock().unwrap().push(event);
+                }
+            }));
+            cache.state.write().unwrap().capacity = 2;
+        }
+        let mut incoming = imported.clone();
+        incoming.managed = true;
+        incoming.tags = vec!["application".into()];
+        incoming.ocsp_response = Some(vec![1, 2, 3]);
+        incoming.ari = None;
+        cache.add(incoming.clone()).await;
+        assert_eq!(cache.count().await, 2);
+        let current = cache.get_by_hash(&hash).await.unwrap();
+        assert!(current.managed);
+        assert_eq!(current.tags, vec!["operator", "application"]);
+        assert_eq!(current.cert_chain, original.cert_chain);
+        assert_eq!(current.private_key_der, original.private_key_der);
+        assert_eq!(current.ocsp_response, original.ocsp_response);
+        assert_eq!(current.ocsp_status, original.ocsp_status);
+        assert_eq!(
+            current.ari.as_ref().unwrap().selected_time,
+            original.ari.as_ref().unwrap().selected_time
+        );
+        assert_eq!(
+            serde_json::to_value(&current.ari).unwrap(),
+            serde_json::to_value(&original.ari).unwrap()
+        );
+        assert!(!original.managed);
+        assert_eq!(original.tags, vec!["operator"]);
+        let removed: HashSet<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                CacheEvent::Removed { hash, .. } => Some(hash.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed.len(), 5);
+        assert!(
+            !removed.contains(&hash),
+            "incoming promotion must survive repeated pool swaps"
+        );
+        assert_cache_indices(&cache);
+        {
+            let state = cache.state.read().unwrap();
+            assert!(Arc::ptr_eq(
+                &key,
+                state.certificates[&hash].key.as_ref().unwrap()
+            ));
+            assert_eq!(state.certificates[&hash].ocsp_deadline(), deadline);
+            let live: HashSet<_> = state.certificates.keys().cloned().collect();
+            let leaves: HashSet<_> = state.chains_by_leaf.values().flatten().cloned().collect();
+            let deadlines: HashSet<_> = state.ocsp_deadlines.values().flatten().cloned().collect();
+            assert_eq!(leaves, live);
+            assert_eq!(deadlines, live);
+            assert!(
+                state
+                    .index
+                    .values()
+                    .flatten()
+                    .all(|hash| live.contains(hash))
+            );
+        }
+        assert_eq!(
+            signed_cache_handshake(cache.clone(), imported.cert_chain[1].clone())
+                .await
+                .unwrap(),
+            imported.cert_chain[0].as_ref()
+        );
+        // Removed leaves cannot disturb an unrelated survivor, and quarantine
+        // still prevents a removed promoted leaf from being republished.
+        for cert in older.iter().filter(|cert| removed.contains(&cert.hash)) {
+            cache
+                .deny_revoked_certificate(&crate::storage::certificate_leaf_hash(cert).unwrap())
+                .await;
+        }
+        assert!(cache.get_by_hash(&hash).await.is_some());
+        cache
+            .deny_revoked_certificate(&crate::storage::certificate_leaf_hash(&imported).unwrap())
+            .await;
+        cache.add(incoming).await;
+        assert!(cache.get_by_hash(&hash).await.is_none());
+        assert_cache_indices(&cache);
     }
 
     #[tokio::test]
