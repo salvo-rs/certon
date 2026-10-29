@@ -837,3 +837,15 @@ Renewal and OCSP periodic ticks still request global scans, including when OCSP
 stapling is disabled. The existing scan concurrency, coalescing and cancellation
 limits are unchanged. ARI wakeups still evaluate cached renewal eligibility;
 this change removes redundant backend reads, not that in-memory walk.
+
+## OCSP endpoint diagnostics
+
+OCSP responder overrides and AIA issuer-fetch diagnostics now show only the
+endpoint's scheme, host and port. User information, paths, query parameters and
+fragments are omitted; malformed endpoints use a static diagnostic label.
+Transport and response-body errors strip reqwest's embedded URL as well.
+
+This affects logs and error text only. Requests still use the configured URL
+and credentials, and retain their existing timeout, size-limit, signature and
+serving-admission behavior. Error categories, HTTP statuses and operation labels
+remain available for troubleshooting.
