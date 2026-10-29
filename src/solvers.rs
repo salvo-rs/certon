@@ -46,7 +46,8 @@ use tracing::{debug, warn};
 #[cfg(feature = "dns-01")]
 use crate::dns_util::{
     DEFAULT_PROPAGATION_INTERVAL, DEFAULT_PROPAGATION_TIMEOUT, challenge_record_name,
-    challenge_record_value, check_dns_propagation_with_resolvers, find_zone_by_fqdn, from_fqdn,
+    challenge_record_value, check_dns_propagation_with_resolvers, find_zone_by_fqdn_with_resolvers,
+    from_fqdn, to_fqdn,
 };
 use crate::error::{Error, Result};
 use crate::storage::Storage;
@@ -972,9 +973,9 @@ impl Dns01Solver {
     /// Compute the FQDN for the challenge TXT record.
     fn dns_name(&self, domain: &str) -> String {
         if let Some(ref override_domain) = self.override_domain {
-            override_domain.clone()
+            to_fqdn(override_domain).to_lowercase()
         } else {
-            challenge_record_name(domain)
+            challenge_record_name(domain).to_lowercase()
         }
     }
 }
@@ -1004,7 +1005,8 @@ impl Solver for Dns01Solver {
         let txt_value = challenge_record_value(key_auth);
 
         // Determine the zone for this domain.
-        let zone = find_zone_by_fqdn(&dns_name)
+        let zone = find_zone_by_fqdn_with_resolvers(&dns_name, self.resolvers.as_deref())
+            .await?
             .ok_or_else(|| Error::Other(format!("could not determine DNS zone for {dns_name}")))?;
 
         // Compute the relative record name within the zone.
@@ -1977,10 +1979,12 @@ mod tests {
 
         #[tokio::test]
         async fn dns01_present_and_cleanup() {
+            let server = crate::dns_util::test_dns::Server::new("example.com.").await;
             let provider = Arc::new(MockDnsProvider::new());
             let provider_ref = Arc::clone(&provider);
 
-            let solver = Dns01Solver::new(Box::new(MockDnsProviderWrapper(provider_ref)));
+            let mut solver = Dns01Solver::new(Box::new(MockDnsProviderWrapper(provider_ref)));
+            solver.resolvers = Some(vec![server.address.clone()]);
 
             solver
                 .present("example.com", "token", "key_auth")

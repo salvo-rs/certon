@@ -484,7 +484,7 @@ impl ZoneCache {
     }
 }
 
-/// Global DNS zone cache with five-minute positive and negative entries.
+/// Global cache of confirmed system-resolver SOA results, retained five minutes.
 static ZONE_CACHE: std::sync::OnceLock<Mutex<ZoneCache>> = std::sync::OnceLock::new();
 
 fn zone_cache() -> &'static Mutex<ZoneCache> {
@@ -502,12 +502,13 @@ fn zone_cache_set(domain: &str, zone: Option<&str>) {
     }
 }
 
-/// Clear the DNS zone cache, including all expiry and eviction bookkeeping.
+/// Clear the confirmed system-resolver SOA cache and its expiry bookkeeping.
 ///
 /// This is primarily useful for testing or when DNS configuration has
 /// changed and cached results are stale.
 /// At most 1024 domains are retained for five minutes; capacity eviction may
 /// remove an entry sooner. Oversized keys or zone values are not cached.
+/// Synchronous guesses and custom-resolver discoveries do not use this cache.
 pub fn clear_zone_cache() {
     if let Ok(mut cache) = zone_cache().lock() {
         cache.clear();
@@ -518,15 +519,11 @@ pub fn clear_zone_cache() {
 // Zone detection
 // ---------------------------------------------------------------------------
 
-/// Determine the registerable domain (zone apex) for the given domain.
+/// Guess a zone by returning the last two domain labels.
 ///
-/// Attempts to find the zone by performing SOA lookups walking up the label
-/// hierarchy. If SOA lookup fails
-/// (e.g. no network), falls back to a heuristic that returns the last two
-/// labels of the domain.
-///
-/// Results use a shared cache of at most 1024 domains, with a five-minute
-/// `ZONE_CACHE_TTL`. Capacity eviction may remove entries sooner.
+/// This synchronous compatibility helper does not perform DNS queries and
+/// cannot discover public suffixes or delegated zones. Its guesses do not
+/// read or populate the authoritative SOA cache used by asynchronous discovery.
 ///
 /// # Examples
 ///
@@ -544,14 +541,7 @@ pub fn clear_zone_cache() {
 /// assert_eq!(find_zone_by_fqdn("com"), None);
 /// ```
 pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {
-    // Check cache first.
-    if let Some(cached) = zone_cache_get(fqdn) {
-        return cached;
-    }
-
-    let result = find_zone_by_fqdn_heuristic(fqdn);
-    zone_cache_set(fqdn, result.as_deref());
-    result
+    find_zone_by_fqdn_heuristic(fqdn)
 }
 
 /// Async version of [`find_zone_by_fqdn`] that performs real SOA queries.
@@ -560,51 +550,86 @@ pub fn find_zone_by_fqdn(fqdn: &str) -> Option<String> {
 /// Returns the first domain that has an SOA record. Falls back to the
 /// heuristic if no SOA is found.
 ///
-/// Results use a shared cache of at most 1024 domains, with a five-minute
-/// `ZONE_CACHE_TTL`. Capacity eviction may remove entries sooner.
+/// Successful SOA results use a shared cache of at most 1024 domains for five
+/// minutes. Best-effort heuristic fallbacks are never cached as SOA results.
+/// The complete discovery walk is bounded by [`DNS_TIMEOUT`]. DNS-01 issuance
+/// requires a confirmed SOA and does not use this helper's fallback.
 pub async fn find_zone_by_fqdn_async(fqdn: &str) -> Option<String> {
-    // Check cache first.
-    if let Some(cached) = zone_cache_get(fqdn) {
-        return cached;
+    match find_zone_by_fqdn_with_resolvers(fqdn, None).await {
+        Ok(Some(zone)) => Some(zone),
+        _ => find_zone_by_fqdn_heuristic(fqdn),
     }
+}
 
-    let domain = from_fqdn(fqdn);
+/// Strict discovery for provider writes. Custom resolver views are deliberately
+/// uncached, so neither another resolver nor a synchronous guess can select
+/// their zone. Only successful system-resolver SOA results enter the shared cache.
+pub(crate) async fn find_zone_by_fqdn_with_resolvers(
+    fqdn: &str,
+    resolvers: Option<&[String]>,
+) -> Result<Option<String>> {
+    let domain =
+        ZoneCache::key(fqdn).ok_or_else(|| Error::Config("DNS zone name is too long".into()))?;
+    let absolute = to_fqdn(&domain);
+    hickory_resolver::proto::rr::Name::from_ascii(&absolute)
+        .map_err(|error| Error::Config(format!("invalid DNS zone name: {error}")))?;
     let labels: Vec<&str> = domain.split('.').collect();
     if labels.len() < 2 {
-        zone_cache_set(fqdn, None);
-        return None;
+        return Ok(None);
     }
-
-    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
-        Ok(resolver) => resolver,
-        Err(_) => {
-            let result = find_zone_by_fqdn_heuristic(fqdn);
-            zone_cache_set(fqdn, result.as_deref());
-            return result;
-        }
-    };
-
-    // Walk up the label hierarchy, starting from the full domain.
-    for i in 0..labels.len() - 1 {
-        let candidate = labels[i..].join(".");
-        if candidate.split('.').count() < 2 {
-            break;
-        }
-        match resolver.soa_lookup(&candidate).await {
-            Ok(_) => {
-                debug!(zone = %candidate, "found SOA record for zone");
-                let result = Some(to_fqdn(&candidate));
-                zone_cache_set(fqdn, result.as_deref());
-                return result;
+    if resolvers.is_none()
+        && let Some(cached) = zone_cache_get(&domain)
+    {
+        return Ok(cached);
+    }
+    let resolver = propagation_resolver(resolvers)?;
+    let discovery = async {
+        for i in 0..labels.len() - 1 {
+            // A trailing dot disables search-domain expansion. A CNAME's SOA
+            // belongs to its target, not necessarily to the provider's zone.
+            let candidate = to_fqdn(&labels[i..].join("."));
+            match resolver.soa_lookup(candidate.as_str()).await {
+                Ok(answer) => {
+                    if answer.answers().iter().any(|record| {
+                        matches!(record.data, hickory_resolver::proto::rr::RData::SOA(_))
+                            && record.name.to_ascii().eq_ignore_ascii_case(&candidate)
+                    }) {
+                        return Ok(Some(candidate));
+                    }
+                    if answer.answers().iter().any(|record| {
+                        matches!(
+                            record.data,
+                            hickory_resolver::proto::rr::RData::SOA(_)
+                                | hickory_resolver::proto::rr::RData::CNAME(_)
+                        )
+                    }) {
+                        return Err(Error::Other(format!(
+                            "SOA lookup for {candidate} returned an unrelated owner; configure the challenge override domain explicitly"
+                        )));
+                    }
+                }
+                Err(error) if error.is_no_records_found() => {}
+                Err(hickory_resolver::net::NetError::Timeout) => {
+                    return Err(Error::Timeout(format!(
+                        "DNS SOA lookup for {candidate} timed out"
+                    )));
+                }
+                Err(error) => {
+                    return Err(Error::Other(format!(
+                        "DNS SOA lookup for {candidate} failed: {error}"
+                    )));
+                }
             }
-            Err(_) => continue,
         }
+        Ok(None)
+    };
+    let result = tokio::time::timeout(DNS_TIMEOUT, discovery)
+        .await
+        .map_err(|_| Error::Timeout(format!("DNS zone discovery for {absolute} timed out")))??;
+    if resolvers.is_none() && result.is_some() {
+        zone_cache_set(&domain, result.as_deref());
     }
-
-    // Fallback to heuristic.
-    let result = find_zone_by_fqdn_heuristic(fqdn);
-    zone_cache_set(fqdn, result.as_deref());
-    result
+    Ok(result)
 }
 
 /// Heuristic zone detection: returns the last two labels as the zone apex.
@@ -694,8 +719,59 @@ pub fn recursive_nameservers(custom: &[String]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "../tests/common/dns_server.rs"]
+pub(crate) mod test_dns;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synchronous_guesses_cannot_read_or_overwrite_confirmed_zones() {
+        let name = "_acme-challenge.isolated.delegate.example.test";
+        zone_cache_set(name, Some("delegate.example.test."));
+        assert_eq!(find_zone_by_fqdn(name), Some("example.test.".into()));
+        assert_eq!(
+            zone_cache_get(name),
+            Some(Some("delegate.example.test.".into()))
+        );
+        let unconfirmed = "_acme-challenge.uncached.example.co.uk";
+        assert_eq!(find_zone_by_fqdn(unconfirmed), Some("co.uk.".into()));
+        assert_eq!(zone_cache_get(unconfirmed), None);
+    }
+
+    #[tokio::test]
+    async fn asynchronous_best_effort_fallback_remains_uncached() {
+        // An invalid label fails before system resolver construction/network.
+        let name = format!("{}.fallback.example.test", "a".repeat(64));
+        assert_eq!(
+            find_zone_by_fqdn_async(&name).await,
+            Some("example.test.".into())
+        );
+        assert_eq!(zone_cache_get(&name), None);
+    }
+
+    #[tokio::test]
+    async fn confirmed_system_zone_is_reused_but_custom_views_still_query() {
+        let name = "_acme-challenge.host.delegate.cached.example.test";
+        zone_cache_set(name, Some("delegate.cached.example.test."));
+        assert_eq!(
+            find_zone_by_fqdn_with_resolvers(name, None).await.unwrap(),
+            Some("delegate.cached.example.test.".into())
+        );
+        let server = super::test_dns::Server::new("cached.example.test.").await;
+        assert_eq!(
+            find_zone_by_fqdn_with_resolvers(name, Some(std::slice::from_ref(&server.address)))
+                .await
+                .unwrap(),
+            Some("cached.example.test.".into())
+        );
+        assert!(!server.state.queries.lock().unwrap().is_empty());
+        assert_eq!(
+            zone_cache_get(name),
+            Some(Some("delegate.cached.example.test.".into()))
+        );
+    }
 
     // -- FQDN helpers -------------------------------------------------------
 

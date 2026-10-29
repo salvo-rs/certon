@@ -1,5 +1,8 @@
 #![cfg(feature = "dns-01")]
 
+#[path = "common/dns_server.rs"]
+mod dns_server;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -92,15 +95,16 @@ impl certon::DnsProvider for ProviderHandle {
 #[tokio::test]
 async fn cancellation_during_dns_creation_and_deletion_retains_cleanup_intent() {
     for during_creation in [true, false] {
+        let server = dns_server::Server::new("example.com.").await;
         let provider = Arc::new(CancellableProvider {
             exists: AtomicBool::new(false),
             block_set: AtomicBool::new(during_creation),
             block_delete: AtomicBool::new(!during_creation),
             entered: tokio::sync::Notify::new(),
         });
-        let solver = Arc::new(certon::Dns01Solver::new(Box::new(ProviderHandle(
-            Arc::clone(&provider),
-        ))));
+        let mut solver = certon::Dns01Solver::new(Box::new(ProviderHandle(Arc::clone(&provider))));
+        solver.resolvers = Some(vec![server.address.clone()]);
+        let solver = Arc::new(solver);
         if !during_creation {
             solver
                 .present("example.com", "token", "key-auth")
