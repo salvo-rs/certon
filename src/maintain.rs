@@ -448,20 +448,24 @@ async fn maintenance_loop(
     let renewals = async {
         let mut ari_changed = cache.subscribe_ari();
         loop {
-            tokio::select! {
-                _ = renew_ticker.tick() => {}
-                _ = ari_changed.changed() => {}
-            }
+            let periodic = tokio::select! {
+                _ = renew_ticker.tick() => true,
+                _ = ari_changed.changed() => false,
+            };
             debug!("maintenance: running renewal check");
             // The global scan is independent of renewal progress. Each bounded
             // job checks its own leaf before any preflight or callback instead
             // of waiting for an unrelated slow marker in this full-cache scan.
-            let _ = renewal_marker_requests.try_send(());
+            // An ARI-only wakeup checks the due jobs' own markers below, not
+            // every unrelated leaf. Periodic and OCSP scans keep their cadence.
+            if periodic {
+                let _ = renewal_marker_requests.try_send(());
+            }
             check_renewals_with_policy(&cache, &policy, &job_queue).await;
         }
     };
     let revocations = async {
-        // Coalesce renewal/ARI and OCSP periodic requests in one eight-read
+        // Coalesce renewal and OCSP periodic requests in one eight-read
         // scan. Backend waits must not block renewal, OCSP or ARI scheduling.
         while marker_receiver.recv().await.is_some() {
             if let Err(error) = refresh_revocations(&cache, config.storage.as_ref()).await {
