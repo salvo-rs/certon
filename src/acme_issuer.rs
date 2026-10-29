@@ -848,8 +848,8 @@ impl AcmeIssuer {
     ///
     /// Preference order:
     /// 1. `dns-01` if a DNS solver is configured, for DNS identifiers only
-    /// 2. `http-01` if not disabled
-    /// 3. `tls-alpn-01` if not disabled
+    /// 2. `http-01` if enabled and a solver is configured
+    /// 3. `tls-alpn-01` if enabled and a solver is configured
     fn select_challenge<'a>(
         &self,
         challenges: &'a [crate::acme_client::AcmeChallenge],
@@ -867,6 +867,7 @@ impl AcmeIssuer {
 
         // Try http-01.
         if !self.disable_http_challenge
+            && self.http01_solver.is_some()
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_HTTP01)
@@ -876,6 +877,7 @@ impl AcmeIssuer {
 
         // Try tls-alpn-01.
         if !self.disable_tlsalpn_challenge
+            && self.tlsalpn01_solver.is_some()
             && let Some(c) = challenges
                 .iter()
                 .find(|c| c.challenge_type == CHALLENGE_TYPE_TLSALPN01)
@@ -891,9 +893,12 @@ impl AcmeIssuer {
             challenge_type: "none".into(),
             message: format!(
                 "no suitable challenge type found among {:?} \
-                 (dns01_solver={}, http_disabled={}, tlsalpn_disabled={})",
+                 (dns01_solver={}, http01_solver={}, tlsalpn01_solver={}, \
+                 http_disabled={}, tlsalpn_disabled={})",
                 available,
                 self.dns01_solver.is_some(),
+                self.http01_solver.is_some(),
+                self.tlsalpn01_solver.is_some(),
                 self.disable_http_challenge,
                 self.disable_tlsalpn_challenge,
             ),

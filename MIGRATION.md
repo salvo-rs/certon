@@ -815,3 +815,16 @@ issuer's internal flow performs this recovery. Other problem types, similar
 human-readable text, JSON status fields and responses with other HTTP statuses
 do not trigger it. Account-missing and already-revoked recognition remain
 restricted to their existing exact HTTP 400 problem contracts.
+
+## Challenge selection follows configured solver capabilities
+
+HTTP-01 and TLS-ALPN-01 are considered only when enabled and their solver is
+configured. A TLS-only integration no longer needs to explicitly disable HTTP
+just because the CA also advertises an HTTP challenge. The existing preference
+among usable solvers remains DNS, HTTP, then TLS; DNS is still excluded for IP
+identifiers. A missing intersection produces a no-suitable-challenge error
+before any solver is presented.
+
+This check runs only for authorizations that need validation. Already-valid
+authorizations can still complete issuance with no configured solver. Public
+builder and solver APIs are unchanged.
