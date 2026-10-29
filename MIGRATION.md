@@ -480,6 +480,35 @@ another enabled manager sharing the cache. The public low-level
 `Certificate::needs_renewal` has no policy argument and continues to use attached
 ARI, with a stable derived point if a valid window has no explicit local choice.
 
+## ARI sidecar retention
+
+Version-1 ARI sidecars now include an optional `leaf_not_after`, derived from
+the actual leaf certificate DER. Positive recommendations, unsupported-response
+negative caches and request-error records all carry it. Active ARI refreshes
+upgrade existing records under the ARI storage lock, including records with a
+future retry deadline or an issuer no longer configured. This metadata-only
+upgrade does not fetch renewal information or change the selected time, retry
+deadline or failure count. Planning/attach reads remain read-only, and expiry
+metadata alone does not override a locally accepted, not-yet-persisted choice.
+
+`clean_storage` also collects version-1 records at the exact
+`ari/<64-lowercase-hex-issuer-hash>/<64-lowercase-hex-leaf-hash>/state.json`
+path when their identity matches and `leaf_not_after` plus the existing
+`expired_cert_grace_period` is strictly before the run's timestamp. A record can
+be collected after its certificate resource has been replaced or removed. ARI
+deletions are logged separately; public cleanup options and certificate/OCSP
+counters are unchanged.
+
+The borrowed cleanup API does not acquire ARI locks or provide atomic
+compare-and-delete. Coordinate cleanup externally with issuance/renewal, every
+instance's ARI refresh and metadata upgrade, and completion of already submitted
+storage writes. Unknown versions, malformed or mismatched records, expiry/grace
+arithmetic overflow and legacy records without an expiry are retained. Live
+legacy records are upgraded gradually through refresh; legacy orphan records
+whose leaf DER is gone cannot be upgraded automatically. Mixed deployments with
+older writers may still produce records without an expiry and retain those
+records until the writers are upgraded.
+
 ## Recovery after a shared Must-Staple replacement
 
 An OCSP recovery queued for an old revoked leaf now plans against the resource

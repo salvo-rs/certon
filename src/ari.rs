@@ -32,6 +32,8 @@ struct Record {
     selected_time: Option<DateTime<Utc>>,
     next_check: DateTime<Utc>,
     failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    leaf_not_after: Option<DateTime<Utc>>,
 }
 
 fn digest(value: &str) -> String {
@@ -116,8 +118,26 @@ async fn load(storage: &dyn Storage, issuer: &str, leaf: &str) -> Result<Option<
 /// Load only advisory state. Certificate/marker failures are handled by callers.
 fn fingerprint(record: Option<&Record>) -> Option<String> {
     record
-        .and_then(|record| serde_json::to_string(record).ok())
+        .and_then(|record| {
+            // Retention metadata is not a changed recommendation. In particular,
+            // another instance upgrading an old sidecar must not discard a
+            // locally accepted point whose last persistence attempt failed.
+            let mut semantic = record.clone();
+            semantic.leaf_not_after = None;
+            serde_json::to_string(&semantic).ok()
+        })
         .map(|json| digest(&json))
+}
+
+fn leaf_not_after(cert: &Certificate) -> Result<DateTime<Utc>> {
+    let der = cert
+        .cert_chain
+        .first()
+        .ok_or_else(|| Error::Other("ARI certificate has no leaf DER".into()))?;
+    let (_, parsed) = x509_parser::parse_x509_certificate(der)
+        .map_err(|error| Error::Other(format!("cannot parse ARI leaf expiry: {error}")))?;
+    DateTime::from_timestamp(parsed.validity().not_after.timestamp(), 0)
+        .ok_or_else(|| Error::Other("ARI leaf expiry is outside the supported range".into()))
 }
 
 pub(crate) async fn attach(storage: &dyn Storage, cert: &mut Certificate, disabled: bool) {
@@ -217,18 +237,32 @@ async fn refresh_inner(
     .await?;
     // Recheck before starting a new request. A late response is confined to its
     // own leaf's sidecar and conditional cache update, never a replacement leaf.
-    let previous = load(manager.storage.as_ref(), &cert.issuer_key, leaf).await?;
-    let Some(resource) = manager.certificates.load(&cert.issuer_key, name).await? else {
+    let mut previous = load(manager.storage.as_ref(), &cert.issuer_key, leaf).await?;
+    if !current_leaf(manager, cert, name, leaf).await? {
         return Ok(after(FALLBACK));
-    };
-    if resource_leaf_hash(&resource)? != leaf
-        || cert.expired()
-        || manager
-            .cache
-            .ari_certificate(&cert.hash)
-            .is_none_or(|current| current.issuer_key != cert.issuer_key)
+    }
+    let leaf_not_after = leaf_not_after(cert)?;
+    let upgrading = previous
+        .as_ref()
+        .is_some_and(|record| record.leaf_not_after.is_none());
+    if let Some(record) = &mut previous
+        && record.leaf_not_after.is_none()
     {
-        return Ok(after(FALLBACK));
+        // Upgrade only an existing, current leaf under its owned ARI lock. This
+        // must also run before negative-cache/future-retry/no-issuer early exits.
+        // Attach/planning remain read-only, and all scheduling fields survive.
+        record.leaf_not_after = Some(leaf_not_after);
+        if let Err(error) = manager
+            .storage
+            .store(
+                &key(&cert.issuer_key, leaf),
+                &serde_json::to_vec(record)
+                    .map_err(|error| StorageError::Serialize(error.to_string()))?,
+            )
+            .await
+        {
+            warn!(%error, "cannot persist ARI retention metadata upgrade");
+        }
     }
     manager.cache.reconcile_ari(
         &cert.hash,
@@ -257,6 +291,11 @@ async fn refresh_inner(
     else {
         return Ok(after(FALLBACK));
     };
+    // Upgrading added a storage await after the original eligibility check.
+    // Do not start a request for a leaf withdrawn/replaced during that write.
+    if upgrading && !current_leaf(manager, cert, name, leaf).await? {
+        return Ok(after(FALLBACK));
+    }
     let response = tokio::time::timeout(
         Duration::from_secs(20),
         issuer.renewal_info(&cert.cert_chain[0]),
@@ -271,6 +310,7 @@ async fn refresh_inner(
         selected_time: None,
         next_check: after(FALLBACK),
         failures: 0,
+        leaf_not_after: Some(leaf_not_after),
     };
     match response {
         Ok(Some(mut info)) if window(&info).is_some() && info.retry_after.is_some() => {
@@ -342,6 +382,101 @@ async fn refresh_inner(
         (!persisted).then(|| fingerprint(previous.as_ref())),
     );
     Ok(record.next_check)
+}
+
+async fn current_leaf(
+    manager: &CertManager,
+    cert: &Certificate,
+    name: &str,
+    leaf: &str,
+) -> Result<bool> {
+    let Some(resource) = manager.certificates.load(&cert.issuer_key, name).await? else {
+        return Ok(false);
+    };
+    Ok(resource_leaf_hash(&resource)? == leaf
+        && !cert.expired()
+        && manager
+            .cache
+            .ari_certificate(&cert.hash)
+            .is_some_and(|current| current.issuer_key == cert.issuer_key))
+}
+
+/// Called by borrowed storage GC, with the same timestamp as its other scans.
+/// No lock is acquired: the caller must coordinate all writers externally.
+pub(crate) async fn clean_expired(storage: &dyn Storage, now: DateTime<Utc>, grace: Duration) {
+    let Ok(grace) = chrono::Duration::from_std(grace) else {
+        return;
+    };
+    let entries = match storage.list("ari", true).await {
+        Ok(entries) => entries,
+        Err(Error::Storage(StorageError::NotFound(_))) => return,
+        Err(error) => {
+            warn!(%error, "clean_storage: failed to list ARI state");
+            return;
+        }
+    };
+    let mut deleted_ari = 0usize;
+    for path in entries {
+        let Some((issuer_hash, leaf)) = retention_identity(&path) else {
+            continue;
+        };
+        let bytes = match storage.load(&path).await {
+            Ok(bytes) => bytes,
+            Err(Error::Storage(StorageError::NotFound(_))) => continue,
+            Err(error) => {
+                warn!(%path, %error, "clean_storage: failed to load ARI state");
+                continue;
+            }
+        };
+        let record: Record = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(%path, %error, "clean_storage: retaining malformed ARI state");
+                continue;
+            }
+        };
+        if record.version != 1 || record.leaf != leaf || digest(&record.issuer) != issuer_hash {
+            warn!(%path, "clean_storage: retaining ARI state with mismatched identity/version");
+            continue;
+        }
+        if !record
+            .leaf_not_after
+            .and_then(|expiry| expiry.checked_add_signed(grace))
+            .is_some_and(|expiry_with_grace| expiry_with_grace < now)
+        {
+            continue;
+        }
+        match storage.delete(&path).await {
+            Ok(()) => deleted_ari += 1,
+            Err(Error::Storage(StorageError::NotFound(_))) => {}
+            Err(error) => {
+                warn!(%path, %error, "clean_storage: failed to delete expired ARI state");
+            }
+        }
+    }
+    if deleted_ari > 0 {
+        tracing::info!(deleted_ari, "clean_storage: deleted expired ARI state");
+    }
+}
+
+fn retention_identity(path: &str) -> Option<(&str, &str)> {
+    let mut parts = path.split('/');
+    if parts.next()? != "ari" {
+        return None;
+    }
+    let issuer_hash = parts.next()?;
+    let leaf = parts.next()?;
+    let is_hash = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    (parts.next()? == "state.json"
+        && parts.next().is_none()
+        && is_hash(issuer_hash)
+        && is_hash(leaf))
+    .then_some((issuer_hash, leaf))
 }
 
 struct Scheduled {

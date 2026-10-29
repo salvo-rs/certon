@@ -1005,7 +1005,8 @@ pub struct CleanStorageResult {
     pub deleted_ocsp: usize,
 }
 
-/// Garbage-collect expired certificates and stale OCSP staples from storage.
+/// Garbage-collect expired certificates, stale OCSP staples and expired ARI
+/// state from storage.
 ///
 /// This function is intended to be called periodically (e.g. daily) to
 /// prevent unbounded growth of the storage backend.
@@ -1017,13 +1018,22 @@ pub struct CleanStorageResult {
 ///   `expired_cert_grace_period` is in the past.
 ///
 /// Callers must externally coordinate this operation with certificate issuance
-/// and renewal against the same storage. Reading expiry and deleting assets
-/// are separate operations, so cleanup must not race a writer publishing a
-/// replacement resource.
+/// and renewal, all instances' ARI refreshes/metadata upgrades, and any pending
+/// storage writes against the same backend. Reading expiry and deleting assets
+/// are separate operations without compare-and-delete, so cleanup must not race
+/// a writer publishing a replacement resource or sidecar.
 ///
 /// For OCSP staples:
 /// - Lists all entries under `ocsp/`.
 /// - Deletes those whose `modified` timestamp is older than `ocsp_max_age`.
+///
+/// For ARI state:
+/// - Deletes identity-matching version-1 sidecars only after their recorded leaf `notAfter` plus
+///   `expired_cert_grace_period` is strictly in the past.
+/// - The certificate resource need not still exist. Legacy sidecars lacking a recorded expiry are
+///   retained; active refreshes upgrade them from leaf DER.
+/// - Malformed, unknown-version, identity-mismatched or unrepresentable expiry records are
+///   retained. ARI deletion counts are logged, not included in the certificate or OCSP counters.
 ///
 /// # Errors
 ///
@@ -1203,6 +1213,8 @@ pub async fn clean_storage(
             }
         }
     }
+
+    crate::ari::clean_expired(storage, now, options.expired_cert_grace_period).await;
 
     Ok(result)
 }

@@ -8,6 +8,8 @@ use x509_parser::prelude::FromDer;
 use super::*;
 use crate::{CertIssuer, CertificateResource, IssuedCertificate, OcspConfig};
 
+mod retention;
+
 #[derive(Default)]
 struct Memory {
     data: Mutex<HashMap<String, Vec<u8>>>,
@@ -20,6 +22,7 @@ struct Memory {
     fail_marker: AtomicBool,
     ari_reads: AtomicUsize,
     load_gate: Mutex<Option<Arc<LoadGate>>>,
+    store_gate: Mutex<Option<Arc<LoadGate>>>,
 }
 
 struct LoadGate {
@@ -30,6 +33,13 @@ struct LoadGate {
 #[async_trait::async_trait]
 impl Storage for Memory {
     async fn store(&self, key: &str, data: &[u8]) -> Result<()> {
+        if key.starts_with("ari/") {
+            let gate = self.store_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.entered.notify_one();
+                gate.release.acquire().await.unwrap().forget();
+            }
+        }
         if key.starts_with("ari/")
             && (self.fail_ari.load(Ordering::SeqCst) || self.fail_ari_store.load(Ordering::SeqCst))
         {
