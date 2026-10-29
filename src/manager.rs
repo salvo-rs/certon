@@ -656,18 +656,15 @@ impl CertManager {
 
             // A rejected retry may have left the old leaf managed in cache.
             // Explicit resubmission must still be able to renew that due leaf.
-            let cached_certs = self.cache.all_matching_certificates(&domain).await;
-            let already_managed = cached_certs.iter().any(|c| {
-                c.managed
-                    && c.not_before <= chrono::Utc::now()
-                    && !c.expired()
-                    && !crate::ari::needs_renewal(
+            let already_managed = self
+                .cache
+                .has_usable_managed_certificate_where(&domain, |c| {
+                    !crate::ari::needs_renewal(
                         c,
                         self.policy.renewal_window_ratio,
                         self.policy.disable_ari,
                     )
-                    && c.ocsp_status != Some(OcspStatus::Revoked)
-            });
+                });
             if already_managed {
                 continue;
             }

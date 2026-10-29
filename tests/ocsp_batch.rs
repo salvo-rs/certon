@@ -736,3 +736,128 @@ async fn verified_leaf_revocation_quarantines_all_cached_chain_encodings() {
         "verified status for a leaf must apply to all cached chains of that same leaf"
     );
 }
+
+struct RecoveryIssuer(std::sync::atomic::AtomicUsize);
+#[async_trait::async_trait]
+impl certon::CertIssuer for RecoveryIssuer {
+    fn issuer_key(&self) -> String {
+        "batch-ca".into()
+    }
+    async fn issue(&self, _: &[u8], _: &[String]) -> certon::Result<certon::IssuedCertificate> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(certon::Error::Config(
+            "staple recovery must not request another certificate".into(),
+        ))
+    }
+}
+
+async fn recover_expired_good(api: &str) {
+    use certon::Storage;
+    let server = Server::new().await;
+    let fixture = Fixture::new(&server.url);
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(certon::FileStorage::new(directory.path()));
+    let issuer = Arc::new(RecoveryIssuer(std::sync::atomic::AtomicUsize::new(0)));
+    let manager = certon::CertManager::builder()
+        .storage(storage.clone())
+        .issuers(vec![issuer.clone()])
+        .disable_ari(true)
+        .build();
+    let resource = certon::CertificateResource {
+        sans: vec!["target.example".into()],
+        certificate_pem: fixture.pem.clone(),
+        private_key_pem: fixture.target_key_pem.as_bytes().to_vec(),
+        issuer_key: "batch-ca".into(),
+        issuer_data: None,
+    };
+    certon::storage::store_certificate(storage.as_ref(), "batch-ca", &resource)
+        .await
+        .unwrap();
+    let parsed =
+        certon::Certificate::from_pem(&fixture.pem, fixture.target_key_pem.as_bytes()).unwrap();
+    assert!(!parsed.needs_renewal(1.0 / 3.0));
+    let mut short = Single::new(Identity::Target);
+    short.start = Utc::now() - Duration::seconds(1);
+    short.end = Utc::now() + Duration::seconds(6);
+    let initial = fixture.response(&[short.clone()]);
+    server.responses.lock().unwrap().push_back(initial.clone());
+    storage
+        .store(
+            &certon::storage::ocsp_key("target.example", &parsed.hash),
+            &initial,
+        )
+        .await
+        .unwrap();
+    manager.cache_certificate("target.example").await.unwrap();
+    assert!(
+        tls_works(manager.cache.clone(), &fixture).await,
+        "initial signed Good must serve"
+    );
+    tokio::time::sleep(
+        (short.end - Utc::now()).to_std().unwrap_or_default()
+            + std::time::Duration::from_millis(50),
+    )
+    .await;
+    assert!(!parsed.expired());
+    assert!(
+        !tls_works(manager.cache.clone(), &fixture).await,
+        "expired staple must block a fresh Must-Staple leaf"
+    );
+    let fresh = fixture.response(&[Single::new(Identity::Target)]);
+    server.responses.lock().unwrap().push_back(fresh.clone());
+    match api {
+        "background" => {
+            manager
+                .manage_in_background(&["target.example".into()])
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if manager
+                        .cache
+                        .get_by_hash(&parsed.hash)
+                        .await
+                        .unwrap()
+                        .ocsp_response
+                        .as_ref()
+                        == Some(&fresh)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("background management did not install the recovered signed Good response");
+        }
+        "foreground" => manager
+            .manage(&["target.example".into()])
+            .await
+            .expect("foreground management must recover the staple"),
+        "renew" => manager.renew("target.example", false).await.unwrap(),
+        _ => unreachable!(),
+    }
+    let current = manager.cache.get_by_hash(&parsed.hash).await.unwrap();
+    assert_eq!(current.cert_chain, parsed.cert_chain);
+    assert_eq!(current.hash, parsed.hash);
+    assert_eq!(current.ocsp_response.as_ref(), Some(&fresh));
+    assert!(server.responses.lock().unwrap().is_empty());
+    assert!(
+        tls_works(manager.cache.clone(), &fixture).await,
+        "recovery must restore trusted same-leaf TLS"
+    );
+    assert_eq!(issuer.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn foreground_management_recovers_an_expired_good_staple() {
+    recover_expired_good("foreground").await;
+}
+#[tokio::test]
+async fn background_management_recovers_an_expired_good_staple() {
+    recover_expired_good("background").await;
+}
+#[tokio::test]
+async fn nonforced_renewal_recovers_an_expired_good_staple_without_issuing() {
+    recover_expired_good("renew").await;
+}

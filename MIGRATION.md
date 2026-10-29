@@ -640,3 +640,17 @@ reason. An extra inner SEQUENCE is no longer mistaken for the required encoding.
 Missing or invalid time metadata remains `None` while the status stays Revoked.
 Certificate identity, full signed-envelope verification and freshness checks
 retain their existing behavior.
+
+## Explicit Must-Staple recovery
+
+Explicit foreground and background management can recover a still-valid leaf
+whose previously signed Good OCSP staple has expired, without obtaining another
+certificate. Background shortcuts require the same candidate to be serviceable
+and not due for renewal; a due cached leaf remains eligible for resubmission.
+
+Managed duplicate admission may install an authenticated fresh Good response
+into an unusable Must-Staple entry only when its leaf identity and original
+metadata version still match. It retains the existing signing key and unrelated
+management metadata. A healthy current staple, concurrent status publication,
+verified revocation and leaf quarantine keep their existing protections. Raw
+metadata-only duplicate imports do not gain this recovery behavior.

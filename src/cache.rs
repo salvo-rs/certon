@@ -1328,6 +1328,43 @@ impl CertCache {
                     return Ok(false);
                 }
             }
+            // An explicit managed reload can recover a stable, unusable
+            // Must-Staple entry. Keep its signing key and all other metadata;
+            // only an authenticated Good for the same leaf may update OCSP.
+            // Any intervening metadata/status publication changes the held
+            // Arc version, so a delayed preparation must retain that update.
+            let recovered_deadline = state.certificates.get_mut(&cert.hash).and_then(|current| {
+                let now = Utc::now();
+                if !requires_staple
+                    || old_hash == Some(cert.hash.as_str())
+                    || key.verified_status != Some(crate::ocsp::OcspStatus::Good)
+                    || cert.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                    || leaf_hash.is_none()
+                    || leaf_hash != current.leaf_hash
+                    || current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
+                    || current.serving_key(now).is_some()
+                    || original
+                        .as_ref()
+                        .is_none_or(|original| !Arc::ptr_eq(original, &current.certificate))
+                {
+                    return None;
+                }
+                let validity = key.validity.filter(|validity| now < validity.expires_at)?;
+                let response = cert.ocsp_response.as_ref()?;
+                let mut container = current.unstapled_key.as_ref()?.as_ref().clone();
+                container.ocsp = Some(response.clone());
+                let old_deadline = current.ocsp_deadline();
+                let certificate = Arc::make_mut(&mut current.certificate);
+                certificate.ocsp_status = Some(crate::ocsp::OcspStatus::Good);
+                certificate.ocsp_response = Some(response.clone());
+                current.key = Some(Arc::new(container));
+                current.ocsp_validity = Some(validity);
+                current.ocsp_retry_after = None;
+                Some((old_deadline, current.ocsp_deadline()))
+            });
+            if let Some((old, new)) = recovered_deadline {
+                state.change_ocsp_deadline(&cert.hash, old, new);
+            }
             if let Some(current) = state.certificates.get(&cert.hash)
                 && ((requires_staple && old_hash != Some(cert.hash.as_str()))
                     || (old_hash == Some(cert.hash.as_str())
@@ -1622,6 +1659,16 @@ impl CertCache {
     /// entry as already managed successfully. Keep the same serving boundary
     /// without parsing DER or cloning private keys.
     pub(crate) fn has_usable_managed_certificate(&self, name: &str) -> bool {
+        self.has_usable_managed_certificate_where(name, |_| true)
+    }
+
+    /// Apply lifecycle eligibility to the same candidate whose serving key is
+    /// usable, rather than combining independent matches from sibling chains.
+    pub(crate) fn has_usable_managed_certificate_where(
+        &self,
+        name: &str,
+        eligible: impl Fn(&Certificate) -> bool,
+    ) -> bool {
         let state = self.state.read().unwrap_or_else(|e| e.into_inner());
         let now = Utc::now();
         state.matching(name).into_iter().any(|entry| {
@@ -1629,6 +1676,7 @@ impl CertCache {
                 && entry.certificate.not_before <= now
                 && now < entry.certificate.not_after
                 && entry.serving_key(now).is_some()
+                && eligible(&entry.certificate)
         })
     }
 
@@ -2306,8 +2354,9 @@ pub(crate) mod tests {
         // 0..3: existing OCSP/leaf quarantine races; 4..5: incoming verified
         // Revoked versus a concurrent Good update (replace/add); 6..9:
         // Must-Staple readiness versus Unknown/Revoked or duplicate admission;
-        // 10: a different chain for the same leaf becomes revoked during AIA.
-        for scenario in 0..11 {
+        // 10: a different chain for the same leaf becomes revoked during AIA;
+        // 11..12: a same-hash Unknown entry is inserted/reinserted during AIA.
+        for scenario in 0..13 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/issuer", listener.local_addr().unwrap());
             let issuer_key = rcgen::KeyPair::generate().unwrap();
@@ -2351,7 +2400,7 @@ pub(crate) mod tests {
             let hash = cert.hash.clone();
             let cache = CertCache::new(CacheOptions::default());
             let incoming_leaf = crate::storage::certificate_leaf_hash(&cert).unwrap();
-            let old = if matches!(scenario, 0 | 3 | 4 | 5 | 6 | 7 | 8) {
+            let old = if matches!(scenario, 0 | 3 | 4 | 5 | 6 | 7 | 8 | 12) {
                 cert.clone()
             } else if scenario == 10 {
                 // Omitting the trusted root is a valid alternate TLS chain.
@@ -2401,11 +2450,14 @@ pub(crate) mod tests {
                     socket.write_all(ca_cert.der()).await.unwrap();
                 }
             });
+            let mut concurrent_entry = cert.clone();
+            concurrent_entry.ocsp_status = Some(crate::ocsp::OcspStatus::Unknown);
+            concurrent_entry.ocsp_response = None;
             let worker = tokio::spawn({
                 let cache = cache.clone();
                 let hash = old_hash.clone();
                 async move {
-                    if matches!(scenario, 5 | 8) {
+                    if matches!(scenario, 5 | 8 | 11 | 12) {
                         cache.add_managed(cert, "ocsp.example.com").await
                     } else {
                         cache.replace_managed(&hash, cert, "ocsp.example.com").await
@@ -2415,7 +2467,7 @@ pub(crate) mod tests {
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .unwrap();
-            let expected_status = if matches!(scenario, 3 | 6 | 8 | 9) {
+            let expected_status = if matches!(scenario, 3 | 6 | 8 | 9 | 11 | 12) {
                 crate::ocsp::OcspStatus::Unknown
             } else {
                 crate::ocsp::OcspStatus::Revoked
@@ -2442,6 +2494,12 @@ pub(crate) mod tests {
                         .update_ocsp_if_present(&old_hash, Some(expected_status), None)
                         .await
                         .unwrap();
+                }
+                11 | 12 => {
+                    if scenario == 12 {
+                        cache.remove(&hash).await;
+                    }
+                    cache.add(concurrent_entry).await;
                 }
                 _ => unreachable!(),
             }
@@ -2542,6 +2600,105 @@ pub(crate) mod tests {
                 assert!(cache.next_ocsp_deadline().is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stable_managed_duplicate_recovers_ocsp_without_replacing_the_signing_key() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut imported, issuer) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        imported.tags = vec!["operator".into()];
+        let hash = imported.hash.clone();
+        cache.add(imported.clone()).await;
+        let original = cache.state.read().unwrap().certificates[&hash]
+            .certificate
+            .clone();
+        let signing = cache.state.read().unwrap().certificates[&hash]
+            .unstapled_key
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
+        assert!(cache.resolve("ocsp.example.com").is_none());
+        imported.managed = true;
+        imported.issuer_key = "managed-ca".into();
+        imported.tags = vec!["application".into()];
+        imported.ocsp_response = Some(signed_staple(&imported, &issuer, 120));
+        let response = imported.ocsp_response.clone();
+        cache
+            .add_managed(imported, "ocsp.example.com")
+            .await
+            .unwrap();
+        let current = cache.get_by_hash(&hash).await.unwrap();
+        assert!(current.managed);
+        assert_eq!(current.issuer_key, "managed-ca");
+        assert_eq!(current.tags, vec!["operator", "application"]);
+        assert_eq!(current.ocsp_response, response);
+        assert_eq!(current.ocsp_status, Some(crate::ocsp::OcspStatus::Good));
+        let selected = cache.resolve("ocsp.example.com").unwrap();
+        assert!(Arc::ptr_eq(&signing, &selected.key.key));
+        assert_eq!(selected.key.ocsp, response);
+        assert!(cache.next_ocsp_deadline().is_some());
+        assert!(!original.managed);
+        assert!(original.ocsp_response.is_none());
+        assert_eq!(original.tags, vec!["operator"]);
+        assert!(!Arc::ptr_eq(
+            &original,
+            &cache.state.read().unwrap().certificates[&hash].certificate
+        ));
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn duplicate_recovery_requires_the_existing_leaf_identity() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (existing, _) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        let hash = existing.hash.clone();
+        let original_leaf = crate::storage::certificate_leaf_hash(&existing);
+        cache.add(existing).await;
+        let (mut incoming, issuer) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        assert_ne!(
+            crate::storage::certificate_leaf_hash(&incoming),
+            original_leaf
+        );
+        incoming.hash = hash.clone();
+        incoming.managed = true;
+        incoming.ocsp_response = Some(signed_staple(&incoming, &issuer, 120));
+        assert!(
+            cache
+                .add_managed(incoming, "ocsp.example.com")
+                .await
+                .is_err()
+        );
+        let retained = cache.get_by_hash(&hash).await.unwrap();
+        assert_eq!(
+            crate::storage::certificate_leaf_hash(&retained),
+            original_leaf
+        );
+        assert!(retained.ocsp_response.is_none());
+        assert!(cache.resolve("ocsp.example.com").is_none());
+        assert_cache_indices(&cache);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_readiness_and_eligibility_must_match_the_same_certificate() {
+        let cache = CertCache::new(CacheOptions::default());
+        let (mut unusable, _) = crate::ocsp::tests::short_lived_certificate(Some(5));
+        unusable.managed = true;
+        unusable.issuer_key = "not-due".into();
+        cache.add(unusable).await;
+        let (mut usable, _) = signed_certificate();
+        usable.managed = true;
+        usable.issuer_key = "due".into();
+        cache.add(usable).await;
+        assert!(cache.has_usable_managed_certificate("ocsp.example.com"));
+        assert!(
+            !cache.has_usable_managed_certificate_where("ocsp.example.com", |cert| cert.issuer_key
+                == "not-due")
+        );
+        assert!(
+            cache.has_usable_managed_certificate_where("ocsp.example.com", |cert| cert.issuer_key
+                == "due")
+        );
     }
 
     #[tokio::test]
