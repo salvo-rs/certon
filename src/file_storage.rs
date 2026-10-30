@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -47,12 +48,25 @@ struct TemporaryWrite {
     path: PathBuf,
     file: Option<std::fs::File>,
     armed: bool,
+    // A cancelled async caller must not release its lifecycle locks while an
+    // owned blocking writer/commit can still change the stored value.
+    _locks: Vec<Arc<std::fs::File>>,
 }
 
 impl TemporaryWrite {
+    #[cfg(test)]
     fn write_with(
         path: PathBuf,
         _mode: u32,
+        write_and_sync: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        Self::write_with_locks(path, _mode, Vec::new(), write_and_sync)
+    }
+
+    fn write_with_locks(
+        path: PathBuf,
+        _mode: u32,
+        locks: Vec<Arc<std::fs::File>>,
         write_and_sync: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
         let mut options = std::fs::OpenOptions::new();
@@ -68,6 +82,7 @@ impl TemporaryWrite {
             path,
             file: Some(file),
             armed: true,
+            _locks: locks,
         };
         write_and_sync(
             temporary
@@ -85,8 +100,12 @@ impl TemporaryWrite {
 
     fn commit(mut self, destination: PathBuf) -> std::io::Result<()> {
         self.close();
+        #[cfg(test)]
+        commit_order_tests::pause_commit(&destination, commit_order_tests::Stage::BeforeRename);
         std::fs::rename(&self.path, &destination)?;
         self.armed = false;
+        #[cfg(test)]
+        commit_order_tests::pause_commit(&destination, commit_order_tests::Stage::AfterRename);
         #[cfg(unix)]
         if let Some(parent) = destination.parent() {
             std::fs::File::open(parent)?.sync_all()?;
@@ -145,6 +164,12 @@ impl Drop for TemporaryWrite {
 /// rename, that blocking commit can still publish the whole replacement.
 /// Until commit, the writer or its returned guard owns temporary-file cleanup,
 /// including when a cancelled caller never receives the blocking task result.
+/// Writes retain shared ownership of the OS locks held by this instance when
+/// the write starts. An unlock removes its registry entry immediately, but a
+/// submitted write keeps that OS lock until its commit or cleanup completes,
+/// even if its caller or runtime shuts down. The storage API does not identify
+/// which lock belongs to a write, so this can also briefly extend unrelated
+/// locks held by the same instance; it does not serialize independent writes.
 pub struct FileStorage {
     /// Root directory for all stored data.
     pub path: PathBuf,
@@ -154,7 +179,7 @@ pub struct FileStorage {
     pub lock_timeout: Duration,
 
     /// Open handles own OS locks; dropping a handle releases only that lock.
-    held_locks: Mutex<HashMap<String, std::fs::File>>,
+    held_locks: Mutex<HashMap<String, Arc<std::fs::File>>>,
 }
 
 impl FileStorage {
@@ -327,7 +352,12 @@ impl FileStorage {
     ///
     /// The file is written to a temporary location first, then renamed.  On
     /// Unix the file permission is set to `mode`.
-    async fn atomic_write(path: &Path, data: &[u8], _mode: u32) -> std::io::Result<()> {
+    async fn atomic_write(
+        path: &Path,
+        data: &[u8],
+        _mode: u32,
+        locks: Vec<Arc<std::fs::File>>,
+    ) -> std::io::Result<()> {
         if let Some(dir) = path.parent() {
             tokio::fs::create_dir_all(dir).await?;
             #[cfg(unix)]
@@ -345,7 +375,7 @@ impl FileStorage {
 
         let data = data.to_vec();
         let temporary = tokio::task::spawn_blocking(move || {
-            TemporaryWrite::write_with(temp_path, _mode, |file| {
+            TemporaryWrite::write_with_locks(temp_path, _mode, locks, |file| {
                 file.write_all(&data)?;
                 file.sync_all()
             })
@@ -407,7 +437,10 @@ impl FileStorage {
             .map_err(|e| StorageError::LockFailed(format!("locking file: {e}")))?;
             file = returned_file;
             if locked {
-                self.held_locks.lock().await.insert(name.to_owned(), file);
+                self.held_locks
+                    .lock()
+                    .await
+                    .insert(name.to_owned(), Arc::new(file));
                 return Ok(());
             }
             tokio::time::sleep(LOCK_POLL_INTERVAL).await;
@@ -460,7 +493,8 @@ impl Storage for FileStorage {
         // key (contains ".key" in path).
         let mode: u32 = if key.ends_with(".key") { 0o600 } else { 0o644 };
 
-        Self::atomic_write(&filename, value, mode)
+        let locks = self.held_locks.lock().await.values().cloned().collect();
+        Self::atomic_write(&filename, value, mode, locks)
             .await
             .map_err(|e| Error::from(StorageError::Io(e)))
     }
@@ -604,6 +638,8 @@ impl Storage for FileStorage {
         // There is no path-based check/remove operation and no renewal task.
         // A close may wait for blocking capacity. Release bookkeeping first so
         // it cannot hold up independent keys on another runtime.
+        // A submitted write may still own another Arc: that write releases the
+        // actual OS lock only after commit or temporary-file cleanup finishes.
         let file = {
             let mut held_locks = self.held_locks.lock().await;
             held_locks.remove(name)
@@ -616,6 +652,10 @@ impl Storage for FileStorage {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "file_storage/commit_order_tests.rs"]
+mod commit_order_tests;
 
 // ---------------------------------------------------------------------------
 // Helpers
