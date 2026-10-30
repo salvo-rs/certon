@@ -294,7 +294,7 @@ async fn round9_only_the_exact_account_missing_problem_may_replace_a_persisted_a
 }
 
 #[tokio::test]
-async fn public_new_order_still_reports_account_missing_as_an_order_error() {
+async fn public_new_order_reports_account_missing_as_a_structured_http_error() {
     for bad_nonce_first in [false, true] {
         let server = Server::start(false).await;
         {
@@ -318,7 +318,7 @@ async fn public_new_order_still_reports_account_missing_as_an_order_error() {
             .unwrap_err();
         assert!(matches!(
             &error,
-            certon::Error::Acme(certon::error::AcmeError::Order(_))
+            certon::Error::Acme(certon::error::AcmeError::HttpResponse { status: 400, .. })
         ));
         assert!(
             error.to_string().contains("accountDoesNotExist")
@@ -408,7 +408,7 @@ async fn account_lookup_accepts_only_the_exact_missing_account_problem() {
         let key=certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
         let result=client.find_account(&key).await;
         if missing { assert!(matches!(result,Ok(None))); }
-        else { assert!(matches!(result,Err(certon::Error::Acme(certon::error::AcmeError::Account(_))))); }
+        else { assert!(matches!(result,Err(certon::Error::Acme(certon::error::AcmeError::HttpResponse { status: actual, .. })) if actual == status)); }
         // Ordinary account lookup remains a public successful Option result.
         assert!(client.find_account(&key).await.unwrap().is_some());
     }

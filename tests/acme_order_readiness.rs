@@ -614,7 +614,7 @@ async fn initial_invalid_finalization_keeps_its_error_and_public_poll_still_wait
 }
 
 #[tokio::test]
-async fn oversized_not_ready_problem_remains_an_order_error_without_recovery() {
+async fn oversized_not_ready_problem_retains_http_status_without_recovery() {
     let mut plan = Plan::ready();
     plan.rejection = Some((403, json!({"type":NOT_READY,"detail":"x".repeat(128*1024)})));
     let server = Server::new(plan).await;
@@ -632,7 +632,11 @@ async fn oversized_not_ready_problem_remains_an_order_error_without_recovery() {
         .unwrap_err();
     assert!(matches!(
         error,
-        certon::Error::Acme(certon::error::AcmeError::Order(_))
+        certon::Error::Acme(certon::error::AcmeError::HttpResponse {
+            status: 403,
+            problem_type: None,
+            ..
+        })
     ));
     assert!(error.to_string().contains("exceeds"));
     assert_eq!(server.count("/order"), 0);

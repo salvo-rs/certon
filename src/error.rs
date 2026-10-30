@@ -43,6 +43,21 @@ pub enum AcmeError {
     #[error("order error: {0}")]
     Order(String),
 
+    /// An unsuccessful HTTP response to a signed ACME request.
+    ///
+    /// `status` is the actual HTTP status, never the optional status in the
+    /// provider's problem document. Protocol-specific recovery is attempted
+    /// before returning this error. See `MIGRATION.md` for match migration.
+    #[error("ACME HTTP {status}: {message}")]
+    HttpResponse {
+        /// Actual HTTP response status code.
+        status: u16,
+        /// Full problem type URI, if the bounded response is a problem document.
+        problem_type: Option<String>,
+        /// Diagnostic endpoint origin and bounded provider detail/read error.
+        message: String,
+    },
+
     /// Authorization failed.
     #[error("authorization error: {0}")]
     Authorization(String),

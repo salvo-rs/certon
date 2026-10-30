@@ -472,8 +472,27 @@ impl std::fmt::Display for AcmeProblem {
 
 const ACCOUNT_DOES_NOT_EXIST: &str = "urn:ietf:params:acme:error:accountDoesNotExist";
 
-/// Issuer-only classification; public order APIs keep returning the existing
-/// error type even for an account-missing response.
+fn http_response_error(
+    status: reqwest::StatusCode,
+    endpoint: &str,
+    problem: Option<AcmeProblem>,
+    fallback: &str,
+) -> AcmeError {
+    let problem_type = problem
+        .as_ref()
+        .map(|problem| &problem.problem_type)
+        .filter(|kind| !kind.is_empty())
+        .cloned();
+    let detail = problem.map_or_else(|| fallback.to_owned(), |problem| problem.to_string());
+    AcmeError::HttpResponse {
+        status: status.as_u16(),
+        problem_type,
+        message: format!("{}: {detail}", diagnostic_endpoint(endpoint)),
+    }
+}
+
+/// Issuer-only recovery; public order APIs return a structured HTTP error for
+/// an account-missing response instead of silently registering again.
 pub(crate) enum NewOrderOutcome {
     Created(Box<AcmeOrder>, String),
     AccountDoesNotExist,
@@ -994,7 +1013,8 @@ impl AcmeClient {
     }
 
     /// Only an explicit caller may recognize a problem with its actual HTTP
-    /// status and complete type URI. Other POSTs retain their original errors.
+    /// status and complete type URI. Unaccepted HTTP failures retain structured
+    /// status/type metadata for retry classification.
     async fn acme_post_accepting_problem(
         &self,
         account_key: &PrivateKey,
@@ -1039,22 +1059,14 @@ impl AcmeClient {
             if status.as_u16() != 400 {
                 self.cache_nonce(&resp).await;
             }
-            if status.as_u16() == 400
-                || accepted_problem.is_some_and(|(code, _)| status.as_u16() == code)
-            {
+            if !status.is_success() {
                 // Peek at the body to see if it's a badNonce error.
                 let resp_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
                     .await
-                    .map_err(|e| {
-                        if status.as_u16() == 400 {
-                            AcmeError::Nonce(e.to_string())
-                        } else {
-                            AcmeError::Order(e.to_string())
-                        }
-                    })?;
+                    .map_err(|error| http_response_error(status, url, None, &error.to_string()))?;
 
-                let problem = serde_json::from_slice::<AcmeProblem>(&resp_bytes);
-                let bad_nonce = problem.as_ref().is_ok_and(|problem| {
+                let problem = serde_json::from_slice::<AcmeProblem>(&resp_bytes).ok();
+                let bad_nonce = problem.as_ref().is_some_and(|problem| {
                     problem.problem_type == "urn:ietf:params:acme:error:badNonce"
                 }) && status.as_u16() == 400;
                 if bad_nonce && attempt == 0 {
@@ -1079,28 +1091,18 @@ impl AcmeClient {
                     *self.nonce.lock().await = Some(nonce);
                 }
 
-                // Not a badNonce error; return an error with the body we already read.
-                let detail = match problem {
-                    Ok(p)
-                        if accepted_problem == Some((status.as_u16(), p.problem_type.as_str())) =>
-                    {
-                        return Ok(None);
-                    }
-                    Ok(p) => format!("{p}"),
-                    Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
-                };
-                let message = if status.as_u16() == 400 {
-                    format!(
-                        "ACME request to {} failed (HTTP 400): {detail}",
-                        diagnostic_endpoint(url)
-                    )
-                } else {
-                    format!(
-                        "ACME {} returned HTTP {status}: {detail}",
-                        diagnostic_endpoint(url)
-                    )
-                };
-                return Err(AcmeError::Order(message).into());
+                if problem.as_ref().is_some_and(|problem| {
+                    accepted_problem == Some((status.as_u16(), problem.problem_type.as_str()))
+                }) {
+                    return Ok(None);
+                }
+                return Err(http_response_error(
+                    status,
+                    url,
+                    problem,
+                    &String::from_utf8_lossy(&resp_bytes),
+                )
+                .into());
             }
 
             return Ok(Some(resp));
@@ -1140,27 +1142,11 @@ impl AcmeClient {
             return Ok(None);
         };
 
-        let status = resp.status();
         let location = resp
             .headers()
             .get("location")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_owned());
-
-        if !status.is_success() {
-            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME error")
-                .await
-                .map_err(|e| AcmeError::Order(e.to_string()))?;
-            let detail = match serde_json::from_slice::<AcmeProblem>(&body) {
-                Ok(p) => format!("{p}"),
-                Err(_) => String::from_utf8_lossy(&body).into_owned(),
-            };
-            return Err(AcmeError::Order(format!(
-                "ACME {} returned HTTP {status}: {detail}",
-                diagnostic_endpoint(url)
-            ))
-            .into());
-        }
 
         let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME JSON")
             .await
@@ -1270,7 +1256,13 @@ impl AcmeClient {
                 Some((400, ACCOUNT_DOES_NOT_EXIST)),
             )
             .await
-            .map_err(|error| AcmeError::Account(error.to_string()))?;
+            .map_err(|error| {
+                if matches!(&error, crate::Error::Acme(AcmeError::HttpResponse { .. })) {
+                    error
+                } else {
+                    AcmeError::Account(error.to_string()).into()
+                }
+            })?;
         let Some((acct_resp, account_url)) = response else {
             return Ok(None);
         };
@@ -1855,13 +1847,6 @@ impl AcmeClient {
         let mut response = self
             .acme_post(account_key, Some(account_url), cert_url, None)
             .await?;
-        if !response.status().is_success() {
-            return Err(AcmeError::Certificate(format!(
-                "certificate download returned HTTP {}",
-                response.status()
-            ))
-            .into());
-        }
         let links = alternate_certificate_links(response.headers(), response.url());
         if response
             .content_length()
@@ -1925,7 +1910,7 @@ impl AcmeClient {
             AcmeError::Certificate(format!("failed to serialize revoke request: {e}"))
         })?;
 
-        let Some(resp) = self
+        let Some(_resp) = self
             .acme_post_accepting_problem(
                 account_key,
                 Some(account_url),
@@ -1940,21 +1925,6 @@ impl AcmeClient {
             debug!("certificate was already revoked");
             return Ok(());
         };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME revocation error")
-                .await
-                .map_err(|e| AcmeError::Certificate(e.to_string()))?;
-            let detail = match serde_json::from_slice::<AcmeProblem>(&body) {
-                Ok(p) => format!("{p}"),
-                Err(_) => String::from_utf8_lossy(&body).into_owned(),
-            };
-            return Err(AcmeError::Certificate(format!(
-                "certificate revocation failed (HTTP {status}): {detail}",
-            ))
-            .into());
-        }
 
         debug!("certificate revoked");
         Ok(())
