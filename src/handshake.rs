@@ -72,7 +72,8 @@ pub struct OnDemandConfig {
 
     /// An explicit set of hostnames for which on-demand issuance is permitted.
     ///
-    /// Lookups are case-insensitive (names are lowercased before checking).
+    /// Lookups are case-insensitive: configured entries are lowercased once
+    /// when attached to a resolver, and server names are lowercased on lookup.
     /// If `None`, this check is skipped.
     pub host_allowlist: Option<HashSet<String>>,
 
@@ -235,6 +236,17 @@ impl CertResolver {
     /// SNI name, the resolver checks [`OnDemandConfig`] to decide whether
     /// to trigger background certificate acquisition.
     pub fn with_on_demand(cache: Arc<CertCache>, on_demand: Arc<OnDemandConfig>) -> Self {
+        // Prepare the set once; handshakes retain a single hash lookup rather
+        // than scanning configured entries. Preserve the caller's shared config.
+        let on_demand = Arc::new(OnDemandConfig {
+            decision_func: on_demand.decision_func.clone(),
+            host_allowlist: on_demand
+                .host_allowlist
+                .as_ref()
+                .map(|entries| entries.iter().map(|name| name.to_lowercase()).collect()),
+            rate_limit: on_demand.rate_limit.clone(),
+            obtain_func: on_demand.obtain_func.clone(),
+        });
         Self {
             cache,
             on_demand: Some(on_demand),

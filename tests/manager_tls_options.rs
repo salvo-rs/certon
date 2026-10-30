@@ -75,6 +75,142 @@ fn handshake(
     panic!("handshake did not finish");
 }
 
+// Exercise admission through a real rustls ClientHello. The empty cache has no
+// certificate, so this initial handshake must fail even when obtain is admitted.
+async fn allowlist_admission(
+    manager_path: bool,
+    entries: Option<&[&str]>,
+    decision: Option<bool>,
+    sni: &str,
+) -> (Vec<String>, Vec<String>) {
+    certon::install_default_crypto_provider();
+    let directory = tempfile::tempdir().unwrap();
+    let obtains = Arc::new(Mutex::new(Vec::new()));
+    let decisions = Arc::new(Mutex::new(Vec::new()));
+    let configured = Arc::new(OnDemandConfig {
+        host_allowlist: entries
+            .map(|entries| entries.iter().map(|entry| (*entry).into()).collect()),
+        decision_func: decision.map(|answer| {
+            let decisions = decisions.clone();
+            Arc::new(move |name: &str| {
+                decisions.lock().unwrap().push(name.to_owned());
+                answer
+            }) as Arc<dyn Fn(&str) -> bool + Send + Sync>
+        }),
+        rate_limit: None,
+        obtain_func: Some(Arc::new({
+            let obtains = obtains.clone();
+            move |name| {
+                let obtains = obtains.clone();
+                Box::pin(async move {
+                    obtains.lock().unwrap().push(name);
+                    Ok(())
+                })
+            }
+        })),
+    });
+    let original = configured.host_allowlist.clone();
+    let config = if manager_path {
+        CertManager::builder()
+            .storage(Arc::new(FileStorage::new(directory.path())))
+            .on_demand(configured.clone())
+            .build()
+            .server_config()
+    } else {
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(certon::handshake::CertResolver::with_on_demand(
+                CertCache::new(CacheOptions::default()),
+                configured.clone(),
+            )))
+    };
+    assert_eq!(
+        configured.host_allowlist, original,
+        "resolver setup must preserve the caller's shared configuration"
+    );
+    assert!(
+        handshake(
+            Arc::new(config),
+            &[],
+            sni,
+            SignatureScheme::ECDSA_NISTP256_SHA256
+        )
+        .is_err()
+    );
+    // With paused Tokio time, runnable obtain tasks finish before the timer
+    // advances. A wrongly admitted task cannot hide behind scheduler latency.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let obtains = obtains.lock().unwrap().clone();
+    let decisions = decisions.lock().unwrap().clone();
+    (obtains, decisions)
+}
+
+#[tokio::test(start_paused = true)]
+async fn configured_and_client_hostname_case_admit_the_same_on_demand_work() {
+    let cases: &[(&[&str], &str, bool)] = &[
+        (&["example.com"], "example.com", true),
+        (&["example.com"], "ExAmPlE.CoM", true),
+        (&["Example.COM"], "example.com", true),
+        (&["Example.COM"], "ExAmPlE.CoM", true),
+        (&["Example.COM", "example.com"], "EXAMPLE.COM", true),
+        (&["Other.Example"], "example.com", false),
+    ];
+    let mut failures = Vec::new();
+    for manager_path in [false, true] {
+        for &(allowed, sni, expected) in cases {
+            let (obtains, decisions) =
+                allowlist_admission(manager_path, Some(allowed), None, sni).await;
+            let expected_names = if expected {
+                vec!["example.com"]
+            } else {
+                Vec::new()
+            };
+            eprintln!("manager={manager_path} allowed={allowed:?} sni={sni} obtains={obtains:?}");
+            if obtains != expected_names {
+                failures.push(format!(
+                    "manager={manager_path} allowed={allowed:?} sni={sni}: {obtains:?}"
+                ));
+            }
+            assert!(decisions.is_empty());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn normalized_allowlists_preserve_decision_authority_and_default_denial() {
+    type AdmissionCase<'a> = (Option<&'a [&'a str]>, Option<bool>, bool);
+    let cases: &[AdmissionCase<'_>] = &[
+        (Some(&["Example.COM"]), Some(false), false),
+        (Some(&["Other.Example"]), Some(true), true),
+        (None, Some(true), true),
+        (None, None, false),
+        (Some(&[]), None, false),
+    ];
+    for manager_path in [false, true] {
+        for &(entries, decision, expected) in cases {
+            let (obtains, decisions) =
+                allowlist_admission(manager_path, entries, decision, "ExAmPlE.CoM").await;
+            assert_eq!(
+                obtains,
+                if expected {
+                    vec!["example.com"]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert_eq!(
+                decisions,
+                if decision.is_some() {
+                    vec!["example.com"]
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+}
+
 struct CsrPublicKey(Vec<u8>);
 impl PublicKeyData for CsrPublicKey {
     fn der_bytes(&self) -> &[u8] {
@@ -244,7 +380,7 @@ async fn absent_callback_uses_manager_to_obtain_publish_and_serve_next_handshake
         })
         .on_demand(Arc::new(OnDemandConfig {
             decision_func: None,
-            host_allowlist: Some(["example.com".into()].into()),
+            host_allowlist: Some(["Example.COM".into()].into()),
             rate_limit: None,
             obtain_func: None,
         }))
@@ -263,7 +399,7 @@ async fn absent_callback_uses_manager_to_obtain_publish_and_serve_next_handshake
         handshake(
             config.clone(),
             std::slice::from_ref(&issuer.root),
-            "example.com",
+            "ExAmPlE.CoM",
             SignatureScheme::ECDSA_NISTP256_SHA256
         )
         .is_err()
