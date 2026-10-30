@@ -98,7 +98,7 @@ fn zerossl_request_error(action: &str, e: reqwest::Error) -> Error {
 #[derive(Debug, Deserialize)]
 struct EabCredentialsResponse {
     /// Whether the request succeeded.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_eab_success")]
     success: bool,
     /// The EAB key identifier.
     eab_kid: Option<String>,
@@ -106,6 +106,22 @@ struct EabCredentialsResponse {
     eab_hmac_key: Option<String>,
     /// Error details, if the request failed.
     error: Option<serde_json::Value>,
+}
+
+// ZeroSSL documents the EAB success flag as integer 1. Keep the existing
+// boolean representation compatible without treating other JSON as truthy.
+fn deserialize_eab_success<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<bool, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Bool(value) => Ok(value),
+        serde_json::Value::Number(value) => match value.as_u64() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            _ => Err(serde::de::Error::custom("invalid ZeroSSL EAB success flag")),
+        },
+        _ => Err(serde::de::Error::custom("invalid ZeroSSL EAB success flag")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +172,8 @@ impl ZeroSslIssuer {
             dns01_solver: None,
             http01_solver: None,
             tlsalpn01_solver: None,
+            #[cfg(test)]
+            eab_origin: None,
         }
     }
 
@@ -171,6 +189,8 @@ impl ZeroSslIssuer {
 
 #[cfg(test)]
 mod ari_tests;
+#[cfg(test)]
+mod eab_tests;
 
 #[async_trait]
 impl CertIssuer for ZeroSslIssuer {
@@ -210,8 +230,21 @@ impl Revoker for ZeroSslIssuer {
 ///
 /// This makes a POST request to ZeroSSL's EAB endpoint and returns the
 /// [`ExternalAccountBinding`] that can be used with ACME registration.
-async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> {
+async fn fetch_eab_credentials(
+    api_key: &str,
+    #[cfg(test)] origin: Option<&Url>,
+) -> Result<ExternalAccountBinding> {
     let url = zerossl_url(ZEROSSL_EAB_ENDPOINT, api_key)?;
+    #[cfg(test)]
+    let url = if let Some(origin) = origin {
+        let mut url = url;
+        url.set_scheme(origin.scheme()).unwrap();
+        url.set_host(origin.host_str()).unwrap();
+        url.set_port(origin.port()).unwrap();
+        url
+    } else {
+        url
+    };
 
     debug!("fetching EAB credentials from ZeroSSL API");
 
@@ -225,25 +258,33 @@ async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> 
     let status = resp.status();
     if !status.is_success() {
         let body = zerossl_error_body(resp, "ZeroSSL EAB error").await?;
-        return Err(Error::Other(format!(
-            "ZeroSSL EAB endpoint returned HTTP {status}: {body}"
-        )));
+        let error = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|body| body.get("error").cloned());
+        return Err(eab_failure(
+            &format!("ZeroSSL EAB endpoint returned HTTP {status}"),
+            error.as_ref(),
+        ));
     }
 
-    let eab_resp: EabCredentialsResponse = zerossl_json(resp, "ZeroSSL EAB").await?;
+    let body =
+        crate::http::read_body_limited(resp, crate::http::MAX_JSON_BODY_BYTES, "ZeroSSL EAB")
+            .await?;
+    // Serde diagnostics can quote a malformed field value. Never echo an EAB
+    // response: it can contain both the account binding and the API key.
+    let eab_resp: EabCredentialsResponse = serde_json::from_slice(&body)
+        .map_err(|_| Error::Other("failed to parse ZeroSSL EAB JSON response".into()))?;
 
-    if !eab_resp.success {
-        let detail = eab_resp
-            .error
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "unknown error".to_owned());
-        return Err(Error::Other(format!(
-            "ZeroSSL EAB request failed: {detail}"
-        )));
+    if !eab_resp.success || eab_resp.error.is_some() {
+        return Err(eab_failure(
+            "ZeroSSL EAB request failed",
+            eab_resp.error.as_ref(),
+        ));
     }
 
     let kid = eab_resp
         .eab_kid
+        .filter(|kid| !kid.is_empty())
         .ok_or_else(|| Error::Other("ZeroSSL EAB response missing eab_kid".to_owned()))?;
     let hmac_key_b64 = eab_resp
         .eab_hmac_key
@@ -256,10 +297,26 @@ async fn fetch_eab_credentials(api_key: &str) -> Result<ExternalAccountBinding> 
     let hmac_key = URL_SAFE_NO_PAD
         .decode(&hmac_key_b64)
         .map_err(|e| Error::Other(format!("failed to decode ZeroSSL HMAC key: {e}")))?;
+    if hmac_key.is_empty() {
+        return Err(Error::Other(
+            "ZeroSSL EAB response has an empty HMAC key".into(),
+        ));
+    }
 
-    info!(kid = %kid, "obtained EAB credentials from ZeroSSL");
+    info!("obtained EAB credentials from ZeroSSL");
 
     Ok(ExternalAccountBinding { kid, hmac_key })
+}
+
+// Keep the provider's numeric diagnostic, never its arbitrary strings or body.
+fn eab_failure(message: &str, error: Option<&serde_json::Value>) -> Error {
+    match error
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(code) => Error::Other(format!("{message} (error code {code})")),
+        None => Error::Other(message.to_owned()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +339,8 @@ pub struct ZeroSslIssuerBuilder {
     dns01_solver: Option<Arc<dyn Solver>>,
     http01_solver: Option<Arc<dyn Solver>>,
     tlsalpn01_solver: Option<Arc<dyn Solver>>,
+    #[cfg(test)]
+    eab_origin: Option<Url>,
 }
 
 impl ZeroSslIssuerBuilder {
@@ -373,7 +432,12 @@ impl ZeroSslIssuerBuilder {
         );
 
         // Fetch EAB credentials from ZeroSSL.
-        let eab = fetch_eab_credentials(&self.api_key).await?;
+        let eab = fetch_eab_credentials(
+            &self.api_key,
+            #[cfg(test)]
+            self.eab_origin.as_ref(),
+        )
+        .await?;
 
         // Build the inner AcmeIssuer with ZeroSSL's ACME directory and EAB.
         let mut acme_builder = AcmeIssuer::builder()
