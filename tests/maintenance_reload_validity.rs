@@ -222,6 +222,11 @@ async fn maintenance_keeps_valid_leaf_when_future_or_expired_storage_and_renewal
         // Once the CA recovers, the normal renewal path must issue and publish
         // a currently valid leaf rather than getting stuck on future B.
         fixture.issuer.fail.store(false, Ordering::SeqCst);
+        // Maintenance now retains at least a 60-second failed-attempt deadline.
+        // Advance only that monotonic backoff; certificate validity uses UTC.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
         wait_for(|| outcomes.lock().unwrap().contains(&true)).await;
         let renewed = fixture.handshake().await;
         assert_ne!(renewed, fixture.old.cert_chain[0].as_ref());

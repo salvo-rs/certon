@@ -78,7 +78,7 @@ impl CertStore for GatedStore {
     }
 }
 
-fn certificate(domain: &str, fresh: bool) -> (CertificateResource, Certificate) {
+pub(super) fn certificate(domain: &str, fresh: bool) -> (CertificateResource, Certificate) {
     let mut params =
         rcgen::CertificateParams::new(vec![domain.to_owned(), format!("alias.{domain}")]).unwrap();
     let now = std::time::SystemTime::now();
@@ -244,7 +244,7 @@ async fn queued_jobs_recheck_management_identity_and_ari_before_any_preflight_io
         assert_eq!(jobs.len().await, 2);
         withdraw(&cache, &old, mutation).await;
         release.add_permits(1);
-        jobs.wait("renew_stale.example").await;
+        wait_for_renewal_jobs(&jobs).await;
         assert_eq!(store.loads.load(Ordering::SeqCst), 0, "{mutation}");
         assert_eq!(callbacks.load(Ordering::SeqCst), 0, "{mutation}");
         jobs.shutdown().await;
@@ -269,7 +269,7 @@ async fn in_flight_preflight_cannot_restore_withdrawn_management_or_invoke_renew
         store.wait_started(1).await;
         withdraw(&cache, &old, mutation).await;
         store.release.add_permits(1);
-        jobs.wait("renew_stale.example").await;
+        wait_for_renewal_jobs(&jobs).await;
         assert!(
             cache.get_by_hash(&replacement.hash).await.is_none(),
             "{mutation}"
@@ -380,7 +380,7 @@ async fn own_marker_hit_and_read_failure_stop_preflight_and_renewal() {
         policy.revocations = markers.clone();
         let jobs = JobQueue::certificate_jobs("own-marker");
         check_renewals_with_policy(&cache, &policy, &jobs).await;
-        jobs.wait("renew_marker.example").await;
+        wait_for_renewal_jobs(&jobs).await;
         assert_eq!(markers.reads.load(Ordering::SeqCst), 1, "{response}");
         assert_eq!(
             store.loads.load(Ordering::SeqCst),
@@ -492,7 +492,7 @@ async fn own_marker_wait_rechecks_withdrawal_identity_and_ari_before_preflight()
         markers.wait_started(1).await;
         withdraw(&cache, &old, mutation).await;
         markers.release.add_permits(1);
-        jobs.wait("renew_stale.example").await;
+        wait_for_renewal_jobs(&jobs).await;
         assert_eq!(store.loads.load(Ordering::SeqCst), 0, "{mutation}");
         assert_eq!(callbacks.load(Ordering::SeqCst), 0, "{mutation}");
         assert_eq!(markers.active.load(Ordering::SeqCst), 0);
