@@ -260,6 +260,8 @@ struct CachedCertificate {
     unstapled_key: Option<Arc<CertifiedKey>>,
     ocsp_validity: Option<OcspValidity>,
     ocsp_retry_after: Option<DateTime<Utc>>,
+    // Confirmed, unchanged responder successes, separate from public metadata.
+    ocsp_unchanged_refreshes: u8,
     must_staple: bool,
     managed_index: Option<usize>,
     ari_unpersisted: Option<Option<String>>,
@@ -374,6 +376,30 @@ impl CachedCertificate {
             (None, retry) => retry,
         }
     }
+}
+
+// Only confirmed, unchanged Good responses far from expiry use the longer
+// retry. Errors/cached fallbacks/changed responses retain the short deadline.
+fn ocsp_retry_delay(
+    now: DateTime<Utc>,
+    validity: Option<OcspValidity>,
+    unchanged_refreshes: u8,
+    jitter_percent: u32,
+) -> chrono::Duration {
+    if let Some(validity) = validity
+        && unchanged_refreshes > 0
+        && validity.expires_at - now > chrono::Duration::hours(1)
+    {
+        let seconds = (30_i64 << unchanged_refreshes.min(4)).min(300);
+        let remaining = validity.expires_at - now;
+        return (chrono::Duration::seconds(seconds) * jitter_percent.clamp(80, 100) as i32 / 100)
+            .min(remaining / 8)
+            .min((remaining - chrono::Duration::hours(1)).max(chrono::Duration::seconds(1)));
+    }
+    validity.map_or(chrono::Duration::seconds(30), |validity| {
+        ((validity.expires_at - now) / 2)
+            .clamp(chrono::Duration::seconds(1), chrono::Duration::seconds(30))
+    })
 }
 
 /// Renewal policy at the OCSP update's cache linearization point.
@@ -499,6 +525,7 @@ impl CacheState {
         cert.ocsp_response = None;
         current.key = current.unstapled_key.clone();
         current.ocsp_validity = None;
+        current.ocsp_unchanged_refreshes = 0;
         current.ocsp_retry_after = (cert.managed || old_deadline.is_some())
             .then(|| Utc::now() + chrono::Duration::seconds(30));
         let new_deadline = current.ocsp_deadline();
@@ -753,6 +780,7 @@ impl CacheState {
                 unstapled_key: key.unstapled,
                 ocsp_validity: key.validity,
                 ocsp_retry_after: retry_after,
+                ocsp_unchanged_refreshes: 0,
                 must_staple: key.must_staple,
                 managed_index,
                 ari_unpersisted: None,
@@ -1386,6 +1414,7 @@ impl CertCache {
                 current.key = Some(Arc::new(container));
                 current.ocsp_validity = Some(validity);
                 current.ocsp_retry_after = None;
+                current.ocsp_unchanged_refreshes = 0;
                 Some((old_deadline, current.ocsp_deadline()))
             });
             if let Some((old, new)) = recovered_deadline {
@@ -1520,6 +1549,17 @@ impl CertCache {
         status: Option<crate::ocsp::OcspStatus>,
         response: Option<Vec<u8>>,
     ) -> Option<OcspUpdateState> {
+        self.update_ocsp_after_refresh(hash, status, response, None)
+            .await
+    }
+
+    pub(crate) async fn update_ocsp_after_refresh(
+        &self,
+        hash: &str,
+        status: Option<crate::ocsp::OcspStatus>,
+        response: Option<Vec<u8>>,
+        refresh: Option<(&Arc<Certificate>, &crate::ocsp::OcspRefreshOutcome)>,
+    ) -> Option<OcspUpdateState> {
         let (certificate, observed_leaf) = {
             let state = self.state.read().unwrap_or_else(|e| e.into_inner());
             let entry = state.certificates.get(hash)?;
@@ -1547,7 +1587,6 @@ impl CertCache {
         } else {
             response
         };
-        drop(certificate);
         let options = self
             .options
             .read()
@@ -1566,11 +1605,33 @@ impl CertCache {
                 .get_mut(hash)
                 .filter(|entry| entry.leaf_hash == observed_leaf)
                 .map(|current| {
+                    let now = Utc::now();
                     let old_deadline = current.ocsp_deadline();
                     let was_scheduled = old_deadline.is_some();
                     let keep_revoked = current.certificate.ocsp_status
                         == Some(crate::ocsp::OcspStatus::Revoked)
                         && status != Some(crate::ocsp::OcspStatus::Revoked);
+                    let unchanged = !keep_revoked
+                        && Arc::ptr_eq(&current.certificate, &certificate)
+                        && current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Good)
+                        && status == Some(crate::ocsp::OcspStatus::Good)
+                        && current
+                            .ocsp_validity
+                            .is_some_and(|old| now < old.expires_at)
+                        && validity
+                            .is_some_and(|new| new.expires_at - now > chrono::Duration::hours(1))
+                        && response.as_ref().is_some_and(|raw| {
+                            current.certificate.ocsp_response.as_ref() == Some(raw)
+                                && refresh.is_some_and(|(expected, proof)| {
+                                    Arc::ptr_eq(expected, &current.certificate)
+                                        && proof.confirms_good(raw)
+                                })
+                        });
+                    current.ocsp_unchanged_refreshes = if unchanged {
+                        current.ocsp_unchanged_refreshes.saturating_add(1).min(4)
+                    } else {
+                        0
+                    };
                     if !keep_revoked {
                         let certificate = Arc::make_mut(&mut current.certificate);
                         certificate.ocsp_status = status;
@@ -1593,11 +1654,12 @@ impl CertCache {
                         || was_scheduled
                         || current.certificate.ocsp_status == Some(crate::ocsp::OcspStatus::Revoked)
                     {
-                        let now = Utc::now();
-                        let delay = validity.map_or(chrono::Duration::seconds(30), |validity| {
-                            ((validity.expires_at - now) / 2)
-                                .clamp(chrono::Duration::seconds(1), chrono::Duration::seconds(30))
-                        });
+                        let delay = ocsp_retry_delay(
+                            now,
+                            validity,
+                            current.ocsp_unchanged_refreshes,
+                            rand::rng().random_range(80..=100),
+                        );
                         Some(now + delay)
                     } else {
                         None
@@ -2046,7 +2108,21 @@ fn normalize_options(mut opts: CacheOptions) -> CacheOptions {
 mod leaf_revocation_tests;
 
 #[cfg(test)]
+mod ocsp_backoff_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
+    // Simulate crossing the indexed deadline without confusing Tokio's paused
+    // monotonic clock with the wall clock used by signed OCSP validity checks.
+    pub(crate) fn force_ocsp_due(cache: &CertCache, hash: &str) {
+        let mut state = cache.state.write().unwrap();
+        let entry = state.certificates.get_mut(hash).unwrap();
+        let old = entry.ocsp_deadline();
+        entry.ocsp_retry_after = Some(Utc::now() - chrono::Duration::seconds(1));
+        let new = entry.ocsp_deadline();
+        state.change_ocsp_deadline(hash, old, new);
+    }
+
     pub(crate) fn signed_certificate() -> (Certificate, rcgen::KeyPair) {
         let (chain, issuer, key) = crate::ocsp::tests::signed_chain();
         let pem: String = chain

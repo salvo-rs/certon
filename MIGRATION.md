@@ -1089,3 +1089,27 @@ The candidate fields are described by ZeroSSL's
 The form field and certificate-object response follow the original
 [ZeroSSL Go SDK's VerifyIdentifiers implementation](https://github.com/caddyserver/zerossl/blob/d35655e3db16c1a450ccaeeac443b05abbe47993/endpoints.go#L42).
 This change applies to the REST issuer; `ZeroSslIssuer` continues to use ACME.
+
+## Maintenance retries for unchanged OCSP Good responses
+
+The first proactive OCSP refresh still occurs at the signed response's existing
+refresh deadline. If the responder successfully returns the same verified,
+still-fresh Good bytes, maintenance now retries after 60, 120, 240, then at most
+300 seconds, with 80–100% jitter. This reduces repeated requests when a CA has
+not published a replacement response yet. The retry also remains within one
+eighth of the remaining validity and cannot postpone entry into the final hour
+before expiry. During that final hour, the existing 1–30 second retry applies.
+
+This is a maintenance scheduling policy, not an extension of signed OCSP
+validity. A changed response, network/validation failure, cached fallback,
+Unknown or Revoked status resets the longer retry. A successful public
+`staple_ocsp` call can still return a fresh cached Good response after a network
+failure; that boolean does not authorize this backoff. Only internal evidence
+of a verified responder success does. A response already in flight cannot
+authorize a longer retry for a newer cache publication.
+
+For a long-lived, unchanged Good response, this can delay the next proactive
+revocation check by up to five minutes. Expiry checks, Must-Staple serving
+requirements, verified revocation quarantine, and the refresh concurrency limit
+are unchanged. Explicit user refresh calls and custom handshake refresh
+callbacks retain their existing behavior; they do not share this retry policy.
