@@ -906,14 +906,24 @@ Do not bypass the guard for arbitrary old or revoked credentials. Keep a private
 backup, rather than the active old partition, for rollback or audit.
 
 This callable procedure uses existing APIs for both key-value and custom stores.
-Supply the exact, unmodified source resource you verified, its existing lookup
-name, a **separate protected backup backend**, and a generation-specific backup
-key ending in `.key`. `CertificateResource` serialization omits credential bytes,
+Supply the exact, unmodified source resource you verified, its canonical lookup
+name (`expected.names_key()`), a **separate protected backup backend**, and a
+generation-specific backup key ending in `.key`. `CertificateResource` serialization omits credential bytes,
 so the backup explicitly includes both PEM and private-key fields. Generic backup
 backends must protect those secrets; `FileStorage` uses private permissions for
 `.key` values on Unix and requires operator-configured Windows ACLs.
 Reserve that backup key exclusively for this migration; a preexisting different
 backup generation is an error, never an invitation to overwrite the backup.
+
+The procedure first republishes and verifies the complete old generation as a
+recovery checkpoint before deleting any old assets. `KeyValueCertStore::save`
+atomically publishes a private snapshot; `remove` deletes legacy three-file
+assets first and that authoritative snapshot last. An error or cancellation
+between legacy deletes therefore leaves the complete source readable for retry.
+Custom stores must provide atomic removal, or equivalent snapshot-last cleanup
+that keeps the verified full generation readable until retirement completes.
+For an opaque non-atomic custom backend without this property, use its own
+backend-specific retirement procedure; this example cannot guarantee its recovery.
 
 ```rust
 use certon::{CertStore, CertificateResource, Error, Result, Storage};
@@ -922,6 +932,9 @@ async fn migrate_certificate_offline(
     store: &dyn CertStore, backup: &dyn Storage, backup_key: &str,
     directory_url: &str, name: &str, expected: &CertificateResource,
 ) -> Result<()> {
+    if name != expected.names_key() {
+        return Err(Error::Config("migration requires the canonical resource name".into()));
+    }
     if !backup_key.ends_with(".key") {
         return Err(Error::Config("private backup key must end in .key".into()));
     }
@@ -969,6 +982,13 @@ async fn migrate_certificate_offline(
         if !same(&current, expected) || current.issuer_key != expected.issuer_key {
             return Err(Error::Config("migration source changed".into()));
         }
+        // Preserve a complete authoritative source until the final delete.
+        store.save(&old, &current).await?;
+        let checkpoint = store.load(&old, name).await?
+            .ok_or_else(|| Error::Config("source checkpoint disappeared".into()))?;
+        if !same(&checkpoint, expected) || checkpoint.issuer_key != expected.issuer_key {
+            return Err(Error::Config("source checkpoint changed".into()));
+        }
         store.remove(&old, name).await?;
     }
     if store.load(&old, name).await?.is_some() {
@@ -982,8 +1002,11 @@ Publication, backup or retirement errors and cancellation do not imply rollback:
 the complete new copy may already exist. Keep writers paused and retry this
 procedure with the same verified generation until it succeeds. A matching
 destination is reused, a different destination/source is never overwritten or
-retired, and an already retired source makes the final retry harmless. Preserve
-the backup after success; no active legacy record needs restoring for an ordinary
+retired, and an already retired source makes the final retry harmless without
+recreating the source checkpoint. A partial source with no verified checkpoint
+is still an error: a matching backup or destination alone does not prove the
+ownership of its remaining files. Do not ignore load errors or manually delete
+those unverified remnants. Preserve the backup after success; no active legacy record needs restoring for an ordinary
 later revoke or obtain. ARI advice is fetched again for the new issuer identity;
 do not blindly copy old CA advice.
 Global leaf revocation markers remain unchanged and still block revoked leaves

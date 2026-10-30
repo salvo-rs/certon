@@ -165,6 +165,11 @@ async fn migrate_certificate_offline(
     name: &str,
     expected: &CertificateResource,
 ) -> certon::Result<()> {
+    if name != expected.names_key() {
+        return Err(certon::Error::Config(
+            "migration requires the canonical resource name".into(),
+        ));
+    }
     if !backup_key.ends_with(".key") {
         return Err(certon::Error::Config(
             "private migration backup key must end in .key".into(),
@@ -224,6 +229,17 @@ async fn migrate_certificate_offline(
                 "migration source changed before retirement".into(),
             ));
         }
+        // Promote a genuine legacy three-file source to a complete checkpoint
+        // before any delete. KeyValueCertStore removes this snapshot last.
+        store.save(&old, &source).await?;
+        let checkpoint = store.load(&old, name).await?.ok_or_else(|| {
+            certon::Error::Config("migration source checkpoint disappeared".into())
+        })?;
+        if !same_material(&checkpoint, expected) || checkpoint.issuer_key != expected.issuer_key {
+            return Err(certon::Error::Config(
+                "migration source checkpoint changed".into(),
+            ));
+        }
         store.remove(&old, name).await?;
     }
     if store.load(&old, name).await?.is_some() {
@@ -238,6 +254,7 @@ struct ControlledMigrationStore {
     inner: Arc<dyn CertStore>,
     mode: std::sync::atomic::AtomicU8,
     old_reads: AtomicUsize,
+    old_saves: AtomicUsize,
     changed: CertificateResource,
     entered: tokio::sync::Notify,
 }
@@ -258,6 +275,9 @@ impl CertStore for ControlledMigrationStore {
         self.inner.load(issuer, name).await
     }
     async fn save(&self, issuer: &str, resource: &CertificateResource) -> certon::Result<()> {
+        if issuer == certon::storage::legacy_issuer_key(CA) {
+            self.old_saves.fetch_add(1, Ordering::SeqCst);
+        }
         self.inner.save(issuer, resource).await
     }
     async fn has(&self, issuer: &str, name: &str) -> certon::Result<bool> {
@@ -267,6 +287,16 @@ impl CertStore for ControlledMigrationStore {
         match self.mode.load(Ordering::SeqCst) {
             1 => return Err(certon::Error::Other("legacy retirement unavailable".into())),
             2 => {
+                self.entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+            mode @ (7 | 8) => {
+                self.inner.remove(issuer, name).await?;
+                if mode == 7 {
+                    return Err(certon::Error::Other(
+                        "retirement response unavailable".into(),
+                    ));
+                }
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
             }
@@ -284,6 +314,364 @@ fn migration_resource(issuer: &str) -> CertificateResource {
         private_key_pem: generated.signing_key.serialize_pem().into_bytes(),
         issuer_data: None,
         issuer_key: issuer.into(),
+    }
+}
+
+// Fault the next legacy delete, after the real .crt deletion has succeeded.
+// This preserves Storage::delete's contract: an errored key still exists.
+struct PartialRetirementStorage {
+    inner: Arc<FileStorage>,
+    blocked_key: String,
+    mode: std::sync::atomic::AtomicU8,
+    entered: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl Storage for PartialRetirementStorage {
+    async fn store(&self, key: &str, value: &[u8]) -> certon::Result<()> {
+        self.inner.store(key, value).await
+    }
+    async fn load(&self, key: &str) -> certon::Result<Vec<u8>> {
+        self.inner.load(key).await
+    }
+    async fn delete(&self, key: &str) -> certon::Result<()> {
+        if key == self.blocked_key {
+            match self.mode.load(Ordering::SeqCst) {
+                1 => {
+                    return Err(certon::Error::Other(
+                        "remaining legacy delete unavailable".into(),
+                    ));
+                }
+                2 => {
+                    self.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                _ => {}
+            }
+        }
+        self.inner.delete(key).await
+    }
+    async fn exists(&self, key: &str) -> certon::Result<bool> {
+        self.inner.exists(key).await
+    }
+    async fn list(&self, path: &str, recursive: bool) -> certon::Result<Vec<String>> {
+        self.inner.list(path, recursive).await
+    }
+    async fn stat(&self, key: &str) -> certon::Result<certon::storage::KeyInfo> {
+        self.inner.stat(key).await
+    }
+    async fn lock(&self, name: &str) -> certon::Result<()> {
+        self.inner.lock(name).await
+    }
+    async fn unlock(&self, name: &str) -> certon::Result<()> {
+        self.inner.unlock(name).await
+    }
+}
+
+async fn seed_legacy_files(storage: &dyn Storage, resource: &CertificateResource) {
+    let issuer = &resource.issuer_key;
+    storage
+        .store(
+            &certon::storage::site_cert_key(issuer, NAME),
+            &resource.certificate_pem,
+        )
+        .await
+        .unwrap();
+    storage
+        .store(
+            &certon::storage::site_private_key(issuer, NAME),
+            &resource.private_key_pem,
+        )
+        .await
+        .unwrap();
+    storage
+        .store(
+            &certon::storage::site_meta_key(issuer, NAME),
+            &serde_json::to_vec(resource).unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_retirement_resumes_after_real_partial_deletion() {
+    let mut failures = Vec::new();
+    for mode in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let files = Arc::new(FileStorage::new(directory.path().join("active")));
+        let old = certon::storage::legacy_issuer_key(CA);
+        let new = certon::storage::issuer_key(CA);
+        let expected = migration_resource(&old);
+        seed_legacy_files(files.as_ref(), &expected).await;
+        let snapshot = format!(
+            "{}/_certon/resource.v1.key",
+            certon::storage::certs_site_prefix(&old, NAME)
+        );
+        assert!(
+            !files.exists(&snapshot).await.unwrap(),
+            "seed must be genuine legacy-only data"
+        );
+        let storage = Arc::new(PartialRetirementStorage {
+            inner: files.clone(),
+            blocked_key: certon::storage::site_private_key(&old, NAME),
+            mode: mode.into(),
+            entered: Default::default(),
+        });
+        let store = Arc::new(KeyValueCertStore::new(storage.clone()));
+        let backup = Arc::new(FileStorage::new(directory.path().join("private-backup")));
+        if mode == 2 {
+            let task = tokio::spawn({
+                let store = store.clone();
+                let backup = backup.clone();
+                let expected = expected.clone();
+                async move {
+                    migrate_certificate_offline(
+                        store.as_ref(),
+                        backup.as_ref(),
+                        "verified.key",
+                        CA,
+                        NAME,
+                        &expected,
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                storage.entered.notified(),
+            )
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(
+                migrate_certificate_offline(
+                    store.as_ref(),
+                    backup.as_ref(),
+                    "verified.key",
+                    CA,
+                    NAME,
+                    &expected
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            !files
+                .exists(&certon::storage::site_cert_key(&old, NAME))
+                .await
+                .unwrap(),
+            "real .crt deletion must have happened"
+        );
+        assert!(
+            files
+                .exists(&certon::storage::site_private_key(&old, NAME))
+                .await
+                .unwrap()
+        );
+        assert!(
+            files
+                .exists(&certon::storage::site_meta_key(&old, NAME))
+                .await
+                .unwrap()
+        );
+        let checkpoint = store.load(&old, NAME).await;
+        let readable =
+            matches!(&checkpoint, Ok(Some(resource)) if same_material(resource, &expected));
+        eprintln!(
+            "partial legacy delete mode={mode}: checkpoint readable={readable}, snapshot={}",
+            files.exists(&snapshot).await.unwrap()
+        );
+        if !readable || !files.exists(&snapshot).await.unwrap() {
+            failures.push(format!(
+                "mode {mode}: interrupted retirement lost its readable source: {checkpoint:?}"
+            ));
+            continue;
+        }
+        storage.mode.store(0, Ordering::SeqCst);
+        migrate_certificate_offline(
+            store.as_ref(),
+            backup.as_ref(),
+            "verified.key",
+            CA,
+            NAME,
+            &expected,
+        )
+        .await
+        .unwrap();
+        assert!(store.load(&old, NAME).await.unwrap().is_none());
+        assert!(!files.exists(&snapshot).await.unwrap());
+        assert!(
+            !files
+                .exists(&certon::storage::site_private_key(&old, NAME))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !files
+                .exists(&certon::storage::site_meta_key(&old, NAME))
+                .await
+                .unwrap()
+        );
+        assert!(same_material(
+            &store.load(&new, NAME).await.unwrap().unwrap(),
+            &expected
+        ));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&backup.load("verified.key").await.unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Vec<u8>>(saved["private_key_pem"].clone()).unwrap(),
+            expected.private_key_pem
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn partial_source_without_verified_checkpoint_is_never_retired() {
+    for foreign in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let files = Arc::new(FileStorage::new(directory.path().join("active")));
+        let store = KeyValueCertStore::new(files.clone());
+        let backup = FileStorage::new(directory.path().join("private-backup"));
+        let old = certon::storage::legacy_issuer_key(CA);
+        let new = certon::storage::issuer_key(CA);
+        let expected = migration_resource(&old);
+        // Create verified destination+backup through a completed migration first.
+        store.save(&old, &expected).await.unwrap();
+        migrate_certificate_offline(&store, &backup, "verified.key", CA, NAME, &expected)
+            .await
+            .unwrap();
+        let source = if foreign {
+            migration_resource(&old)
+        } else {
+            expected.clone()
+        };
+        seed_legacy_files(files.as_ref(), &source).await;
+        files
+            .delete(&certon::storage::site_cert_key(&old, NAME))
+            .await
+            .unwrap();
+        let before_key = files
+            .load(&certon::storage::site_private_key(&old, NAME))
+            .await
+            .unwrap();
+        let before_meta = files
+            .load(&certon::storage::site_meta_key(&old, NAME))
+            .await
+            .unwrap();
+        assert!(
+            migrate_certificate_offline(&store, &backup, "verified.key", CA, NAME, &expected)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            files
+                .load(&certon::storage::site_private_key(&old, NAME))
+                .await
+                .unwrap(),
+            before_key
+        );
+        assert_eq!(
+            files
+                .load(&certon::storage::site_meta_key(&old, NAME))
+                .await
+                .unwrap(),
+            before_meta
+        );
+        let snapshot = format!(
+            "{}/_certon/resource.v1.key",
+            certon::storage::certs_site_prefix(&old, NAME)
+        );
+        assert!(!files.exists(&snapshot).await.unwrap());
+        assert!(same_material(
+            &store.load(&new, NAME).await.unwrap().unwrap(),
+            &expected
+        ));
+    }
+}
+
+#[tokio::test]
+async fn atomic_custom_retirement_does_not_restore_source_after_response_loss() {
+    for mode in [7, 8] {
+        let directory = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn CertStore> = Arc::new(MemoryStore::default());
+        let old = certon::storage::legacy_issuer_key(CA);
+        let new = certon::storage::issuer_key(CA);
+        let expected = migration_resource(&old);
+        inner.save(&old, &expected).await.unwrap();
+        let store = Arc::new(ControlledMigrationStore {
+            inner: inner.clone(),
+            mode: mode.into(),
+            old_reads: 0.into(),
+            old_saves: 0.into(),
+            changed: migration_resource(&old),
+            entered: Default::default(),
+        });
+        let backup = Arc::new(FileStorage::new(directory.path().join("private-backup")));
+        if mode == 8 {
+            let task = tokio::spawn({
+                let store = store.clone();
+                let backup = backup.clone();
+                let expected = expected.clone();
+                async move {
+                    migrate_certificate_offline(
+                        store.as_ref(),
+                        backup.as_ref(),
+                        "verified.key",
+                        CA,
+                        NAME,
+                        &expected,
+                    )
+                    .await
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(
+                migrate_certificate_offline(
+                    store.as_ref(),
+                    backup.as_ref(),
+                    "verified.key",
+                    CA,
+                    NAME,
+                    &expected
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            inner.load(&old, NAME).await.unwrap().is_none(),
+            "atomic deletion must have actually completed"
+        );
+        let saves = store.old_saves.load(Ordering::SeqCst);
+        store.mode.store(0, Ordering::SeqCst);
+        migrate_certificate_offline(
+            store.as_ref(),
+            backup.as_ref(),
+            "verified.key",
+            CA,
+            NAME,
+            &expected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.old_saves.load(Ordering::SeqCst),
+            saves,
+            "retry must not recreate a retired source"
+        );
+        assert!(inner.load(&old, NAME).await.unwrap().is_none());
+        assert!(same_material(
+            &inner.load(&new, NAME).await.unwrap().unwrap(),
+            &expected
+        ));
     }
 }
 
@@ -307,6 +695,7 @@ async fn incomplete_offline_retirement_is_retryable_without_deleting_changed_gen
                 inner: inner.clone(),
                 mode: mode.into(),
                 old_reads: 0.into(),
+                old_saves: 0.into(),
                 changed: foreign.clone(),
                 entered: Default::default(),
             });
