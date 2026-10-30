@@ -1002,9 +1002,14 @@ impl AcmeClient {
         self.transport
             .validate_url(url)
             .map_err(|error| AcmeError::Order(error.to_string()))?;
-        // We try once; on a badNonce error we retry with a fresh nonce.
+        // RFC 8555 section 6.5 requires the retry to use this response's
+        // nonce. Keep it out of the pool shared with concurrent requests.
+        let mut retry_nonce = None;
         for attempt in 0..2 {
-            let nonce = self.get_nonce().await?;
+            let nonce = match retry_nonce.take() {
+                Some(nonce) => nonce,
+                None => self.get_nonce().await?,
+            };
             let body = build_jws_body(account_key, kid, &nonce, url, payload)?;
 
             let resp = self
@@ -1016,13 +1021,15 @@ impl AcmeClient {
                 .await
                 .map_err(|e| AcmeError::Order(format!("ACME POST to {url} failed: {e}")))?;
 
-            // Always cache the nonce from the response.
-            self.cache_nonce(&resp).await;
-
             // The actual response status, never the problem JSON's status,
-            // controls recognition. Keep the original first-400 nonce retry.
+            // controls recognition. A 400's nonce cannot enter the shared
+            // pool until we know it is not a badNonce response.
             let status = resp.status();
-            if (status.as_u16() == 400 && (attempt == 0 || accepted_problem.is_some()))
+            let response_nonce = extract_nonce(&resp);
+            if status.as_u16() != 400 {
+                self.cache_nonce(&resp).await;
+            }
+            if status.as_u16() == 400
                 || accepted_problem.is_some_and(|(code, _)| status.as_u16() == code)
             {
                 // Peek at the body to see if it's a badNonce error.
@@ -1036,18 +1043,33 @@ impl AcmeClient {
                         }
                     })?;
 
-                if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&resp_bytes)
-                    && status.as_u16() == 400
-                    && problem.problem_type.contains("badNonce")
-                    && attempt == 0
-                {
+                let problem = serde_json::from_slice::<AcmeProblem>(&resp_bytes);
+                let bad_nonce = problem.as_ref().is_ok_and(|problem| {
+                    problem.problem_type == "urn:ietf:params:acme:error:badNonce"
+                }) && status.as_u16() == 400;
+                if bad_nonce && attempt == 0 {
+                    retry_nonce = Some(
+                        response_nonce
+                            .filter(|nonce| {
+                                !nonce.is_empty() && URL_SAFE_NO_PAD.decode(nonce).is_ok()
+                            })
+                            .ok_or_else(|| {
+                                AcmeError::Nonce(
+                                    "badNonce response has no valid Replay-Nonce header".into(),
+                                )
+                            })?,
+                    );
                     warn!("bad nonce, retrying with fresh nonce");
                     continue;
                 }
+                if !bad_nonce
+                    && status.as_u16() == 400
+                    && let Some(nonce) = response_nonce
+                {
+                    *self.nonce.lock().await = Some(nonce);
+                }
 
                 // Not a badNonce error; return an error with the body we already read.
-                let problem: std::result::Result<AcmeProblem, _> =
-                    serde_json::from_slice(&resp_bytes);
                 let detail = match problem {
                     Ok(p)
                         if accepted_problem == Some((status.as_u16(), p.problem_type.as_str())) =>
@@ -1221,66 +1243,19 @@ impl AcmeClient {
         let payload = serde_json::to_string(&req)
             .map_err(|e| AcmeError::Account(format!("failed to serialize find request: {e}")))?;
 
-        self.transport
-            .validate_url(&self.directory.new_account)
+        let response: Option<(AccountResponse, _)> = self
+            .acme_post_json_accepting_problem(
+                account_key,
+                None,
+                &self.directory.new_account,
+                Some(&payload),
+                Some((400, ACCOUNT_DOES_NOT_EXIST)),
+            )
+            .await
             .map_err(|error| AcmeError::Account(error.to_string()))?;
-        let nonce = self.get_nonce().await?;
-        let body = build_jws_body(
-            account_key,
-            None,
-            &nonce,
-            &self.directory.new_account,
-            Some(&payload),
-        )?;
-
-        let resp = self
-            .http
-            .post(&self.directory.new_account)
-            .header("Content-Type", "application/jose+json")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| AcmeError::Account(format!("account lookup failed: {e}")))?;
-
-        self.cache_nonce(&resp).await;
-
-        // 400 with accountDoesNotExist means no account for this key.
-        if resp.status().as_u16() == 400 {
-            let body_bytes = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME account error")
-                .await
-                .map_err(|e| AcmeError::Account(e.to_string()))?;
-            if let Ok(problem) = serde_json::from_slice::<AcmeProblem>(&body_bytes)
-                && problem.problem_type == ACCOUNT_DOES_NOT_EXIST
-            {
-                return Ok(None);
-            }
-            return Err(AcmeError::Account(format!(
-                "account lookup returned HTTP 400: {}",
-                String::from_utf8_lossy(&body_bytes)
-            ))
-            .into());
-        }
-
-        if !resp.status().is_success() {
-            return Err(AcmeError::Account(format!(
-                "account lookup returned HTTP {}",
-                resp.status()
-            ))
-            .into());
-        }
-
-        let account_url = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_owned());
-
-        let body_bytes = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME account")
-            .await
-            .map_err(|e| AcmeError::Account(e.to_string()))?;
-
-        let acct_resp: AccountResponse = serde_json::from_slice(&body_bytes)
-            .map_err(|e| AcmeError::Account(format!("failed to parse account response: {e}")))?;
+        let Some((acct_resp, account_url)) = response else {
+            return Ok(None);
+        };
 
         match account_url {
             Some(url) => Ok(Some((acct_resp, url))),

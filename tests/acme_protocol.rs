@@ -414,6 +414,26 @@ async fn account_lookup_accepts_only_the_exact_missing_account_problem() {
     }
 }
 
+#[tokio::test]
+async fn account_lookup_requires_a_location_after_success() {
+    let server = Server::start(false).await;
+    server
+        .lookup_responses
+        .lock()
+        .unwrap()
+        .push_back((200, json!({"status":"valid"}).to_string()));
+    let client = AcmeClient::new(&format!("{}/directory", server.url))
+        .await
+        .unwrap();
+    let key = certon::crypto::generate_private_key(KeyType::EcdsaP256).unwrap();
+    let error = client.find_account(&key).await.unwrap_err();
+    assert!(matches!(
+        error,
+        certon::Error::Acme(certon::error::AcmeError::Account(_))
+    ));
+    assert!(error.to_string().contains("no Location header"));
+}
+
 #[derive(Clone, Debug)]
 struct Request {
     method: String,
