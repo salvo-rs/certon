@@ -1283,6 +1283,8 @@ impl ZeroSslApiIssuer {
                     let mut expected: Vec<_> = emails.iter().map(String::as_str).collect();
                     actual.sort_unstable();
                     expected.sort_unstable();
+                    actual.dedup();
+                    expected.dedup();
                     actual != expected
                 })
         {

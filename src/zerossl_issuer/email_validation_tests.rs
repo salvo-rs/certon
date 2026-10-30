@@ -318,6 +318,40 @@ async fn issue_email_preserves_caller_csr_and_external_private_key_ownership() {
 }
 
 #[tokio::test]
+async fn issue_email_accepts_deduplicated_recipient_echo_but_not_missing_or_extra_addresses() {
+    let selected = "admin@example.com";
+    for (echo, accepted) in [
+        (selected, true),
+        ("", false),
+        ("admin@example.com,other@example.com", false),
+    ] {
+        let create = serde_json::json!({"id":ID,"status":"draft","validation":{"email_validation":{
+            "one.example.com":[selected], "*.two.example.com":[selected]
+        }}});
+        let confirmation = serde_json::json!({"id":ID,"status":"pending_validation","validation_type":"EMAIL","validation_emails":echo});
+        let api = Api::start(create.to_string(), 200, confirmation.to_string(), false).await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut issuer =
+            ZeroSslApiIssuer::new(API_KEY, Arc::new(crate::FileStorage::new(directory.path())))
+                .with_validation_email(DOMAINS[0], selected)
+                .unwrap()
+                .with_validation_email(DOMAINS[1], selected)
+                .unwrap()
+                .with_poll_interval(Duration::ZERO);
+        issuer.revocation_origin = Some(api.origin.clone());
+        let result = issuer.issue(&[], &domains()).await;
+        assert_eq!(result.is_ok(), accepted);
+        let requests = api.finish().await;
+        assert_eq!(requests[1].form["validation_method"], "EMAIL");
+        assert_eq!(
+            requests[1].form["validation_email"],
+            "admin@example.com,admin@example.com"
+        );
+        assert_eq!(requests.len(), if accepted { 4 } else { 2 });
+    }
+}
+
+#[tokio::test]
 async fn issue_email_rejection_never_polls_or_downloads() {
     let failures = [
         r#"{"success":false,"error":{"code":2824,"type":"missing_validation_emails"}}"#,
