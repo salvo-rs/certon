@@ -314,19 +314,55 @@ pub(crate) async fn ensure_required_staple(cert: &Certificate) -> Result<()> {
 pub async fn staple_ocsp(
     storage: &dyn Storage,
     cert: &mut Certificate,
-    _config: &OcspConfig,
+    config: &OcspConfig,
 ) -> Result<bool> {
+    staple_ocsp_with_outcome(storage, cert, config)
+        .await
+        .map(|outcome| outcome.usable)
+}
+
+/// Evidence of a successful responder refresh, separate from the public
+/// boolean which also permits a fresh cached fallback after network failure.
+/// Only this module can construct evidence; public Certificate fields cannot.
+pub(crate) struct OcspRefreshOutcome {
+    usable: bool,
+    fetched_good: Option<[u8; 32]>,
+}
+
+impl OcspRefreshOutcome {
+    fn cached(usable: bool) -> Self {
+        Self {
+            usable,
+            fetched_good: None,
+        }
+    }
+
+    pub(crate) fn usable(&self) -> bool {
+        self.usable
+    }
+
+    pub(crate) fn confirms_good(&self, raw: &[u8]) -> bool {
+        self.fetched_good
+            .is_some_and(|digest| digest == <[u8; 32]>::from(sha2::Sha256::digest(raw)))
+    }
+}
+
+pub(crate) async fn staple_ocsp_with_outcome(
+    storage: &dyn Storage,
+    cert: &mut Certificate,
+    _config: &OcspConfig,
+) -> Result<OcspRefreshOutcome> {
     // A failed refresh must never leave a stale response attached. A verified
     // revocation is sticky for this certificate: an outage, Unknown response or
     // replay of an older, still-fresh Good response cannot make it usable again.
     // Replacing the certificate creates a new Certificate with no OCSP status.
     let attached = cert.ocsp_response.take();
     if cert.ocsp_status == Some(OcspStatus::Revoked) {
-        return Ok(false);
+        return Ok(OcspRefreshOutcome::cached(false));
     }
     cert.ocsp_status = None;
     if _config.disable_stapling {
-        return Ok(false);
+        return Ok(OcspRefreshOutcome::cached(false));
     }
     // Skip OCSP stapling for short-lived certificates (< 7 days total
     // lifetime). These certificates expire before OCSP responses would
@@ -338,12 +374,12 @@ pub async fn staple_ocsp(
             lifetime_hours = lifetime.num_hours(),
             "certificate lifetime is shorter than {SHORT_LIVED_CERT_DAYS} days; skipping OCSP stapling"
         );
-        return Ok(false);
+        return Ok(OcspRefreshOutcome::cached(false));
     }
 
     if cert.cert_chain.is_empty() {
         debug!("certificate chain is empty; skipping OCSP stapling");
-        return Ok(false);
+        return Ok(OcspRefreshOutcome::cached(false));
     }
 
     // Parse the leaf to extract its first SAN for storage key generation.
@@ -373,7 +409,9 @@ pub async fn staple_ocsp(
                         if parsed.status == OcspStatus::Good {
                             cert.ocsp_response = Some(cached_bytes);
                         }
-                        return Ok(parsed.status == OcspStatus::Good);
+                        return Ok(OcspRefreshOutcome::cached(
+                            parsed.status == OcspStatus::Good,
+                        ));
                     }
                     // Proactively request a replacement, retaining this response
                     // only while it is still fresh if the responder is unavailable.
@@ -426,9 +464,9 @@ pub async fn staple_ocsp(
                 {
                     cert.ocsp_status = Some(OcspStatus::Good);
                     cert.ocsp_response = Some(raw);
-                    return Ok(true);
+                    return Ok(OcspRefreshOutcome::cached(true));
                 }
-                return Ok(false);
+                return Ok(OcspRefreshOutcome::cached(false));
             }
         };
 
@@ -448,10 +486,15 @@ pub async fn staple_ocsp(
     );
 
     cert.ocsp_status = Some(parsed.status);
+    let fetched_good =
+        (parsed.status == OcspStatus::Good).then(|| sha2::Sha256::digest(&raw_response).into());
     if parsed.status == OcspStatus::Good {
         cert.ocsp_response = Some(raw_response);
     }
-    Ok(parsed.status == OcspStatus::Good)
+    Ok(OcspRefreshOutcome {
+        usable: parsed.status == OcspStatus::Good,
+        fetched_good,
+    })
 }
 
 // ---------------------------------------------------------------------------

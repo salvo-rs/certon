@@ -959,15 +959,18 @@ async fn refresh_ocsp_certificate(
         "maintenance: refreshing OCSP staple",
     );
 
-    let mut updated_cert = Arc::unwrap_or_clone(cert);
-    let outcome = ocsp::staple_ocsp(storage, &mut updated_cert, config).await;
+    // Retain the fetch-start version across network and issuer verification.
+    // A late response cannot authorize extending a newer publication's retry.
+    let mut updated_cert = cert.as_ref().clone();
+    let outcome = ocsp::staple_ocsp_with_outcome(storage, &mut updated_cert, config).await;
     // Publish removal of an unusable staple as well as successful refreshes.
     // Otherwise a failed refresh keeps serving the expired response forever.
     let Some(current) = cache
-        .update_ocsp_if_present(
+        .update_ocsp_after_refresh(
             &old_hash,
             updated_cert.ocsp_status,
             updated_cert.ocsp_response.clone(),
+            outcome.as_ref().ok().map(|outcome| (&cert, outcome)),
         )
         .await
     else {
@@ -976,7 +979,7 @@ async fn refresh_ocsp_certificate(
     };
     let first_name = current.first_name;
     match outcome {
-        Ok(true) if current.ocsp_status == Some(ocsp::OcspStatus::Good) => {
+        Ok(outcome) if outcome.usable() && current.ocsp_status == Some(ocsp::OcspStatus::Good) => {
             debug!(name = %first_name, "maintenance: OCSP staple refreshed successfully");
         }
         Ok(_) => {
@@ -1386,6 +1389,9 @@ fn normalize_interval(interval: Duration, default: Duration) -> Duration {
 mod preflight_tests;
 
 #[cfg(test)]
+mod ocsp_backoff_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1496,7 +1502,7 @@ mod tests {
         }
     }
 
-    fn signed_certificate() -> (Certificate, rcgen::KeyPair) {
+    pub(super) fn signed_certificate() -> (Certificate, rcgen::KeyPair) {
         let (chain, issuer_key, leaf_key) = crate::ocsp::tests::signed_chain();
         let pem: String = chain
             .iter()
@@ -1517,7 +1523,7 @@ mod tests {
         )
     }
 
-    async fn read_ocsp_request(socket: &mut tokio::net::TcpStream) {
+    pub(super) async fn read_ocsp_request(socket: &mut tokio::net::TcpStream) {
         use tokio::io::AsyncReadExt;
         let mut request = Vec::new();
         loop {
