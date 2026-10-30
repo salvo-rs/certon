@@ -41,6 +41,8 @@ use crate::ocsp::{self, OcspConfig};
 use crate::storage::Storage;
 
 #[cfg(test)]
+mod interval_tests;
+#[cfg(test)]
 mod parallel_ocsp_tests;
 #[cfg(test)]
 mod renewal_backoff_tests;
@@ -61,6 +63,133 @@ const REVOCATION_READ_CONCURRENCY: usize = 8;
 const OCSP_REFRESH_CONCURRENCY: usize = 8;
 const FORCED_RENEWAL_CONCURRENCY: usize = 4;
 const FORCED_RENEWAL_BACKLOG: usize = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaintenanceIntervals {
+    pub renew: Duration,
+    pub ocsp: Duration,
+}
+
+impl MaintenanceIntervals {
+    pub(crate) fn new(renew: Duration, ocsp: Duration) -> Self {
+        Self {
+            renew: normalize_interval(renew, DEFAULT_RENEW_CHECK_INTERVAL),
+            ocsp: normalize_interval(ocsp, DEFAULT_OCSP_CHECK_INTERVAL),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum IntervalSource {
+    Fixed(MaintenanceIntervals),
+    Cache(tokio::sync::watch::Receiver<MaintenanceIntervals>),
+}
+
+impl IntervalSource {
+    fn current(&self) -> MaintenanceIntervals {
+        let intervals = match self {
+            Self::Fixed(intervals) => *intervals,
+            Self::Cache(receiver) => *receiver.borrow(),
+        };
+        // A different runtime (or an advanced controllable clock) may have a
+        // different remaining range than the setter's clock.
+        MaintenanceIntervals::new(intervals.renew, intervals.ocsp)
+    }
+}
+
+struct MaintenanceTicker {
+    ticker: tokio::time::Interval,
+    period: Duration,
+    renewal: bool,
+    updates: Option<tokio::sync::watch::Receiver<MaintenanceIntervals>>,
+}
+
+impl MaintenanceTicker {
+    fn new(source: &IntervalSource, renewal: bool) -> Self {
+        let intervals = source.current();
+        let configured = if renewal {
+            intervals.renew
+        } else {
+            intervals.ocsp
+        };
+        let (period, first) = interval_deadline(
+            tokio::time::Instant::now(),
+            configured,
+            Self::default_period(renewal),
+        );
+        Self {
+            ticker: tokio::time::interval_at(first, period),
+            period,
+            renewal,
+            updates: match source {
+                IntervalSource::Cache(receiver) => Some(receiver.clone()),
+                IntervalSource::Fixed(_) => None,
+            },
+        }
+    }
+
+    fn default_period(renewal: bool) -> Duration {
+        if renewal {
+            DEFAULT_RENEW_CHECK_INTERVAL
+        } else {
+            DEFAULT_OCSP_CHECK_INTERVAL
+        }
+    }
+
+    fn poll_tick(
+        ticker: &mut tokio::time::Interval,
+        period: &mut Duration,
+        renewal: bool,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<tokio::time::Instant> {
+        let (safe_period, first) = interval_deadline(
+            tokio::time::Instant::now(),
+            *period,
+            Self::default_period(renewal),
+        );
+        if safe_period != *period {
+            *period = safe_period;
+            *ticker = tokio::time::interval_at(first, safe_period);
+        }
+        ticker.poll_tick(cx)
+    }
+
+    /// Updates restart only the changed timer, without synthesizing a tick.
+    /// `false` asks the caller to recompute independent retry/deadline timers.
+    async fn next(&mut self) -> bool {
+        loop {
+            tokio::select! {
+                biased;
+                update = async {
+                    match &mut self.updates {
+                        Some(receiver) => receiver.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if update.is_err() {
+                        self.updates = None;
+                        continue;
+                    }
+                    let intervals = *self.updates.as_mut().unwrap().borrow_and_update();
+                    let configured = if self.renewal { intervals.renew } else { intervals.ocsp };
+                    let (period, first) = interval_deadline(tokio::time::Instant::now(), configured, Self::default_period(self.renewal));
+                    if period != self.period {
+                        self.period = period;
+                        self.ticker = tokio::time::interval_at(first, period);
+                        return false;
+                    }
+                    // An unrelated component may change continuously. Honor
+                    // our ready tick without letting those updates starve it;
+                    // a change to our own period above still wins over it.
+                    return std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(Self::poll_tick(&mut self.ticker, &mut self.period, self.renewal, cx).is_ready())
+                    }).await;
+                }
+                _ = std::future::poll_fn(|cx| Self::poll_tick(&mut self.ticker, &mut self.period, self.renewal, cx)) => return true,
+            }
+        }
+    }
+}
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct RenewalIdentity {
@@ -107,12 +236,13 @@ struct RenewalRetry {
     running: bool,
     token: Arc<()>,
     minimum_delay: Duration,
+    failed_at: Option<tokio::time::Instant>,
 }
 
 struct RenewalBackoff {
     entries: Mutex<HashMap<RenewalIdentity, RenewalRetry>>,
     changed: tokio::sync::Notify,
-    renew_interval: Duration,
+    intervals: IntervalSource,
 }
 
 impl Default for RenewalBackoff {
@@ -123,10 +253,37 @@ impl Default for RenewalBackoff {
 
 impl RenewalBackoff {
     fn new(renew_interval: Duration) -> Self {
+        Self::with_intervals(IntervalSource::Fixed(MaintenanceIntervals::new(
+            renew_interval,
+            DEFAULT_OCSP_CHECK_INTERVAL,
+        )))
+    }
+
+    fn with_intervals(intervals: IntervalSource) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             changed: tokio::sync::Notify::new(),
-            renew_interval,
+            intervals,
+        }
+    }
+
+    fn renew_interval(&self) -> Duration {
+        self.intervals.current().renew
+    }
+
+    fn extend_permanent(entry: &mut RenewalRetry, interval: Duration) {
+        if !entry.minimum_delay.is_zero()
+            && let Some(failed_at) = entry.failed_at
+        {
+            entry.minimum_delay =
+                normalize_interval(entry.minimum_delay, DEFAULT_RENEW_CHECK_INTERVAL).max(interval);
+            let (_, floor) = interval_deadline(failed_at, interval, DEFAULT_RENEW_CHECK_INTERVAL);
+            entry.retry_at = match entry.retry_at {
+                Some(retry_at) => Some(retry_at.max(floor)),
+                // Eligibility skips suspend elapsed timers. Only a genuinely
+                // later floor can rearm them; never revive a past timer.
+                None => (floor > tokio::time::Instant::now()).then_some(floor),
+            };
         }
     }
     fn prune(&self, live: &HashSet<RenewalIdentity>) {
@@ -151,13 +308,21 @@ impl RenewalBackoff {
     }
 
     fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.entries
+        let mut entries = self
+            .entries
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-            .filter(|entry| !entry.running)
-            .filter_map(|entry| entry.retry_at)
-            .min()
+            .unwrap_or_else(|error| error.into_inner());
+        let interval = self.renew_interval();
+        let mut next: Option<tokio::time::Instant> = None;
+        for entry in entries.values_mut() {
+            Self::extend_permanent(entry, interval);
+            if !entry.running
+                && let Some(at) = entry.retry_at
+            {
+                next = Some(next.map_or(at, |next| next.min(at)));
+            }
+        }
+        next
     }
 
     fn reserve(
@@ -169,6 +334,7 @@ impl RenewalBackoff {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let interval = self.renew_interval();
         let entry = entries
             .entry(identity.clone())
             .or_insert_with(|| RenewalRetry {
@@ -177,7 +343,9 @@ impl RenewalBackoff {
                 running: false,
                 token: Arc::new(()),
                 minimum_delay: Duration::ZERO,
+                failed_at: None,
             });
+        Self::extend_permanent(entry, interval);
         if entry.running
             || entry
                 .retry_at
@@ -194,7 +362,8 @@ impl RenewalBackoff {
             token: entry.token.clone(),
             started: false,
             success: false,
-            minimum_delay: Duration::ZERO,
+            permanent: false,
+            deferred: false,
         })
     }
 }
@@ -206,7 +375,35 @@ struct RenewalAttempt {
     token: Arc<()>,
     started: bool,
     success: bool,
-    minimum_delay: Duration,
+    permanent: bool,
+    deferred: bool,
+}
+
+impl RenewalAttempt {
+    fn begin(&mut self) -> bool {
+        let mut entries = self
+            .backoff
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let interval = self.backoff.renew_interval();
+        let Some(entry) = entries
+            .get_mut(&self.identity)
+            .filter(|entry| Arc::ptr_eq(&entry.token, &self.token))
+        else {
+            return false;
+        };
+        RenewalBackoff::extend_permanent(entry, interval);
+        if entry
+            .retry_at
+            .is_some_and(|at| at > tokio::time::Instant::now())
+        {
+            self.deferred = true;
+            return false;
+        }
+        self.started = true;
+        true
+    }
 }
 
 impl Drop for RenewalAttempt {
@@ -220,24 +417,42 @@ impl Drop for RenewalAttempt {
             .entries
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let interval = self.backoff.renew_interval();
         if let Some(entry) = entries.get_mut(&self.identity)
             && Arc::ptr_eq(&entry.token, &self.token)
         {
-            if self.success || !current || (!self.started && entry.failures == 0) {
+            if self.deferred && current {
+                entry.running = false;
+            } else if self.success || !current || (!self.started && entry.failures == 0) {
                 entries.remove(&self.identity);
             } else {
                 entry.running = false;
                 if self.started {
                     entry.failures = entry.failures.saturating_add(1);
-                    entry.minimum_delay = self.minimum_delay;
+                    entry.minimum_delay = if self.permanent {
+                        interval
+                    } else {
+                        Duration::ZERO
+                    };
+                    entry.failed_at = Some(tokio::time::Instant::now());
                 }
                 // Unexecuted cancellation preserves the failure level, but
                 // must not rearm a timer whose deadline is already past.
                 let seconds = 60 * (1u64 << entry.failures.saturating_sub(1).min(3));
-                entry.retry_at = Some(
-                    tokio::time::Instant::now()
-                        + Duration::from_secs(seconds.min(300)).max(entry.minimum_delay),
+                let delay = Duration::from_secs(seconds.min(300)).max(entry.minimum_delay);
+                let (delay, at) = interval_deadline(
+                    tokio::time::Instant::now(),
+                    delay,
+                    DEFAULT_RENEW_CHECK_INTERVAL,
                 );
+                if !entry.minimum_delay.is_zero() {
+                    entry.minimum_delay = delay;
+                }
+                entry.retry_at = Some(if self.started {
+                    at
+                } else {
+                    entry.retry_at.map_or(at, |old| old.max(at))
+                });
             }
         }
         drop(entries);
@@ -253,6 +468,8 @@ impl Drop for RenewalAttempt {
 ///
 /// Controls the intervals at which the maintenance loop checks for
 /// certificate renewals and OCSP staple freshness.
+/// Lower-level entry points keep these explicit values, independently of
+/// cache option updates. Zero or unrepresentable intervals use their defaults.
 #[derive(Clone)]
 pub struct MaintenanceConfig {
     /// How often to check for certificate renewals.
@@ -510,20 +727,57 @@ pub(crate) fn start_maintenance_with_observed_renewal(
         ratio,
         ari_manager,
     };
-    let renew_interval =
-        normalize_interval(config.renew_check_interval, DEFAULT_RENEW_CHECK_INTERVAL);
-    let ocsp_interval = normalize_interval(config.ocsp_check_interval, DEFAULT_OCSP_CHECK_INTERVAL);
+    let intervals = IntervalSource::Fixed(MaintenanceIntervals::new(
+        config.renew_check_interval,
+        config.ocsp_check_interval,
+    ));
+    start_maintenance_impl(cache, config, policy, intervals)
+}
+
+pub(crate) fn start_maintenance_following_cache(
+    manager: Arc<crate::CertManager>,
+    renew: Arc<ReasonedRenewFn>,
+    observed_renew: Arc<ObservedRenewFn>,
+) -> JoinHandle<()> {
+    // Subscribe before reading. Watch retains the last pair even if options
+    // change before this task starts, during a scan, or during panic recovery.
+    let intervals = IntervalSource::Cache(manager.cache.subscribe_maintenance_intervals());
+    let current = intervals.current();
+    let config = MaintenanceConfig {
+        renew_check_interval: current.renew,
+        ocsp_check_interval: current.ocsp,
+        ocsp: manager.policy.ocsp.clone(),
+        storage: manager.storage.clone(),
+    };
+    let policy = RenewalPolicy {
+        renew,
+        observed_renew: Some(observed_renew),
+        certificates: manager.certificates.clone(),
+        revocations: manager.storage.clone(),
+        ratio: manager.policy.renewal_window_ratio,
+        ari_manager: Some(manager.clone()),
+    };
+    start_maintenance_impl(manager.cache.clone(), config, policy, intervals)
+}
+
+fn start_maintenance_impl(
+    cache: Arc<CertCache>,
+    config: MaintenanceConfig,
+    policy: RenewalPolicy,
+    intervals: IntervalSource,
+) -> JoinHandle<()> {
+    let current = intervals.current();
 
     info!(
-        renew_check_secs = renew_interval.as_secs(),
-        ocsp_check_secs = ocsp_interval.as_secs(),
+        renew_check_secs = current.renew.as_secs(),
+        ocsp_check_secs = current.ocsp.as_secs(),
         "starting certificate maintenance loop",
     );
 
     let maintenance = cache.maintenance_guard();
     tokio::spawn(async move {
         let _maintenance = maintenance;
-        maintenance_loop_with_recovery(cache, config, policy, renew_interval, ocsp_interval).await;
+        maintenance_loop_with_recovery(cache, config, policy, intervals).await;
     })
 }
 
@@ -534,25 +788,18 @@ async fn maintenance_loop_with_recovery(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
     policy: RenewalPolicy,
-    renew_interval: Duration,
-    ocsp_interval: Duration,
+    intervals: IntervalSource,
 ) {
     loop {
         let cache_clone = Arc::clone(&cache);
         let config_clone = config.clone();
         let policy_clone = policy.clone();
+        let intervals = intervals.clone();
 
         let inner_maintenance = cache_clone.maintenance_guard();
         let task = tokio::task::spawn(async move {
             let _maintenance = inner_maintenance;
-            maintenance_loop(
-                cache_clone,
-                config_clone,
-                policy_clone,
-                renew_interval,
-                ocsp_interval,
-            )
-            .await;
+            maintenance_loop(cache_clone, config_clone, policy_clone, intervals).await;
         });
         // Aborting this outer task must not detach the inner maintenance loop.
         struct AbortOnDrop(tokio::task::AbortHandle);
@@ -600,8 +847,7 @@ async fn maintenance_loop(
     cache: Arc<CertCache>,
     config: MaintenanceConfig,
     policy: RenewalPolicy,
-    renew_interval: Duration,
-    ocsp_interval: Duration,
+    intervals: IntervalSource,
 ) {
     let mut stop_rx = cache.subscribe_stop();
     if *stop_rx.borrow() {
@@ -618,13 +864,8 @@ async fn maintenance_loop(
         force_receiver,
     );
 
-    let mut renew_ticker = tokio::time::interval(renew_interval);
-    let mut ocsp_ticker = tokio::time::interval(ocsp_interval);
-
-    // Consume the first immediate tick so the loop starts after one full
-    // interval has elapsed, matching the Go `time.NewTicker` behavior.
-    renew_ticker.tick().await;
-    ocsp_ticker.tick().await;
+    let mut renew_ticker = MaintenanceTicker::new(&intervals, true);
+    let ocsp_ticker = MaintenanceTicker::new(&intervals, false);
 
     let (marker_requests, mut marker_receiver) = tokio::sync::mpsc::channel(1);
     let renewal_marker_requests = marker_requests.clone();
@@ -632,14 +873,17 @@ async fn maintenance_loop(
     // for admission for a long time without starving the OCSP ticker.
     let renewals = async {
         let mut ari_changed = cache.subscribe_ari();
-        let backoff = Arc::new(RenewalBackoff::new(renew_interval));
+        let backoff = Arc::new(RenewalBackoff::with_intervals(intervals));
         loop {
             // Subscribe before inspecting deadlines. Completion only asks us
             // to recalculate this timer; it does not rescan every certificate.
             let changed = backoff.changed.notified();
             let retry_at = backoff.deadline();
             let periodic = tokio::select! {
-                _ = renew_ticker.tick() => true,
+                tick = renew_ticker.next() => {
+                    if !tick { continue; }
+                    true
+                },
                 _ = ari_changed.changed() => false,
                 _ = async {
                     match retry_at {
@@ -705,7 +949,7 @@ async fn run_ocsp_refreshes(
     storage: &dyn Storage,
     config: &OcspConfig,
     forced: &ForcedRenewals,
-    mut ticker: tokio::time::Interval,
+    mut ticker: MaintenanceTicker,
     marker_requests: tokio::sync::mpsc::Sender<()>,
 ) {
     let mut changed = cache.subscribe_ocsp();
@@ -752,10 +996,12 @@ async fn run_ocsp_refreshes(
             }
         };
         tokio::select! {
-            _ = ticker.tick() => {
-                let _ = marker_requests.try_send(());
-                if !config.disable_stapling {
-                    pending = cache.ocsp_snapshot(true).into();
+            tick = ticker.next() => {
+                if tick {
+                    let _ = marker_requests.try_send(());
+                    if !config.disable_stapling {
+                        pending = cache.ocsp_snapshot(true).into();
+                    }
                 }
             }
             _ = due => {}
@@ -949,7 +1195,7 @@ async fn check_renewals_with_backoff(
                 let mut attempt = attempt;
                 // From this point cancellation is a failed attempt too. A
                 // failed marker/backend preflight must not amplify ARI wakes.
-                attempt.started = true;
+                if !attempt.begin() { return; }
                 let Some(current) = current_renewal_candidate(&cache, &snapshot, &domain, &policy) else {
                     attempt.success = true;
                     return;
@@ -988,7 +1234,9 @@ async fn check_renewals_with_backoff(
                     }
                     Err(e) => {
                         if !crate::async_jobs::should_retry(&e) {
-                            attempt.minimum_delay = attempt.backoff.renew_interval;
+                            // This flag is resolved against the latest interval
+                            // when the attempt completes, even after an await.
+                            attempt.permanent = true;
                         }
                         error!(
                             domain = %domain,
@@ -1627,14 +1875,30 @@ fn retention_has_elapsed(
         .is_some_and(|deadline| deadline < now)
 }
 
-/// Ensure an interval duration is non-zero, falling back to the provided
-/// default.
+/// Reject zero or unrepresentable monotonic deadlines, using the same defaults
+/// for both explicit configuration and cache options.
 fn normalize_interval(interval: Duration, default: Duration) -> Duration {
-    if interval.is_zero() {
-        default
-    } else {
-        interval
+    interval_deadline(tokio::time::Instant::now(), interval, default).0
+}
+
+/// Validate and construct against the same clock reading. The small defaults
+/// fit normal monotonic clocks; a synthetic clock at its absolute end is not a
+/// usable scheduler clock, regardless of configuration.
+fn interval_deadline(
+    now: tokio::time::Instant,
+    interval: Duration,
+    default: Duration,
+) -> (Duration, tokio::time::Instant) {
+    if !interval.is_zero()
+        && let Some(at) = now.checked_add(interval)
+    {
+        return (interval, at);
     }
+    (
+        default,
+        now.checked_add(default)
+            .expect("maintenance default fits the monotonic clock"),
+    )
 }
 
 // ---------------------------------------------------------------------------
