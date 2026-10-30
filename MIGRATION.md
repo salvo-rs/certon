@@ -1123,3 +1123,35 @@ revocation check by up to five minutes. Expiry checks, Must-Staple serving
 requirements, verified revocation quarantine, and the refresh concurrency limit
 are unchanged. Explicit user refresh calls and custom handshake refresh
 callbacks retain their existing behavior; they do not share this retry policy.
+
+## ACME HTTP error classification
+
+Unsuccessful signed ACME requests now return
+`Error::Acme(AcmeError::HttpResponse { status, problem_type, message })`.
+Previously these responses were flattened into `Order`, `Account` or
+`Certificate` strings. Account lookup preserves this structured error too;
+local account errors, including a missing successful `Location`, still use
+`Account`. Successful responses and exact protocol recovery outcomes are
+unchanged.
+
+`AcmeError` has a new public variant. Downstream exhaustive matches must add
+an `HttpResponse { .. }` arm (or an appropriate fallback). Consumers that
+matched HTTP failures as `Order(_)`, `Account(_)` or `Certificate(_)` should
+match the new variant and inspect `status` and `problem_type` instead of
+parsing the display message. `status` always comes from HTTP, even when a
+problem document contains a contradictory `status` field. `problem_type`
+retains the full URI and is absent for malformed or unrecognized documents.
+
+`should_retry` and `do_with_retry` stop on HTTP 4xx other than 429 and the
+exact HTTP 400 `urn:ietf:params:acme:error:badNonce` problem. The ACME client
+still retries that nonce problem once with its dedicated response nonce;
+an exhausted nonce retry retains its previous transient classification for
+an outer retry loop. Exact account-missing recovery, order-not-ready recovery
+and already-revoked confirmation occur before generic HTTP classification.
+HTTP 5xx, 429 and transport failures remain retryable. A problem URI or the
+document's `status` cannot override the actual HTTP status.
+
+The existing `RateLimited { retry_after, .. }` variant remains supported.
+This change does not introduce parsing or scheduling of HTTP `Retry-After`
+headers for signed requests: the retry loop continues using its configured
+intervals. ARI's separate `Retry-After` handling is unchanged.

@@ -140,6 +140,10 @@ impl RetryConfig {
 /// | Timeout                            | yes    |
 /// | Client errors (4xx except 429)     | **no** |
 /// | Crypto / cert / config errors      | **no** |
+///
+/// An exact HTTP 400 `urn:ietf:params:acme:error:badNonce` remains transient
+/// after the client's single protocol replay. Problem-body status fields and
+/// message strings never override the actual HTTP status.
 pub fn should_retry(err: &Error) -> bool {
     match err {
         // Explicitly marked as non-retriable.
@@ -147,6 +151,19 @@ pub fn should_retry(err: &Error) -> bool {
 
         // Rate-limit responses are always retryable.
         Error::Acme(AcmeError::RateLimited { .. }) => true,
+
+        // Classification uses transport metadata, not provider prose or its
+        // optional JSON status. Exhausted badNonce recovery remains transient.
+        Error::Acme(AcmeError::HttpResponse {
+            status,
+            problem_type,
+            ..
+        }) => {
+            !(400..500).contains(status)
+                || *status == 429
+                || (*status == 400
+                    && problem_type.as_deref() == Some("urn:ietf:params:acme:error:badNonce"))
+        }
 
         // Other ACME errors: treat as server-side / transient by default,
         // *except* challenge and authorization failures which usually indicate
