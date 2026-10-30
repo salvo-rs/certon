@@ -3,9 +3,9 @@
 **Rust 自动 HTTPS/TLS 证书管理库，基于 ACME 协议。**
 
 <!-- badges -->
-[![Crates.io](https://img.shields.io/crates/v/certon.svg)](https://crates.io/crates/certon)
-[![Documentation](https://docs.rs/certon/badge.svg)](https://docs.rs/certon)
-[![License](https://img.shields.io/crates/l/certon.svg)](LICENSE)
+[![Crates.io](assets/badges/crates-io.svg)](https://crates.io/crates/certon)
+[![Documentation](assets/badges/docs-rs.svg)](https://docs.rs/certon)
+[![License](assets/badges/license.svg)](LICENSE)
 
 [English](README.md) | **简体中文**
 
