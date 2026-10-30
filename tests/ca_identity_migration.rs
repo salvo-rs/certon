@@ -507,7 +507,13 @@ async fn unbound_split_files_under_the_new_ca_need_explicit_upgrade_too() {
     let directory = tempfile::tempdir().unwrap();
     let storage = Arc::new(FileStorage::new(directory.path()));
     let original = account("https://ca.example:8443/account/imported");
-    let prefix = certon::storage::account_key_prefix(&certon::storage::issuer_key(CA), EMAIL);
+    // This fixture uses the old escaped-email layout beneath the new CA.
+    // The current prefix helper now selects the separate hashed-email layout.
+    let prefix = format!(
+        "{}/users/{}",
+        certon::storage::acme_ca_prefix(&certon::storage::issuer_key(CA)),
+        certon::storage::safe_key(EMAIL)
+    );
     let registration = format!("{prefix}/operator.json");
     let private_key = format!("{prefix}/operator.key");
     storage

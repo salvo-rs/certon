@@ -3,11 +3,9 @@
 //! This module handles creating, loading, and saving ACME accounts to storage.
 //!
 //! Accounts are atomically stored as complete snapshots at
-//! `acme/<ca_key>/users/<email>/_certon/account.v1.key`. Legacy registration JSON
-//! and private-key files remain readable for upgrades.
-//!
-//! where `<username>` is the portion of the email address before `@`, or
-//! `"default"` if no email is provided.
+//! `acme/<ca_key>/users/_certon-account-v2/<identity-hash>/_certon/account.v1.key`.
+//! The snapshot binds the complete CA and configured email identity, separately
+//! from mutable contacts. Legacy records require an explicit, guarded upgrade.
 
 use std::sync::Arc;
 
@@ -165,6 +163,7 @@ pub fn get_primary_contact(account: &AcmeAccount) -> String {
 ///
 /// Shape: `acme/<ca_key>/users/<email>/<username>.json`
 fn storage_key_user_reg(issuer_key: &str, email: &str) -> String {
+    let identity = email;
     let email = normalise_email(email);
     let username = email_username(&email);
     let filename = if username.is_empty() {
@@ -174,7 +173,7 @@ fn storage_key_user_reg(issuer_key: &str, email: &str) -> String {
     };
     format!(
         "{}/{}.json",
-        account_key_prefix(issuer_key, &email),
+        account_key_prefix(issuer_key, identity),
         filename
     )
 }
@@ -183,6 +182,7 @@ fn storage_key_user_reg(issuer_key: &str, email: &str) -> String {
 ///
 /// Shape: `acme/<ca_key>/users/<email>/<username>.key`
 fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
+    let identity = email;
     let email = normalise_email(email);
     let username = email_username(&email);
     let filename = if username.is_empty() {
@@ -192,7 +192,7 @@ fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
     };
     format!(
         "{}/{}.key",
-        account_key_prefix(issuer_key, &email),
+        account_key_prefix(issuer_key, identity),
         filename
     )
 }
@@ -315,12 +315,22 @@ async fn read_legacy_account(
     issuer: &str,
     ca_url: &str,
     email: &str,
+    ignore_bound_foreign: bool,
 ) -> Result<Option<AcmeAccount>> {
     let [snapshot, registration, key] = legacy_account_keys(issuer, email);
     if let Some(bytes) = account_bytes(storage, &snapshot).await? {
         let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
             .map_err(|error| AcmeError::Account(format!("invalid account snapshot: {error}")))?;
         if snapshot.version == 2 {
+            if ignore_bound_foreign
+                && snapshot.ca_url.as_deref() == Some(canonical_account_ca(ca_url).as_str())
+                && snapshot.configured_email.present
+                && snapshot.configured_email.value != canonical_account_email(email)
+            {
+                let foreign = snapshot.configured_email.value.as_deref().unwrap_or("");
+                read_bound_snapshot(&bytes, ca_url, foreign)?;
+                return Ok(None);
+            }
             return read_bound_snapshot(&bytes, ca_url, email).map(Some);
         }
         if snapshot.version != 1 {
@@ -349,7 +359,7 @@ async fn read_legacy_account(
 fn storage_key_account_snapshot(issuer: &str, email: &str) -> String {
     format!(
         "{}/_certon/account.v1.key",
-        account_key_prefix(issuer, &normalise_email(email))
+        account_key_prefix(issuer, email)
     )
 }
 
@@ -473,7 +483,7 @@ pub async fn get_account(
     }
     let legacy = crate::storage::legacy_issuer_key(ca_url);
     for source in [&issuer_key, &legacy] {
-        if let Some(account) = read_legacy_account(storage, source, ca_url, email).await?
+        if let Some(account) = read_legacy_account(storage, source, ca_url, email, true).await?
             && !retired_account_matches(storage, &issuer_key, source, ca_url, email, &account)
                 .await?
         {
@@ -557,8 +567,12 @@ pub async fn migrate_account_ca_identity(
         publication = Some(current);
     }
     let mut sources = Vec::new();
-    for source in [&legacy, &issuer] {
-        if let Some(account) = read_legacy_account(storage.as_ref(), source, ca_url, email).await? {
+    // A current-CA, explicitly bound weak-email source has newer identity
+    // metadata than an old CA-slug copy of the same registered account.
+    for source in [&issuer, &legacy] {
+        if let Some(account) =
+            read_legacy_account(storage.as_ref(), source, ca_url, email, false).await?
+        {
             if !same_registered_account(&account, expected)? {
                 return Err(AcmeError::Account(
                     "migration source or destination differs from the supplied registered account"
@@ -683,29 +697,18 @@ pub(crate) async fn migrate_contact_account(
 /// This generates a fresh private key but does **not** register the account
 /// with any CA or save it to storage. The caller should register the account
 /// via the ACME protocol and then call [`save_account`].
+/// An empty normalized email produces no contact. The literal `"default"` is
+/// an explicit value, not a placeholder for no email; use an empty string for
+/// that case. Callers must choose an address supported by their CA.
 pub fn new_account(email: &str, key_type: KeyType) -> Result<AcmeAccount> {
     let private_key = generate_private_key(key_type)?;
     let private_key_pem = encode_private_key_pem(&private_key)?;
 
-    let contact = if email.is_empty() {
-        Vec::new()
-    } else {
-        let email_normalised = normalise_email(email);
-        let email_addr = if email_normalised == EMPTY_EMAIL {
-            // No actual email — leave contacts empty.
-            return Ok(AcmeAccount {
-                status: String::new(),
-                contact: Vec::new(),
-                location: String::new(),
-                terms_of_service_agreed: false,
-                private_key_pem,
-                key_type,
-            });
-        } else {
-            email_normalised
-        };
-        vec![format!("mailto:{email_addr}")]
-    };
+    // An empty identity has no contact. The old filename placeholder
+    // "default" is not a second spelling for that empty configured identity.
+    let contact = canonical_account_email(email)
+        .map(|email| vec![format!("mailto:{email}")])
+        .unwrap_or_default();
 
     Ok(AcmeAccount {
         status: String::new(),
@@ -799,19 +802,23 @@ pub(crate) async fn delete_account_for_email(
 
 /// Find the email address of the most recently modified account for a given CA.
 ///
-/// Enumerates account directories and ranks their authoritative snapshot's
-/// modification time. Legacy accounts use the newer registration/key file
-/// timestamp. Parent directory timestamps do not track snapshot overwrites.
+/// Enumerates the current versioned account namespace and ranks validated
+/// authoritative snapshots by their modification time. Legacy accounts become
+/// discoverable after explicit migration; retained source records are ignored.
+/// Parent directory timestamps do not track snapshot overwrites.
 ///
 /// Returns `Ok(None)` if no accounts exist for the given CA. The
-/// `"default"` placeholder (used for accounts with no email) is filtered
-/// out.
+/// empty configured identity is filtered out. The literal configured string
+/// `"default"` is a separate identity and remains discoverable.
 pub async fn most_recent_account_email(
     storage: &dyn Storage,
     ca_url: &str,
 ) -> Result<Option<String>> {
     let ik = crate::storage::issuer_key(ca_url);
-    let prefix = format!("{}/users", crate::storage::acme_ca_prefix(&ik));
+    let prefix = format!(
+        "{}/users/_certon-account-v2",
+        crate::storage::acme_ca_prefix(&ik)
+    );
 
     let entries = match storage.list(&prefix, false).await {
         Ok(e) => e,
@@ -827,12 +834,13 @@ pub async fn most_recent_account_email(
     let mut best_modified: Option<chrono::DateTime<chrono::Utc>> = None;
 
     for entry in &entries {
-        // Extract the email component from the key path -- it is the last
-        // segment of the entry key (which is a directory name under users/).
-        let email_part = entry.rsplit('/').next().unwrap_or("").to_string();
-
-        // Skip the "default" placeholder (represents an account with no email).
-        if email_part == "default" || email_part.is_empty() {
+        let bucket = entry.rsplit('/').next().unwrap_or("");
+        // An old email named after the namespace marker can leave unrelated
+        // assets here. Only digest buckets belong to this versioned layout.
+        if bucket.len() != 64
+            || !bucket.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || entry == &account_key_prefix(&ik, "")
+        {
             continue;
         }
 
@@ -845,7 +853,7 @@ pub async fn most_recent_account_email(
             continue;
         }
 
-        let Some(modified) = account_modified(storage, &ik, &email_part).await? else {
+        let Some(modified) = account_modified(storage, entry).await? else {
             continue;
         };
         let Some((Some(email), _)) = discovered_account(storage, ca_url, &ik, entry).await? else {
@@ -875,19 +883,31 @@ async fn account_asset_modified(
 
 async fn account_modified(
     storage: &dyn Storage,
-    issuer: &str,
-    email: &str,
+    entry: &str,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
     if let Some(modified) =
-        account_asset_modified(storage, &storage_key_account_snapshot(issuer, email)).await?
+        account_asset_modified(storage, &format!("{entry}/_certon/account.v1.key")).await?
     {
         return Ok(Some(modified));
     }
-    let registration =
-        account_asset_modified(storage, &storage_key_user_reg(issuer, email)).await?;
-    let key = account_asset_modified(storage, &storage_key_user_private_key(issuer, email)).await?;
+    // Never reverse a digest or guess an identity from mutable contacts. Old
+    // unbound assets copied into a new bucket still need explicit binding.
+    let assets = match storage.list(entry, false).await {
+        Ok(assets) => assets,
+        Err(crate::Error::Storage(StorageError::NotFound(_))) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut registration = None;
+    let mut key = None;
+    for asset in assets {
+        if asset.ends_with(".json") {
+            registration = account_asset_modified(storage, &asset).await?;
+        } else if asset.ends_with(".key") {
+            key = account_asset_modified(storage, &asset).await?;
+        }
+    }
     match (registration, key) {
-        (Some(registration), Some(key)) => Ok(Some(registration.max(key))),
+        (Some(_), Some(_)) => Err(account_migration_required()),
         (None, None) => Ok(None),
         _ => Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
     }
@@ -895,8 +915,9 @@ async fn account_modified(
 
 /// Find an ACME account whose private key PEM matches `key_pem`.
 ///
-/// Lists all account directories for the given CA URL, loads each one,
-/// and compares the stored private key PEM against `key_pem`. Returns
+/// Lists the current versioned account directories for the given CA URL,
+/// validates their CA/configured-email bindings, and compares each private key
+/// PEM against `key_pem`. Legacy accounts require explicit migration. Returns
 /// the first matching account, or `None` if no match is found.
 ///
 /// This is useful for key-based account lookup when the email address
@@ -907,7 +928,10 @@ pub async fn get_account_by_key(
     key_pem: &str,
 ) -> Result<Option<AcmeAccount>> {
     let ik = crate::storage::issuer_key(ca_url);
-    let prefix = format!("{}/users", crate::storage::acme_ca_prefix(&ik));
+    let prefix = format!(
+        "{}/users/_certon-account-v2",
+        crate::storage::acme_ca_prefix(&ik)
+    );
 
     let entries = match storage.list(&prefix, false).await {
         Ok(e) => e,
@@ -916,21 +940,22 @@ pub async fn get_account_by_key(
     };
 
     for entry in &entries {
-        // Each entry is a directory named after the email.
-        let email_part = entry.rsplit('/').next().unwrap_or("").to_string();
-
-        if email_part.is_empty() {
+        let bucket = entry.rsplit('/').next().unwrap_or("");
+        if bucket.len() != 64 || !bucket.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             continue;
         }
-
-        match discovered_account(storage, ca_url, &ik, entry).await {
-            Ok(Some((_, account))) => {
-                if account.private_key_pem == key_pem {
-                    return Ok(Some(account));
-                }
-            }
-            Ok(None) => continue,
-            Err(_) => continue,
+        let info = match storage.stat(entry).await {
+            Ok(info) => info,
+            Err(crate::Error::Storage(StorageError::NotFound(_))) => continue,
+            Err(error) => return Err(error),
+        };
+        if info.is_terminal || account_modified(storage, entry).await?.is_none() {
+            continue;
+        }
+        if let Some((_, account)) = discovered_account(storage, ca_url, &ik, entry).await?
+            && account.private_key_pem == key_pem
+        {
+            return Ok(Some(account));
         }
     }
 
@@ -1040,6 +1065,9 @@ fn atty_is_terminal() -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod email_identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1272,6 +1300,14 @@ mod tests {
                 .as_deref(),
             Some("a@example.com")
         );
+        assert!(
+            get_account_by_key(&excluded, ca, "an-unmatched-key")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stat is unavailable"),
+            "key lookup must include the empty identity and propagate its backend failure"
+        );
         for fault in [
             account_key_prefix(&issuer, "a@example.com"),
             snapshot.clone(),
@@ -1283,6 +1319,13 @@ mod tests {
             let error = most_recent_account_email(&failure, ca).await.unwrap_err();
             assert!(error.to_string().contains("stat is unavailable"));
             assert!(discover_email(&failure, ca).await.is_none());
+            assert!(
+                get_account_by_key(&failure, ca, "an-unmatched-key")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stat is unavailable")
+            );
         }
         storage.delete(&snapshot).await.unwrap();
         for fault in [registration, key] {
@@ -1458,7 +1501,8 @@ mod tests {
     fn storage_key_user_reg_empty_email() {
         let ik = crate::storage::issuer_key("https://acme.example.com/directory");
         let key = storage_key_user_reg(&ik, "");
-        assert!(key.contains("/users/default/"));
+        assert!(key.starts_with(&format!("{}/", account_key_prefix(&ik, ""))));
+        assert!(!key.starts_with(&format!("{}/", account_key_prefix(&ik, "default"))));
         assert!(key.ends_with(".json"));
     }
 

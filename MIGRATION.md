@@ -1011,3 +1011,44 @@ later revoke or obtain. ARI advice is fetched again for the new issuer identity;
 do not blindly copy old CA advice.
 Global leaf revocation markers remain unchanged and still block revoked leaves
 across all namespaces and chains.
+
+
+## Configured ACME email identities
+
+Account paths now use
+`acme/<versioned-ca>/users/_certon-account-v2/<sha256>/_certon/account.v1.key`.
+The extra namespace layer separates new paths from every old escaped email
+spelling. The bounded digest covers the normalized configured identity, with a
+separate encoding for no email. It does not use the account's mutable contacts.
+The v2 snapshot still verifies both the complete CA binding and configured email.
+
+Mailbox case, a leading lowercase `mailto:` and surrounding address whitespace
+keep their existing normalization. Distinct addresses such as
+`operator+prod@example.com` and `operator_plus_prod@example.com` no longer share
+storage or deletion targets. An empty configured identity and the literal
+`default` are now distinct; `new_account("default", ...)` therefore retains
+`mailto:default` as its contact instead of treating that string as no email.
+Callers remain responsible for configuring a valid CA-supported contact address.
+Use an empty string for no email. An old unbound `default` folder cannot prove
+whether its original configuration was empty or the literal value; its owner
+must confirm that distinction during explicit migration.
+
+Existing accounts in escaped-email folders require the explicit
+`account::migrate_account_ca_identity` procedure described above, including
+verification of the original configured identity, key and registration URI.
+This also applies to v2 snapshots written in the earlier email layout. Migration
+retains the source and publishes a source-generation receipt; account-missing
+recovery can then replace the account without resurrecting the retired source.
+When both an old CA-slug copy and a current-CA bound email source identify the
+same account, migration retains the current-CA source's contact and status data.
+A completely bound same-CA source belonging to a different email does not block
+a fresh independent account, but it cannot be imported as that new identity.
+Unbound, changed or unreadable matching sources continue to fail closed.
+
+`most_recent_account_email`, `discover_email` and `get_account_by_key` enumerate
+only authoritative snapshots in the new account namespace. Explicitly upgrade
+legacy accounts before using these discovery helpers; retained old sources do
+not compete with the current account's modification time. Discovery reads and
+validates the snapshot's configured identity, never a digest directory name or
+the account's contact list. Empty identities remain excluded from email
+discovery, while the separate literal `default` identity is discoverable.

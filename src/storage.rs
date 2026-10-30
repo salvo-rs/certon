@@ -24,7 +24,7 @@
 //! certificates/<issuer>/<domain>/<domain>.json  -- metadata sidecar
 //! revocations/<leaf-hash>.json                 -- persistent revocation intent
 //! ocsp/<domain>-<hash>                          -- OCSP staple
-//! acme/<issuer>/users/<email>/...               -- ACME account data
+//! acme/<issuer>/users/_certon-account-v2/<hash>/... -- bound ACME account data
 //! locks/<name>                                  -- distributed locks
 //! ```
 
@@ -585,9 +585,21 @@ pub fn acme_ca_prefix(issuer_key: &str) -> String {
 
 /// Return the storage key prefix for accounts under a given issuer.
 ///
-/// Example: `"acme/<safe_issuer_key>/users/<safe_email>"`
+/// The email is normalized independently of mutable account contacts. An
+/// additional versioned path layer separates these digests from every old
+/// filename-escaped email, including old strings resembling a digest.
 pub fn account_key_prefix(issuer_key: &str, email: &str) -> String {
-    legacy_account_key_prefix(issuer_key, email)
+    // JSON's optional-string encoding distinguishes null from every actual
+    // identity, including the literal "default", without delimiter ambiguity.
+    let identity = serde_json::to_string(&crate::account::canonical_account_email(email))
+        .expect("an optional string serializes");
+    let digest = storage_identity_hash(&format!("certon-account-email-v2\0{identity}"));
+    path_join(&[
+        &acme_ca_prefix(issuer_key),
+        "users",
+        "_certon-account-v2",
+        &digest,
+    ])
 }
 
 /// The exact old layout, kept separate from the current account namespace for
@@ -1131,13 +1143,23 @@ mod tests {
     #[test]
     fn account_key_prefix_with_email() {
         let ak = account_key_prefix("example.com-directory", "user@example.com");
-        assert_eq!(ak, "acme/example.com-directory/users/user@example.com");
+        assert!(ak.starts_with("acme/example.com-directory/users/_certon-account-v2/"));
+        assert_eq!(ak.rsplit('/').next().unwrap().len(), 64);
+        assert_eq!(
+            legacy_account_key_prefix("example.com-directory", "user@example.com"),
+            "acme/example.com-directory/users/user@example.com"
+        );
     }
 
     #[test]
     fn account_key_prefix_empty_email() {
         let ak = account_key_prefix("example.com-directory", "");
-        assert_eq!(ak, "acme/example.com-directory/users/default");
+        assert_ne!(ak, account_key_prefix("example.com-directory", "default"));
+        assert_eq!(ak, account_key_prefix("example.com-directory", "   "));
+        assert_eq!(
+            legacy_account_key_prefix("example.com-directory", ""),
+            "acme/example.com-directory/users/default"
+        );
     }
 }
 
