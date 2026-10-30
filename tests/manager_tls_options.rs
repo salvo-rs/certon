@@ -179,7 +179,8 @@ async fn configured_and_client_hostname_case_admit_the_same_on_demand_work() {
 
 #[tokio::test(start_paused = true)]
 async fn normalized_allowlists_preserve_decision_authority_and_default_denial() {
-    let cases: &[(Option<&[&str]>, Option<bool>, bool)] = &[
+    type AdmissionCase<'a> = (Option<&'a [&'a str]>, Option<bool>, bool);
+    let cases: &[AdmissionCase<'_>] = &[
         (Some(&["Example.COM"]), Some(false), false),
         (Some(&["Other.Example"]), Some(true), true),
         (None, Some(true), true),
