@@ -154,6 +154,15 @@ pub trait CertIssuer: Send + Sync {
     /// different issuers do not collide.
     fn issuer_key(&self) -> String;
 
+    /// A pre-upgrade storage namespace requiring explicit operator migration.
+    ///
+    /// Managers reject an old resource when the new namespace is absent rather
+    /// than silently issuing again. Custom issuers keep their existing identity
+    /// unless they explicitly advertise such a legacy namespace.
+    fn legacy_issuer_key(&self) -> Option<String> {
+        None
+    }
+
     /// Fetch advisory renewal information for this issuer's leaf certificate.
     /// The default means unsupported. Implementations must not require account
     /// registration: ARI uses an unauthenticated request.
@@ -1402,6 +1411,10 @@ impl CertIssuer for AcmeIssuer {
         issuer_key(&self.ca)
     }
 
+    fn legacy_issuer_key(&self) -> Option<String> {
+        Some(crate::storage::legacy_issuer_key(&self.ca))
+    }
+
     fn as_revoker(&self) -> Option<&dyn Revoker> {
         Some(self)
     }
@@ -1514,13 +1527,22 @@ mod tests {
     #[test]
     fn test_issuer_key_lets_encrypt() {
         let ik = issuer_key(LETS_ENCRYPT_PRODUCTION);
-        assert!(ik.contains("acme-v02.api.letsencrypt.org"));
+        assert!(ik.starts_with("_certon-ca-v2/"));
+        assert_eq!(ik.len(), "_certon-ca-v2/".len() + 64);
+        assert_eq!(
+            crate::storage::legacy_issuer_key(LETS_ENCRYPT_PRODUCTION),
+            "acme-v02.api.letsencrypt.org-directory"
+        );
     }
 
     #[test]
     fn test_issuer_key_staging() {
         let ik = issuer_key(LETS_ENCRYPT_STAGING);
-        assert!(ik.contains("acme-staging-v02.api.letsencrypt.org"));
+        assert_ne!(ik, issuer_key(LETS_ENCRYPT_PRODUCTION));
+        assert_eq!(
+            crate::storage::legacy_issuer_key(LETS_ENCRYPT_STAGING),
+            "acme-staging-v02.api.letsencrypt.org-directory"
+        );
     }
 
     #[test]

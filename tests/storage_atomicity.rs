@@ -194,9 +194,16 @@ async fn legacy_account_and_snapshot_names_do_not_collide() {
     let directory = tempfile::tempdir().unwrap();
     let storage = FileStorage::new(directory.path());
     let ca = "https://acme.example.com/directory";
-    let account = new_account("account.v1@example.com", KeyType::EcdsaP256).unwrap();
+    let mut account = new_account("account.v1@example.com", KeyType::EcdsaP256).unwrap();
+    account.status = "valid".into();
+    account.location = "https://acme.example.com/account/legacy".into();
     let issuer = certon::storage::issuer_key(ca);
-    let prefix = certon::storage::account_key_prefix(&issuer, "account.v1@example.com");
+    // Use the real old layout, not the current account-prefix helper.
+    let prefix = format!(
+        "{}/users/{}",
+        certon::storage::acme_ca_prefix(&issuer),
+        certon::storage::safe_key("account.v1@example.com")
+    );
     let registration_key = format!("{prefix}/account.v1.json");
     let private_key = format!("{prefix}/account.v1.key");
     storage
@@ -213,6 +220,24 @@ async fn legacy_account_and_snapshot_names_do_not_collide() {
         .store(&private_key, account.private_key_pem.as_bytes())
         .await
         .unwrap();
+    assert!(
+        get_account(&storage, ca, "account.v1@example.com")
+            .await
+            .is_err(),
+        "complete unbound legacy assets require explicit migration"
+    );
+    certon::account::migrate_account_ca_identity(
+        Arc::new(FileStorage::new(directory.path())),
+        ca,
+        "account.v1@example.com",
+        &account,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        storage.load(&private_key).await.unwrap(),
+        account.private_key_pem.as_bytes()
+    );
     let loaded = get_account(&storage, ca, "account.v1@example.com")
         .await
         .unwrap()

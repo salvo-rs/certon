@@ -9,6 +9,8 @@
 //! where `<username>` is the portion of the email address before `@`, or
 //! `"default"` if no email is provided.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -16,7 +18,7 @@ use crate::crypto::{
     KeyType, decode_private_key_pem, encode_private_key_pem, generate_private_key,
 };
 use crate::error::{AcmeError, Result, StorageError};
-use crate::storage::{Storage, account_key_prefix, safe_key};
+use crate::storage::{Storage, account_key_prefix, legacy_account_key_prefix, safe_key};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -111,6 +113,20 @@ fn normalise_email(email: &str) -> String {
     }
 }
 
+/// The configured identity, distinct from its old filename spelling.
+pub(crate) fn canonical_account_email(email: &str) -> Option<String> {
+    let email = email
+        .strip_prefix("mailto:")
+        .unwrap_or(email)
+        .trim()
+        .to_lowercase();
+    (!email.is_empty()).then_some(email)
+}
+
+fn canonical_account_ca(ca_url: &str) -> String {
+    crate::storage::canonical_ca_url(ca_url).unwrap_or_else(|| ca_url.to_owned())
+}
+
 /// Extracts the username portion of an email address (the part before `@`).
 ///
 /// If there is no `@` character the entire input is returned. If the `@` is
@@ -184,8 +200,150 @@ fn storage_key_user_private_key(issuer_key: &str, email: &str) -> String {
 #[derive(Serialize, Deserialize)]
 struct AccountSnapshot {
     version: u32,
+    #[serde(default)]
+    ca_url: Option<String>,
+    #[serde(default)]
+    configured_email: RequiredEmail,
     registration: AcmeAccount,
     private_key_pem: String,
+}
+
+/// A missing binding is not the explicitly configured empty identity (`null`).
+#[derive(Default)]
+struct RequiredEmail {
+    present: bool,
+    value: Option<String>,
+}
+
+impl Serialize for RequiredEmail {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RequiredEmail {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(Self {
+            present: true,
+            value: Option::<String>::deserialize(deserializer)?,
+        })
+    }
+}
+
+fn legacy_account_keys(issuer: &str, email: &str) -> [String; 3] {
+    let email = normalise_email(email);
+    let username = email_username(&email);
+    let prefix = legacy_account_key_prefix(issuer, &email);
+    let name = safe_key(username);
+    let reg = if name.is_empty() {
+        DEFAULT_REG_FILENAME
+    } else {
+        &name
+    };
+    let key = if name.is_empty() {
+        DEFAULT_KEY_FILENAME
+    } else {
+        &name
+    };
+    [
+        format!("{prefix}/_certon/account.v1.key"),
+        format!("{prefix}/{reg}.json"),
+        format!("{prefix}/{key}.key"),
+    ]
+}
+
+fn account_migration_required() -> crate::Error {
+    crate::Error::Config("an account exists in an unbound legacy CA namespace; explicitly call account::migrate_account_ca_identity with the original account key/registration after confirming its directory endpoint".into())
+}
+
+async fn account_bytes(storage: &dyn Storage, key: &str) -> Result<Option<Vec<u8>>> {
+    match storage.load(key).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(crate::Error::Storage(StorageError::NotFound(_))) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_bound_snapshot(bytes: &[u8], ca_url: &str, email: &str) -> Result<AcmeAccount> {
+    let snapshot: AccountSnapshot = serde_json::from_slice(bytes)
+        .map_err(|error| AcmeError::Account(format!("invalid account snapshot: {error}")))?;
+    if snapshot.version != 2 {
+        return Err(account_migration_required());
+    }
+    if snapshot.ca_url.as_deref() != Some(canonical_account_ca(ca_url).as_str())
+        || !snapshot.configured_email.present
+        || snapshot.configured_email.value != canonical_account_email(email)
+    {
+        return Err(crate::Error::Config("account snapshot is bound to a different CA endpoint or configured identity, or lacks its required binding".into()));
+    }
+    validate_account(snapshot.registration, snapshot.private_key_pem)
+}
+
+async fn discovered_account(
+    storage: &dyn Storage,
+    ca_url: &str,
+    issuer: &str,
+    entry: &str,
+) -> Result<Option<(Option<String>, AcmeAccount)>> {
+    let key = format!("{entry}/_certon/account.v1.key");
+    let Some(bytes) = account_bytes(storage, &key).await? else {
+        return Ok(None);
+    };
+    let snapshot: AccountSnapshot = serde_json::from_slice(&bytes).map_err(|error| {
+        AcmeError::Account(format!("invalid discovered account snapshot: {error}"))
+    })?;
+    if snapshot.version != 2 || !snapshot.configured_email.present {
+        return Err(account_migration_required());
+    }
+    let email = snapshot.configured_email.value;
+    if storage_key_account_snapshot(issuer, email.as_deref().unwrap_or_default()) != key {
+        return Err(crate::Error::Config(
+            "discovered account snapshot is in another configured identity's slot".into(),
+        ));
+    }
+    let account = read_bound_snapshot(&bytes, ca_url, email.as_deref().unwrap_or_default())?;
+    Ok(Some((email, account)))
+}
+
+async fn read_legacy_account(
+    storage: &dyn Storage,
+    issuer: &str,
+    ca_url: &str,
+    email: &str,
+) -> Result<Option<AcmeAccount>> {
+    let [snapshot, registration, key] = legacy_account_keys(issuer, email);
+    if let Some(bytes) = account_bytes(storage, &snapshot).await? {
+        let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|error| AcmeError::Account(format!("invalid account snapshot: {error}")))?;
+        if snapshot.version == 2 {
+            return read_bound_snapshot(&bytes, ca_url, email).map(Some);
+        }
+        if snapshot.version != 1 {
+            return Err(AcmeError::Account("unsupported account snapshot version".into()).into());
+        }
+        return validate_account(snapshot.registration, snapshot.private_key_pem).map(Some);
+    }
+    match (
+        account_bytes(storage, &registration).await?,
+        account_bytes(storage, &key).await?,
+    ) {
+        (None, None) => Ok(None),
+        (Some(registration), Some(key)) => {
+            let registration = serde_json::from_slice(&registration).map_err(|error| {
+                AcmeError::Account(format!("invalid legacy account registration: {error}"))
+            })?;
+            let key = String::from_utf8(key).map_err(|error| {
+                AcmeError::Account(format!("account private key is not UTF-8: {error}"))
+            })?;
+            validate_account(registration, key).map(Some)
+        }
+        _ => Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
+    }
 }
 
 fn storage_key_account_snapshot(issuer: &str, email: &str) -> String {
@@ -193,6 +351,97 @@ fn storage_key_account_snapshot(issuer: &str, email: &str) -> String {
         "{}/_certon/account.v1.key",
         account_key_prefix(issuer, &normalise_email(email))
     )
+}
+
+#[derive(Serialize, Deserialize)]
+struct AccountMigrationReceipt {
+    version: u32,
+    ca_url: String,
+    #[serde(default)]
+    configured_email: RequiredEmail,
+    source_issuer: String,
+    source_email: String,
+    public_key_identity: String,
+    location: String,
+}
+
+fn public_account_identity(account: &AcmeAccount) -> Result<String> {
+    let key = decode_private_key_pem(&account.private_key_pem)?;
+    crate::acme_client::key_authorization("account-migration-v1", &key)
+}
+
+fn migration_receipt_key(target: &str, email: &str, source: &str) -> String {
+    let identity = serde_json::to_string(&canonical_account_email(email))
+        .expect("an optional string serializes");
+    format!(
+        "{}/_certon/account-migrations/{}/{}.key",
+        crate::storage::acme_ca_prefix(target),
+        crate::storage::storage_identity_hash(&format!("configured-email\0{identity}")),
+        crate::storage::storage_identity_hash(&format!(
+            "legacy-source\0{source}\0{}",
+            normalise_email(email)
+        )),
+    )
+}
+
+pub(crate) async fn retired_account_matches(
+    storage: &dyn Storage,
+    target: &str,
+    source: &str,
+    ca_url: &str,
+    email: &str,
+    account: &AcmeAccount,
+) -> Result<bool> {
+    let Some(bytes) = account_bytes(storage, &migration_receipt_key(target, email, source)).await?
+    else {
+        return Ok(false);
+    };
+    let receipt: AccountMigrationReceipt = serde_json::from_slice(&bytes).map_err(|error| {
+        AcmeError::Account(format!("invalid account migration receipt: {error}"))
+    })?;
+    if receipt.version != 1
+        || receipt.ca_url != canonical_account_ca(ca_url)
+        || !receipt.configured_email.present
+        || receipt.configured_email.value != canonical_account_email(email)
+        || receipt.source_issuer != source
+        || receipt.source_email != normalise_email(email)
+    {
+        return Err(crate::Error::Config(
+            "account migration receipt lacks its required identity binding".into(),
+        ));
+    }
+    Ok(receipt.location == account.location
+        && receipt.public_key_identity == public_account_identity(account)?)
+}
+
+pub(crate) async fn record_account_migration(
+    storage: &dyn Storage,
+    target: &str,
+    source: &str,
+    ca_url: &str,
+    email: &str,
+    account: &AcmeAccount,
+) -> Result<()> {
+    let receipt = AccountMigrationReceipt {
+        version: 1,
+        ca_url: canonical_account_ca(ca_url),
+        configured_email: RequiredEmail {
+            present: true,
+            value: canonical_account_email(email),
+        },
+        source_issuer: source.into(),
+        source_email: normalise_email(email),
+        public_key_identity: public_account_identity(account)?,
+        location: account.location.clone(),
+    };
+    let bytes = serde_json::to_vec(&receipt).map_err(|error| {
+        AcmeError::Account(format!(
+            "cannot serialize account migration receipt: {error}"
+        ))
+    })?;
+    storage
+        .store(&migration_receipt_key(target, email, source), &bytes)
+        .await
 }
 
 fn validate_account(mut account: AcmeAccount, key_pem: String) -> Result<AcmeAccount> {
@@ -217,56 +466,21 @@ pub async fn get_account(
     email: &str,
 ) -> Result<Option<AcmeAccount>> {
     let issuer_key = crate::storage::issuer_key(ca_url);
-    let reg_key = storage_key_user_reg(&issuer_key, email);
-    let pk_key = storage_key_user_private_key(&issuer_key, email);
-
-    match storage
-        .load(&storage_key_account_snapshot(&issuer_key, email))
-        .await
+    if let Some(bytes) =
+        account_bytes(storage, &storage_key_account_snapshot(&issuer_key, email)).await?
     {
-        Ok(bytes) => {
-            let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
-                .map_err(|e| AcmeError::Account(format!("invalid account snapshot: {e}")))?;
-            if snapshot.version != 1 {
-                return Err(
-                    AcmeError::Account("unsupported account snapshot version".into()).into(),
-                );
-            }
-            return Ok(Some(validate_account(
-                snapshot.registration,
-                snapshot.private_key_pem,
-            )?));
+        return read_bound_snapshot(&bytes, ca_url, email).map(Some);
+    }
+    let legacy = crate::storage::legacy_issuer_key(ca_url);
+    for source in [&issuer_key, &legacy] {
+        if let Some(account) = read_legacy_account(storage, source, ca_url, email).await?
+            && !retired_account_matches(storage, &issuer_key, source, ca_url, email, &account)
+                .await?
+        {
+            return Err(account_migration_required());
         }
-        Err(crate::error::Error::Storage(StorageError::NotFound(_))) => {}
-        Err(error) => return Err(error),
     }
-    let mut legacy = Vec::new();
-    for key in [&reg_key, &pk_key] {
-        legacy.push(match storage.load(key).await {
-            Ok(bytes) => Some(bytes),
-            Err(crate::error::Error::Storage(StorageError::NotFound(_))) => None,
-            Err(error) => return Err(error),
-        });
-    }
-    let (reg_bytes, key_bytes) = match (legacy.remove(0), legacy.remove(0)) {
-        (None, None) => return Ok(None),
-        (Some(reg), Some(key)) => (reg, key),
-        _ => return Err(AcmeError::Account("incomplete legacy account resources".into()).into()),
-    };
-    let registration = serde_json::from_slice(&reg_bytes).map_err(|e| {
-        AcmeError::Account(format!("failed to deserialise account registration: {e}"))
-    })?;
-    let key_pem = String::from_utf8(key_bytes)
-        .map_err(|e| AcmeError::Account(format!("account private key is not valid UTF-8: {e}")))?;
-    let account = validate_account(registration, key_pem)?;
-
-    debug!(
-        email = email,
-        ca = ca_url,
-        "loaded existing ACME account from storage"
-    );
-
-    Ok(Some(account))
+    Ok(None)
 }
 
 /// Save an ACME account to storage transactionally.
@@ -283,6 +497,100 @@ pub async fn save_account(
     save_account_for_email(storage, ca_url, &email, account).await
 }
 
+/// Explicitly bind a legacy account to its operator-confirmed CA endpoint.
+///
+/// The caller must verify the original full directory URL and configured email,
+/// then supply that registered account's original key and URI as `expected`.
+/// An old record alone cannot prove endpoint ownership. Stop old certon versions
+/// first. Source records are retained; no ambiguous account is adopted on read.
+///
+/// A source-generation receipt allows later invalid-account recovery without
+/// resurrecting or permanently blocking on that retired account. Both the new
+/// complete snapshot and receipt must publish before this call returns success.
+/// Failure or cancellation can leave a complete new snapshot: retry this call
+/// to finish the receipt. It never overwrites a different destination account.
+pub async fn migrate_account_ca_identity(
+    storage: Arc<dyn Storage>,
+    ca_url: &str,
+    email: &str,
+    expected: &AcmeAccount,
+) -> Result<()> {
+    if expected.location.is_empty() {
+        return Err(AcmeError::Account(
+            "migration requires the original registered account URI and key".into(),
+        )
+        .into());
+    }
+    let issuer = crate::storage::issuer_key(ca_url);
+    let legacy = crate::storage::legacy_issuer_key(ca_url);
+    let mut names = vec![
+        format!("acme_account_{issuer}"),
+        format!("acme_account_{legacy}"),
+    ];
+    names.sort_by_key(|name| crate::storage::lock_storage_identity(name));
+    names.dedup_by(|first, second| {
+        crate::storage::lock_storage_identity(first)
+            == crate::storage::lock_storage_identity(second)
+    });
+    let mut locks = Vec::new();
+    for name in names {
+        locks.push(crate::storage::acquire(storage.clone(), &name).await?);
+    }
+    let target = storage_key_account_snapshot(&issuer, email);
+    let mut publication = None;
+    let mut target_bound = false;
+    if let Some(bytes) = account_bytes(storage.as_ref(), &target).await? {
+        let snapshot: AccountSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|error| AcmeError::Account(format!("invalid account snapshot: {error}")))?;
+        let current = if snapshot.version == 1 {
+            validate_account(snapshot.registration, snapshot.private_key_pem)?
+        } else {
+            read_bound_snapshot(&bytes, ca_url, email)?
+        };
+        if !same_registered_account(&current, expected)? {
+            return Err(AcmeError::Account(
+                "migration destination already contains another registered account".into(),
+            )
+            .into());
+        }
+        target_bound = snapshot.version == 2;
+        publication = Some(current);
+    }
+    let mut sources = Vec::new();
+    for source in [&legacy, &issuer] {
+        if let Some(account) = read_legacy_account(storage.as_ref(), source, ca_url, email).await? {
+            if !same_registered_account(&account, expected)? {
+                return Err(AcmeError::Account(
+                    "migration source or destination differs from the supplied registered account"
+                        .into(),
+                )
+                .into());
+            }
+            if publication.is_none() {
+                publication = Some(account);
+            }
+            sources.push(source);
+        }
+    }
+    if sources.is_empty() {
+        return Err(AcmeError::Account("no legacy account is available to migrate".into()).into());
+    }
+    if !target_bound {
+        save_account_for_email(
+            storage.as_ref(),
+            ca_url,
+            email,
+            publication.as_ref().expect("a source was checked"),
+        )
+        .await?;
+    }
+    for source in sources {
+        record_account_migration(storage.as_ref(), &issuer, source, ca_url, email, expected)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Issuer persistence uses the configured identity rather than mutable contacts.
 pub(crate) async fn save_account_for_email(
     storage: &dyn Storage,
@@ -293,7 +601,12 @@ pub(crate) async fn save_account_for_email(
     let issuer_key = crate::storage::issuer_key(ca_url);
 
     let snapshot = AccountSnapshot {
-        version: 1,
+        version: 2,
+        ca_url: Some(canonical_account_ca(ca_url)),
+        configured_email: RequiredEmail {
+            present: true,
+            value: canonical_account_email(email),
+        },
         registration: account.clone(),
         private_key_pem: account.private_key_pem.clone(),
     };
@@ -535,10 +848,13 @@ pub async fn most_recent_account_email(
         let Some(modified) = account_modified(storage, &ik, &email_part).await? else {
             continue;
         };
+        let Some((Some(email), _)) = discovered_account(storage, ca_url, &ik, entry).await? else {
+            return Err(account_migration_required());
+        };
         let dominated = best_modified.is_some_and(|bm| modified <= bm);
         if !dominated {
             best_modified = Some(modified);
-            best_email = Some(email_part);
+            best_email = Some(email);
         }
     }
 
@@ -607,8 +923,8 @@ pub async fn get_account_by_key(
             continue;
         }
 
-        match get_account(storage, ca_url, &email_part).await {
-            Ok(Some(account)) => {
+        match discovered_account(storage, ca_url, &ik, entry).await {
+            Ok(Some((_, account))) => {
                 if account.private_key_pem == key_pem {
                     return Ok(Some(account));
                 }
@@ -813,7 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_discovery_mixes_legacy_and_authoritative_snapshots() {
+    async fn account_discovery_uses_explicitly_bound_legacy_imports() {
         let directory = tempfile::tempdir().unwrap();
         let storage = crate::FileStorage::new(directory.path());
         let ca = "https://acme.example.com/directory";
@@ -832,6 +1148,15 @@ mod tests {
             .unwrap();
         set_modified(&directory.path().join(&reg), 1_700_000_000);
         set_modified(&directory.path().join(&key), 1_700_002_000);
+        // An operator-confirmed legacy import must publish its identity binding
+        // before discovery can use it. Preserve the imported modification rank.
+        save_account(&storage, ca, &a).await.unwrap();
+        set_modified(
+            &directory
+                .path()
+                .join(storage_key_account_snapshot(&issuer, "a@example.com")),
+            1_700_002_000,
+        );
         set_modified(
             &directory
                 .path()

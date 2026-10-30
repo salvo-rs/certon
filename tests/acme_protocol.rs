@@ -14,6 +14,99 @@ fn round9_account_thumbprint(account: &certon::account::AcmeAccount) -> String {
 }
 
 #[tokio::test]
+async fn explicitly_migrated_ca_account_recovers_without_resurrecting_legacy_identity() {
+    use certon::Storage;
+    let server = Server::start(false).await;
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(FileStorage::new(directory.path()));
+    let ca = format!("{}/directory", server.url);
+    let mut original =
+        certon::account::new_account("review@example.com", KeyType::EcdsaP256).unwrap();
+    original.location = format!("{}/account/old", server.url);
+    original.status = "valid".into();
+    let old_key = format!(
+        "acme/{}/users/review@example.com/_certon/account.v1.key",
+        certon::storage::safe_key(&certon::storage::legacy_issuer_key(&ca))
+    );
+    let old_bytes = serde_json::to_vec(
+        &json!({"version":1,"registration":original,"private_key_pem":original.private_key_pem}),
+    )
+    .unwrap();
+    storage.store(&old_key, &old_bytes).await.unwrap();
+    certon::account::migrate_account_ca_identity(
+        storage.clone(),
+        &ca,
+        "review@example.com",
+        &original,
+    )
+    .await
+    .unwrap();
+    server.order_problem_responses.lock().unwrap().push_back((
+        400,
+        json!({"type":"urn:ietf:params:acme:error:accountDoesNotExist"}).to_string(),
+    ));
+    let supplied = rcgen::KeyPair::generate().unwrap().serialize_pem();
+    let build = || {
+        AcmeIssuer::builder()
+            .ca(&ca)
+            .test_ca(&ca)
+            .storage(storage.clone())
+            .email("review@example.com")
+            .agreed(true)
+            .account_key_pem(supplied.clone())
+            .build()
+    };
+    let issuer = build();
+    issuer
+        .issue(b"csr", &["review.example.com".into()])
+        .await
+        .unwrap();
+    let recovered = certon::account::get_account(storage.as_ref(), &ca, "review@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        round9_account_thumbprint(&recovered),
+        round9_account_thumbprint(&original)
+    );
+    assert_ne!(recovered.location, original.location);
+    assert_eq!(storage.load(&old_key).await.unwrap(), old_bytes);
+    drop(issuer);
+    build()
+        .issue(b"csr", &["review.example.com".into()])
+        .await
+        .unwrap();
+    let reloaded = certon::account::get_account(storage.as_ref(), &ca, "review@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        round9_account_thumbprint(&reloaded),
+        round9_account_thumbprint(&recovered)
+    );
+    assert_eq!(reloaded.location, recovered.location);
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/new-account")
+            .count(),
+        1
+    );
+    let orders: Vec<_> = requests
+        .iter()
+        .filter(|request| request.path == "/new-order")
+        .collect();
+    assert_eq!(orders.len(), 3);
+    assert_eq!(orders[0].protected["kid"], original.location);
+    assert!(
+        orders[1..]
+            .iter()
+            .all(|request| request.protected["kid"] == recovered.location)
+    );
+}
+
+#[tokio::test]
 async fn round9_only_the_exact_account_missing_problem_may_replace_a_persisted_account() {
     let missing = "urn:ietf:params:acme:error:accountDoesNotExist";
     let unauthorized = "urn:ietf:params:acme:error:unauthorized";

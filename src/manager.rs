@@ -482,11 +482,38 @@ impl CertManager {
     /// Check the certificate store, propagating backend failures.
     async fn storage_has_cert_resources_any_issuer(&self, domain: &str) -> Result<bool> {
         for issuer in &self.issuers {
-            if self.certificates.has(&issuer.issuer_key(), domain).await? {
+            if self
+                .load_issuer_resource(issuer.as_ref(), domain)
+                .await?
+                .is_some()
+            {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Old namespaces contain no proof of the full endpoint they belonged to.
+    /// Never treat their resources as either this issuer's credentials or proof
+    /// of absence permitting automatic replacement issuance.
+    pub(crate) async fn load_issuer_resource(
+        &self,
+        issuer: &dyn CertIssuer,
+        domain: &str,
+    ) -> Result<Option<CertificateResource>> {
+        let key = issuer.issuer_key();
+        if let Some(resource) = self.certificates.load(&key, domain).await? {
+            return Ok(Some(resource));
+        }
+        if let Some(legacy) = issuer.legacy_issuer_key()
+            && legacy != key
+            && self.certificates.has(&legacy, domain).await?
+        {
+            return Err(Error::Config(
+                "a certificate exists in an ambiguous legacy CA namespace; explicitly migrate it after confirming the original directory endpoint".into(),
+            ));
+        }
+        Ok(None)
     }
 
     /// Select the newest valid resource across configured issuers. An older
@@ -508,7 +535,7 @@ impl CertManager {
             let issuer_key = issuer.issuer_key();
             // Backend failures must remain failures even if another issuer has
             // a usable resource. Only invalid certificate contents are skipped.
-            if let Some(resource) = self.certificates.load(&issuer_key, domain).await? {
+            if let Some(resource) = self.load_issuer_resource(issuer.as_ref(), domain).await? {
                 let cert = match Self::parse_managed_certificate(&resource, domain) {
                     Ok(cert) => cert,
                     Err(error) => {
@@ -1341,7 +1368,7 @@ impl CertManager {
         domain: &str,
     ) -> Result<(crate::crypto::PrivateKey, String)> {
         for issuer in &self.issuers {
-            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
+            if let Some(resource) = self.load_issuer_resource(issuer.as_ref(), domain).await? {
                 let pem = String::from_utf8(resource.private_key_pem)
                     .map_err(|e| Error::Config(format!("invalid private key PEM: {e}")))?;
                 let key = decode_private_key_pem(&pem)?;
@@ -1815,7 +1842,7 @@ impl CertManager {
             found_issuer = true;
             // Default selection checks all configured stores: backend errors
             // must not quietly redirect a destructive operation to another CA.
-            let Some(resource) = self.certificates.load(&key, domain).await? else {
+            let Some(resource) = self.load_issuer_resource(issuer.as_ref(), domain).await? else {
                 continue;
             };
             if issuer_key.is_some() {
@@ -1915,7 +1942,7 @@ impl CertManager {
             // All certon writers use the lifecycle lock. Check the leaf again as
             // protection against an independently updated custom CertStore; this
             // is not an atomic CAS against writers that ignore the shared lock.
-            if let Some(current) = self.certificates.load(&issuer_key, domain).await?
+            if let Some(current) = self.load_issuer_resource(issuer.as_ref(), domain).await?
                 && crate::storage::resource_leaf_hash(&current)? == leaf_hash
             {
                 self.delete_site_assets(&issuer_key, domain).await?;
@@ -2096,7 +2123,7 @@ impl CertManager {
         // an unusable first/best leaf and overlooking a healthy fallback.
         let mut candidates = Vec::new();
         for issuer in &self.issuers {
-            if let Some(resource) = self.certificates.load(&issuer.issuer_key(), domain).await? {
+            if let Some(resource) = self.load_issuer_resource(issuer.as_ref(), domain).await? {
                 match Self::parse_managed_certificate(&resource, domain) {
                     Ok(cert) => candidates.push(Arc::new(cert)),
                     Err(error) => {

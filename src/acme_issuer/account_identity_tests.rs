@@ -437,6 +437,12 @@ async fn legacy_pair_partial_delete(has_alias: bool) {
             )
             .await
             .unwrap();
+        // The operator-confirmed legacy import publishes its CA/configured
+        // identity binding before ordinary recovery may use the old account.
+        // Keep both old files to exercise the original partial-delete faults.
+        save_account_for_email(&storage.inner, CA, CONTACT, &old)
+            .await
+            .unwrap();
         if has_alias {
             migrate_contact_account(storage.as_ref(), CA, identity, &old)
                 .await

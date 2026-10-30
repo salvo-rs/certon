@@ -1123,23 +1123,20 @@ pub async fn clean_storage(
     // only from a valid snapshot whose identity maps back to this exact site.
     let mut groups = std::collections::BTreeMap::new();
     for physical_site in sites {
-        let Some((issuer, folder)) = physical_site
-            .strip_prefix("certificates/")
-            .and_then(|path| path.split_once('/'))
-        else {
+        let Some((issuer, folder)) = crate::storage::certificate_site_parts(&physical_site) else {
             continue;
         };
         let safe_name = match crate::storage::load_certificate_snapshot_from_site(
             storage,
             &physical_site,
-            issuer,
+            &issuer,
         )
         .await
         {
             Ok(resource) => {
                 let safe_name = crate::storage::safe_key(&resource.names_key());
                 let canonical =
-                    crate::storage::certificate_site_prefix_from_safe_name(issuer, &safe_name);
+                    crate::storage::certificate_site_prefix_from_safe_name(&issuer, &safe_name);
                 if physical_site != canonical && folder != safe_name {
                     continue;
                 }
@@ -1154,7 +1151,7 @@ pub async fn clean_storage(
             // or identity-less hashed sites, including legacy-only imports.
             Err(_) => continue,
         };
-        let canonical = crate::storage::certificate_site_prefix_from_safe_name(issuer, &safe_name);
+        let canonical = crate::storage::certificate_site_prefix_from_safe_name(&issuer, &safe_name);
         groups
             .entry(canonical)
             .or_insert_with(|| (issuer.to_owned(), safe_name));

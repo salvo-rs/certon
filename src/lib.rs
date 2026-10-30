@@ -230,11 +230,15 @@ async fn ensure_default_agreement(
     let issuer = storage::issuer_key(LETS_ENCRYPT_PRODUCTION);
     let mut needs_account = false;
     for domain in domains {
-        match manager
-            .certificates
-            .load(&issuer, &domain.to_lowercase())
-            .await?
-        {
+        let resource = match manager.issuers.iter().find(|ca| ca.issuer_key() == issuer) {
+            Some(ca) => {
+                manager
+                    .load_issuer_resource(ca.as_ref(), &domain.to_lowercase())
+                    .await?
+            }
+            None => None,
+        };
+        match resource {
             None => {
                 needs_account = true;
                 break;
