@@ -8,6 +8,7 @@
 //!   challenges are not practical, as it supports email-based domain validation. Note that REST API
 //!   access may be restricted by payment tier.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -814,6 +815,46 @@ struct ZeroSslCertResponse {
     /// Error information, if any.
     #[serde(default)]
     error: Option<serde_json::Value>,
+    #[serde(default)]
+    success: Option<serde_json::Value>,
+    #[serde(default)]
+    validation: Option<ZeroSslValidationOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ZeroSslValidationOptions {
+    #[serde(default)]
+    email_validation: BTreeMap<String, Vec<String>>,
+}
+
+// Preserve explicit null separately from a missing field. Besides avoiding
+// accidental confirmation, this lets derived deserialization reject duplicate
+// confirmation/identity fields even when their first value is null.
+#[derive(Default)]
+struct ZeroSslPresentValue(Option<serde_json::Value>);
+
+impl<'de> Deserialize<'de> for ZeroSslPresentValue {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(|value| Self(Some(value)))
+    }
+}
+
+#[derive(Deserialize)]
+struct ZeroSslEmailResponse {
+    #[serde(default)]
+    success: ZeroSslPresentValue,
+    #[serde(default)]
+    error: ZeroSslPresentValue,
+    #[serde(default)]
+    id: ZeroSslPresentValue,
+    #[serde(default)]
+    status: ZeroSslPresentValue,
+    #[serde(default)]
+    validation_type: ZeroSslPresentValue,
+    #[serde(default)]
+    validation_emails: ZeroSslPresentValue,
 }
 
 /// Response from the ZeroSSL certificate download endpoint.
@@ -834,9 +875,10 @@ struct ZeroSslDownloadResponse {
 /// A certificate issuer that uses ZeroSSL's REST API directly, bypassing ACME.
 ///
 /// This issuer communicates with ZeroSSL's REST API to create, validate, and
-/// download certificates. It uses **email-based domain validation** by default,
-/// which means ZeroSSL will send a validation email to the domain's
-/// administrative contacts (e.g. `admin@example.com`).
+/// download certificates. It uses **email-based domain validation**. Configure
+/// one address for each requested domain with [`Self::with_validation_email`];
+/// the address must appear in ZeroSSL's eligible validation emails for that
+/// domain. A recipient must approve the email before issuance can finish.
 ///
 /// # Limitations
 ///
@@ -855,7 +897,9 @@ struct ZeroSslDownloadResponse {
 /// let storage: Arc<dyn Storage> = Arc::new(FileStorage::default());
 /// let issuer = ZeroSslApiIssuer::new("your-api-key", storage)
 ///     .with_validity_days(90)
-///     .with_key_type(KeyType::EcdsaP256);
+///     .with_key_type(KeyType::EcdsaP256)
+///     .with_validation_email("example.com", "admin@example.com")?;
+/// # Ok::<(), certon::Error>(())
 /// ```
 pub struct ZeroSslApiIssuer {
     /// ZeroSSL API key.
@@ -868,6 +912,8 @@ pub struct ZeroSslApiIssuer {
     key_type: KeyType,
     /// Interval between status polls.
     poll_interval: Duration,
+    /// Explicit per-domain recipients; never inferred from administrative names.
+    validation_emails: BTreeMap<String, String>,
     #[cfg(test)]
     revocation_origin: Option<Url>,
 }
@@ -885,6 +931,7 @@ impl std::fmt::Debug for ZeroSslApiIssuer {
 
 impl ZeroSslApiIssuer {
     /// Create a new `ZeroSslApiIssuer` with the given API key and storage.
+    /// Configure recipients with [`Self::with_validation_email`] before issuance.
     pub fn new(api_key: impl Into<String>, storage: Arc<dyn Storage>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -892,6 +939,7 @@ impl ZeroSslApiIssuer {
             storage,
             key_type: KeyType::EcdsaP256,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            validation_emails: BTreeMap::new(),
             #[cfg(test)]
             revocation_origin: None,
         }
@@ -915,6 +963,139 @@ impl ZeroSslApiIssuer {
         self
     }
 
+    /// Select an email validation recipient for one domain.
+    ///
+    /// Call once per requested domain. DNS names are compared without ASCII
+    /// case or a trailing dot; wildcard prefixes remain significant. Duplicate
+    /// domains and email list delimiters are rejected. Addresses are matched
+    /// exactly against the CA's `validation.email_validation` candidates.
+    /// The selected addresses are sent in requested-domain order using the
+    /// REST API's `validation_email` comma-separated form field. Extra configured
+    /// domains may be retained for later requests using the same issuer.
+    pub fn with_validation_email(
+        mut self,
+        domain: impl AsRef<str>,
+        email: impl AsRef<str>,
+    ) -> Result<Self> {
+        let domain = Self::validation_domain(domain.as_ref())?;
+        let email = email.as_ref();
+        if email.len() > 254
+            || email
+                .bytes()
+                .any(|c| c.is_ascii_whitespace() || c.is_ascii_control() || c == b',')
+            || !email.split_once('@').is_some_and(|(local, host)| {
+                !local.is_empty() && !host.is_empty() && !host.contains('@')
+            })
+        {
+            return Err(Error::Config(
+                "invalid ZeroSSL validation email address".into(),
+            ));
+        }
+        if self.validation_emails.contains_key(&domain) {
+            return Err(Error::Config(
+                "duplicate ZeroSSL email validation domain".into(),
+            ));
+        }
+        self.validation_emails.insert(domain, email.to_owned());
+        Ok(self)
+    }
+
+    fn validation_domain(domain: &str) -> Result<String> {
+        if !crate::dns_util::is_valid_domain(domain) {
+            return Err(Error::Config(
+                "invalid ZeroSSL email validation domain".into(),
+            ));
+        }
+        Ok(domain
+            .strip_suffix('.')
+            .unwrap_or(domain)
+            .to_ascii_lowercase())
+    }
+
+    fn selected_validation_emails(&self, domains: &[String]) -> Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        domains
+            .iter()
+            .map(|domain| {
+                let domain = Self::validation_domain(domain)?;
+                if !seen.insert(domain.clone()) {
+                    return Err(Error::Config(
+                        "duplicate ZeroSSL email validation domain".into(),
+                    ));
+                }
+                self.validation_emails.get(&domain).cloned().ok_or_else(|| {
+                    Error::Config(
+                        "configure a ZeroSSL validation email for every requested domain".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn check_validation_candidates(
+        response: &ZeroSslCertResponse,
+        domains: &[String],
+        emails: &[String],
+    ) -> Result<()> {
+        let options = response.validation.as_ref().ok_or_else(|| {
+            Error::Other("ZeroSSL create response missing eligible validation emails".into())
+        })?;
+        for (domain, email) in domains.iter().zip(emails) {
+            let canonical = Self::validation_domain(domain)?;
+            let mut matches = options.email_validation.iter().filter(|(name, _)| {
+                Self::validation_domain(name).is_ok_and(|name| name == canonical)
+            });
+            let Some((_, candidates)) = matches.next() else {
+                return Err(Error::Other(
+                    "ZeroSSL create response missing domain's eligible validation emails".into(),
+                ));
+            };
+            if matches.next().is_some() || !candidates.contains(email) {
+                return Err(Error::Config(
+                    "selected ZeroSSL validation email is not an unambiguous eligible address"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn api_url<'a>(&self, segments: impl IntoIterator<Item = &'a str>) -> Result<Url> {
+        let url = zerossl_api_url(segments, &self.api_key)?;
+        #[cfg(test)]
+        let url = if let Some(origin) = &self.revocation_origin {
+            let mut url = url;
+            url.set_scheme(origin.scheme()).unwrap();
+            url.set_host(origin.host_str()).unwrap();
+            url.set_port(origin.port()).unwrap();
+            url
+        } else {
+            url
+        };
+        Ok(url)
+    }
+
+    fn validation_error(&self, status: reqwest::StatusCode, error: &serde_json::Value) -> Error {
+        // Only retain structured diagnostic identifiers, never a provider body
+        // or URL that could echo access_key (including its encoded form).
+        let code = error.get("code").and_then(serde_json::Value::as_u64);
+        let kind = error
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| {
+                !kind.is_empty()
+                    && kind.len() <= 80
+                    && kind
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+                    && (self.api_key.is_empty() || !kind.contains(&self.api_key))
+            });
+        Error::Other(format!(
+            "ZeroSSL email validation was not confirmed (HTTP {status}, code {code:?}, type {})",
+            kind.unwrap_or("[REDACTED]")
+        ))
+    }
+
     /// Return the configured storage backend.
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
@@ -936,7 +1117,7 @@ impl ZeroSslApiIssuer {
         csr_pem: &str,
         domains: &[String],
     ) -> Result<ZeroSslCertResponse> {
-        let url = zerossl_api_url(["certificates"], &self.api_key)?;
+        let url = self.api_url(["certificates"])?;
         let domains_csv = domains.join(",");
 
         debug!(domains = %domains_csv, "creating ZeroSSL certificate via REST API");
@@ -955,18 +1136,38 @@ impl ZeroSslApiIssuer {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = zerossl_error_body(resp, "ZeroSSL create error").await?;
-            return Err(Error::Other(format!(
-                "ZeroSSL create certificate returned HTTP {status}: {body}"
-            )));
+            let body = crate::http::read_body_limited(
+                resp,
+                crate::http::MAX_ERROR_BODY_BYTES,
+                "ZeroSSL create error",
+            )
+            .await?;
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            return Err(self.validation_error(
+                status,
+                body.get("error").unwrap_or(&serde_json::Value::Null),
+            ));
         }
 
-        let cert_resp: ZeroSslCertResponse = zerossl_json(resp, "ZeroSSL create").await?;
+        let body = crate::http::read_body_limited(
+            resp,
+            crate::http::MAX_JSON_BODY_BYTES,
+            "ZeroSSL create",
+        )
+        .await?;
+        let cert_resp: ZeroSslCertResponse = serde_json::from_slice(&body)
+            .map_err(|_| Error::Other("invalid ZeroSSL create JSON response".into()))?;
 
         if let Some(ref err) = cert_resp.error {
-            return Err(Error::Other(format!(
-                "ZeroSSL create certificate error: {err}"
-            )));
+            return Err(self.validation_error(status, err));
+        }
+        if cert_resp
+            .success
+            .as_ref()
+            .is_some_and(|success| success.as_bool() != Some(true) && success.as_u64() != Some(1))
+        {
+            return Err(self.validation_error(status, &serde_json::Value::Null));
         }
 
         if cert_resp.id.is_empty() {
@@ -981,10 +1182,11 @@ impl ZeroSslApiIssuer {
 
     /// Initiate email-based validation for a certificate.
     ///
-    /// This tells ZeroSSL to send validation emails to the domain's
-    /// administrative contacts.
-    async fn verify_by_email(&self, cert_id: &str) -> Result<()> {
-        let url = zerossl_api_url(["certificates", cert_id, "challenges"], &self.api_key)?;
+    /// This tells ZeroSSL to send validation emails to the explicitly selected
+    /// eligible recipients and requires confirmation before polling.
+    async fn verify_by_email(&self, cert_id: &str, emails: &[String]) -> Result<()> {
+        let url = self.api_url(["certificates", cert_id, "challenges"])?;
+        let emails_csv = emails.join(",");
 
         debug!(
             cert_id = cert_id,
@@ -994,17 +1196,83 @@ impl ZeroSslApiIssuer {
         let client = zerossl_client()?;
         let resp = client
             .post(url)
-            .form(&[("validation_method", "EMAIL")])
+            .form(&[
+                ("validation_method", "EMAIL"),
+                ("validation_email", emails_csv.as_str()),
+            ])
             .send()
             .await
             .map_err(|e| zerossl_request_error("initiate ZeroSSL email validation", e))?;
 
         let status = resp.status();
-        if !status.is_success() {
-            let body = zerossl_error_body(resp, "ZeroSSL email validation error").await?;
-            return Err(Error::Other(format!(
-                "ZeroSSL email validation returned HTTP {status}: {body}"
-            )));
+        let limit = if status.is_success() {
+            crate::http::MAX_JSON_BODY_BYTES
+        } else {
+            crate::http::MAX_ERROR_BODY_BYTES
+        };
+        let body = crate::http::read_body_limited(resp, limit, "ZeroSSL email validation").await?;
+        let response: ZeroSslEmailResponse = serde_json::from_slice(&body)
+            .map_err(|_| Error::Other("invalid ZeroSSL email validation JSON response".into()))?;
+        let error = response
+            .error
+            .0
+            .as_ref()
+            .unwrap_or(&serde_json::Value::Null);
+        let explicit_success = response
+            .success
+            .0
+            .as_ref()
+            .is_some_and(|value| value.as_bool() == Some(true) || value.as_u64() == Some(1));
+        if !status.is_success()
+            || !error.is_null()
+            || (response.success.0.is_some() && !explicit_success)
+        {
+            return Err(self.validation_error(status, error));
+        }
+        let has_object = response.id.0.is_some() || response.status.0.is_some();
+        let valid_object = response.id.0.as_ref().and_then(serde_json::Value::as_str)
+            == Some(cert_id)
+            && matches!(
+                response
+                    .status
+                    .0
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str),
+                Some("pending_validation" | "issued")
+            );
+        // VerifyIdentifiers returns a certificate object in the original SDK.
+        // Also tolerate an explicit success envelope, but never let it mask a
+        // contradictory or partially supplied certificate identity.
+        if (has_object && !valid_object) || (!has_object && !explicit_success) {
+            return Err(self.validation_error(status, error));
+        }
+        if response
+            .validation_type
+            .0
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .is_some_and(|value| {
+                !value
+                    .as_str()
+                    .is_some_and(|method| method.eq_ignore_ascii_case("EMAIL"))
+            })
+            || response
+                .validation_emails
+                .0
+                .as_ref()
+                .filter(|value| !value.is_null())
+                .is_some_and(|value| {
+                    let Some(csv) = value.as_str() else {
+                        return true;
+                    };
+                    let mut actual: Vec<_> = csv.split(',').map(str::trim).collect();
+                    let mut expected: Vec<_> = emails.iter().map(String::as_str).collect();
+                    actual.sort_unstable();
+                    expected.sort_unstable();
+                    actual != expected
+                })
+        {
+            return Err(self.validation_error(status, error));
         }
 
         info!(
@@ -1020,7 +1288,7 @@ impl ZeroSslApiIssuer {
     /// if the maximum number of poll attempts is exceeded or an unexpected
     /// status is encountered.
     async fn wait_for_issued(&self, cert_id: &str) -> Result<ZeroSslCertResponse> {
-        let url = zerossl_api_url(["certificates", cert_id], &self.api_key)?;
+        let url = self.api_url(["certificates", cert_id])?;
         let client = zerossl_client()?;
 
         for attempt in 1..=MAX_POLL_ATTEMPTS {
@@ -1083,10 +1351,7 @@ impl ZeroSslApiIssuer {
     /// Returns the PEM-encoded certificate chain (leaf + CA bundle
     /// concatenated).
     async fn download_certificate(&self, cert_id: &str) -> Result<String> {
-        let url = zerossl_api_url(
-            ["certificates", cert_id, "download", "return"],
-            &self.api_key,
-        )?;
+        let url = self.api_url(["certificates", cert_id, "download", "return"])?;
 
         debug!(cert_id = cert_id, "downloading ZeroSSL certificate");
 
@@ -1119,6 +1384,10 @@ impl ZeroSslApiIssuer {
 // CertIssuer trait for ZeroSslApiIssuer
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+#[path = "zerossl_issuer/email_validation_tests.rs"]
+mod email_validation_tests;
+
 #[async_trait]
 impl CertIssuer for ZeroSslApiIssuer {
     /// Issue a certificate using ZeroSSL's REST API.
@@ -1133,6 +1402,7 @@ impl CertIssuer for ZeroSslApiIssuer {
         if domains.is_empty() {
             return Err(Error::Other("at least one domain is required".to_owned()));
         }
+        let validation_emails = self.selected_validation_emails(domains)?;
 
         // Generate a key + CSR if none was provided.
         let (private_key_pem, csr_der_owned) = if csr_der.is_empty() {
@@ -1148,10 +1418,11 @@ impl CertIssuer for ZeroSslApiIssuer {
 
         // Step 1: Create the certificate.
         let cert_resp = self.create_certificate(&csr_pem, domains).await?;
+        Self::check_validation_candidates(&cert_resp, domains, &validation_emails)?;
         let cert_id = cert_resp.id;
 
         // Step 2: Initiate email validation.
-        self.verify_by_email(&cert_id).await?;
+        self.verify_by_email(&cert_id, &validation_emails).await?;
 
         // Step 3: Poll until issued.
         let _issued = self.wait_for_issued(&cert_id).await?;

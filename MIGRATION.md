@@ -1052,3 +1052,40 @@ not compete with the current account's modification time. Discovery reads and
 validates the snapshot's configured identity, never a digest directory name or
 the account's contact list. Empty identities remain excluded from email
 discovery, while the separate literal `default` identity is discoverable.
+
+## ZeroSSL REST email validation recipients
+
+`ZeroSslApiIssuer` now requires an explicit validation email for every requested
+domain. Configure these with the fallible, repeatable
+`with_validation_email(domain, email)` method. For example:
+
+```rust,no_run
+# use std::sync::Arc;
+# use certon::{FileStorage, ZeroSslApiIssuer};
+let issuer = ZeroSslApiIssuer::new("your-api-key", Arc::new(FileStorage::default()))
+    .with_validation_email("example.com", "admin@example.com")?
+    .with_validation_email("*.example.com", "hostmaster@example.com")?;
+# Ok::<(), certon::Error>(())
+```
+
+Missing recipients fail before creating an order. Duplicate domains and email
+list delimiters are rejected; DNS case and a trailing dot are ignored, while a
+wildcard remains a separate domain. An issuer may retain selections for domains
+outside the current request. After creation, each selected address must appear
+in that domain's `validation.email_validation` candidate list. No recipient is
+chosen automatically. A human must still approve the validation emails.
+
+The request sends `validation_method=EMAIL` and `validation_email` containing one
+selected address per requested domain, in domain order. Validation must be
+confirmed before polling or downloading. A matching certificate object with
+`pending_validation` or `issued` status is accepted, as is an explicit
+`success: true` or `success: 1` confirmation. Explicit failures, contradictory
+objects, incomplete responses and invalid JSON stop issuance. Responses are
+bounded; diagnostics retain safe error identifiers without echoing provider
+bodies or API-key URLs.
+
+The candidate fields are described by ZeroSSL's
+[Get Certificate documentation](https://zerossl.com/documentation/api/get-certificate).
+The form field and certificate-object response follow the original
+[ZeroSSL Go SDK's VerifyIdentifiers implementation](https://github.com/caddyserver/zerossl/blob/d35655e3db16c1a450ccaeeac443b05abbe47993/endpoints.go#L42).
+This change applies to the REST issuer; `ZeroSslIssuer` continues to use ACME.
