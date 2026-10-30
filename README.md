@@ -78,7 +78,7 @@ async fn main() -> certon::Result<()> {
 
 ## Requirements
 
-1. **Rust 2024 edition** (Rust 1.92+) with a Tokio async runtime
+1. **Rust 2024 edition** (Rust 1.95+) with a Tokio async runtime
 2. **Public DNS name(s)** you control, pointed (A/AAAA records) at your server
 3. **Port 80** accessible from the public internet (for HTTP-01 challenge), and/or **port 443** (for TLS-ALPN-01 challenge)
    - These can be forwarded to other ports you control
@@ -96,7 +96,7 @@ Add `certon` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-certon = "0.3"
+certon = "0.4"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -113,7 +113,7 @@ The default `aws-lc-rs` backend requires no extra configuration. To use `ring` i
 
 ```toml
 [dependencies]
-certon = { version = "0.3", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
+certon = { version = "0.4", default-features = false, features = ["ring", "zerossl", "dns-01", "rsa-keys"] }
 ```
 
 ### Optional Features
@@ -138,7 +138,7 @@ the crate, and with it the finding:
 
 ```toml
 [dependencies]
-certon = { version = "0.3", default-features = false, features = ["ring"] }
+certon = { version = "0.4", default-features = false, features = ["ring"] }
 ```
 
 That build is 172 crates against 220 with everything on. A certificate in an

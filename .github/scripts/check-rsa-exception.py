@@ -11,7 +11,7 @@ def check(metadata):
     if len(roots) != 1 or roots[0]["name"] != "certon":
         raise ValueError("review the RSA exception for this workspace")
     root = roots[0]
-    if root["version"] != "0.3.0":
+    if root["version"] != "0.4.0":
         raise ValueError("review the RSA exception for the new certon release")
     if root["features"].get("rsa-keys") != ["dep:rsa"]:
         raise ValueError("review the changed rsa-keys feature")
@@ -32,4 +32,4 @@ if __name__ == "__main__":
         check(json.load(sys.stdin))
     except (KeyError, TypeError, ValueError) as error:
         sys.exit(f"RSA exception boundary failed: {error}")
-    print("RSA exception boundary: certon 0.3.0 -> rsa 0.9 via rsa-keys")
+    print("RSA exception boundary: certon 0.4.0 -> rsa 0.9 via rsa-keys")

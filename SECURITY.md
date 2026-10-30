@@ -25,7 +25,7 @@ features and select `ring` or `aws-lc-rs`, adding other optional features as nee
 
 Only the full-feature advisory command uses the exception. Its preceding
 metadata check restricts `rsa` to the 0.9 series, directly used only by
-`certon@0.3.0` through the unchanged `rsa-keys` feature. Another dependent crate,
+`certon@0.4.0` through the unchanged `rsa-keys` feature. Another dependent crate,
 a version change, an unused exception, or a different vulnerability fails the
 checks and requires review. Remove the exception when a
 patched compatible dependency is available, and re-review it on every release
@@ -33,6 +33,11 @@ and whenever RSA call sites change. The minimal graph must continue to pass
 without this exception. `cargo audit` alone examines all packages in a lockfile,
 including disabled optional dependencies, so the minimal check uses cargo-deny's
 feature-aware graph instead.
+
+The 0.4.0 release review confirmed that `rsa` remains limited to local key
+generation and private-key decoding/encoding. Asynchronous key generation uses
+the same operations on a bounded blocking pool; TLS signing still uses rustls
+providers. The existing advisory exception remains scoped to those operations.
 
 ## Resolution and license checks
 

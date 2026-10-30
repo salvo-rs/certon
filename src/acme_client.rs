@@ -1624,12 +1624,11 @@ impl AcmeClient {
                             .await?;
                         continue;
                     }
-                    Some("pending" | "processing") => {
-                        if polled {
-                            tokio::time::sleep(interval).await;
-                            interval = (interval * 2).min(Duration::from_secs(30));
-                        }
+                    Some("pending" | "processing") if polled => {
+                        tokio::time::sleep(interval).await;
+                        interval = (interval * 2).min(Duration::from_secs(30));
                     }
+                    Some("pending" | "processing") => {}
                     None => {} // Exact 403/orderNotReady: inspect the same order now.
                     Some(status) => {
                         let detail = order

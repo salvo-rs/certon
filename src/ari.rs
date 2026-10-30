@@ -439,10 +439,10 @@ pub(crate) async fn clean_expired(storage: &dyn Storage, now: DateTime<Utc>, gra
             warn!(%path, "clean_storage: retaining ARI state with mismatched identity/version");
             continue;
         }
-        if !record
+        if record
             .leaf_not_after
             .and_then(|expiry| expiry.checked_add_signed(grace))
-            .is_some_and(|expiry_with_grace| expiry_with_grace < now)
+            .is_none_or(|expiry_with_grace| expiry_with_grace >= now)
         {
             continue;
         }

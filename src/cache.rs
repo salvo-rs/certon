@@ -1544,10 +1544,11 @@ impl CertCache {
                 };
                 // The ordinary publication already reports the target, and a
                 // removed/evicted sibling needs only its removal notification.
-                !(matches!(&publication, Ok(true)) && hash == &published_hash)
-                    && !events.iter().any(|event| {
-                        matches!(event, CacheEvent::Removed { hash: removed, .. } if removed == hash)
-                    })
+                let published = matches!(&publication, Ok(true)) && hash == &published_hash;
+                let removed = events.iter().any(|event| {
+                    matches!(event, CacheEvent::Removed { hash: removed, .. } if removed == hash)
+                });
+                !(published || removed)
             })
             .collect();
         events.extend(quarantine_events);

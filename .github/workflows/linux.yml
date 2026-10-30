@@ -51,7 +51,7 @@ jobs:
           if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
 
       - name: check crates
-        run: cargo check --locked --all --bins --examples --tests
+        run: cargo check --locked --all-targets --all-features
   test:
     strategy:
         fail-fast: false
@@ -81,6 +81,9 @@ jobs:
       - name: Cargo test
         timeout-minutes: 40
         run: cargo test --locked --all --all-features --no-fail-fast -- --nocapture
+
+      - name: Clippy (all targets and features)
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Check documentation
         env:

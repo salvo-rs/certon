@@ -1,5 +1,8 @@
 # Migrating to CertManager and Policy
 
+Version 0.4.0 requires Rust 1.95 or newer. Upgrade your toolchain and use
+`certon = "0.4"` in `Cargo.toml`. The changes since 0.3.0 are described below.
+
 `certon::start_maintenance(&manager)` now starts with the cache's normalized
 `CacheOptions::renew_check_interval` and `ocsp_check_interval` and follows
 `CertCache::set_options` while running. Updates are asynchronous and may coalesce
