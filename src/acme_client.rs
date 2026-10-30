@@ -35,7 +35,9 @@ use crate::error::{AcmeError, Result};
 // ---------------------------------------------------------------------------
 /// Set the user agent shared by all certon HTTP requests.
 pub use crate::http::set_user_agent;
-use crate::http::{MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES, read_body_limited};
+use crate::http::{
+    MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES, diagnostic_endpoint, read_body_limited,
+};
 
 // ---------------------------------------------------------------------------
 // Well-known CA directory URLs
@@ -818,7 +820,12 @@ pub struct AcmeClient {
 impl std::fmt::Debug for AcmeClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcmeClient")
-            .field("directory", &self.directory)
+            .field("new_nonce", &diagnostic_endpoint(&self.directory.new_nonce))
+            .field(
+                "new_account",
+                &diagnostic_endpoint(&self.directory.new_account),
+            )
+            .field("new_order", &diagnostic_endpoint(&self.directory.new_order))
             .finish_non_exhaustive()
     }
 }
@@ -857,14 +864,12 @@ impl AcmeClient {
                 ))
             })?;
 
-        debug!(directory_url, "fetching ACME directory");
+        debug!(directory_url = %diagnostic_endpoint(directory_url), "fetching ACME directory");
 
         // Fetch directory.
-        let resp = http
-            .get(directory_url)
-            .send()
-            .await
-            .map_err(|e| AcmeError::Directory(format!("failed to fetch directory: {e}")))?;
+        let resp = http.get(directory_url).send().await.map_err(|e| {
+            AcmeError::Directory(format!("failed to fetch directory: {}", e.without_url()))
+        })?;
 
         if !resp.status().is_success() {
             return Err(
@@ -900,9 +905,9 @@ impl AcmeClient {
         }
 
         debug!(
-            new_nonce = %directory.new_nonce,
-            new_account = %directory.new_account,
-            new_order = %directory.new_order,
+            new_nonce = %diagnostic_endpoint(&directory.new_nonce),
+            new_account = %diagnostic_endpoint(&directory.new_account),
+            new_order = %diagnostic_endpoint(&directory.new_order),
             "ACME directory loaded"
         );
 
@@ -949,11 +954,10 @@ impl AcmeClient {
             .validate_url(new_nonce_url)
             .map_err(|error| AcmeError::Nonce(error.to_string()))?;
         debug!("fetching new nonce via HEAD");
-        let resp = http
-            .head(new_nonce_url)
-            .send()
-            .await
-            .map_err(|e| AcmeError::Nonce(format!("HEAD newNonce failed: {e}")))?;
+        let resp =
+            http.head(new_nonce_url).send().await.map_err(|e| {
+                AcmeError::Nonce(format!("HEAD newNonce failed: {}", e.without_url()))
+            })?;
 
         extract_nonce(&resp).ok_or_else(|| {
             AcmeError::Nonce("no Replay-Nonce header in HEAD response".into()).into()
@@ -1019,7 +1023,13 @@ impl AcmeClient {
                 .body(body)
                 .send()
                 .await
-                .map_err(|e| AcmeError::Order(format!("ACME POST to {url} failed: {e}")))?;
+                .map_err(|e| {
+                    AcmeError::Order(format!(
+                        "ACME POST to {} failed: {}",
+                        diagnostic_endpoint(url),
+                        e.without_url()
+                    ))
+                })?;
 
             // The actual response status, never the problem JSON's status,
             // controls recognition. A 400's nonce cannot enter the shared
@@ -1080,9 +1090,15 @@ impl AcmeClient {
                     Err(_) => String::from_utf8_lossy(&resp_bytes).into_owned(),
                 };
                 let message = if status.as_u16() == 400 {
-                    format!("ACME request to {url} failed (HTTP 400): {detail}")
+                    format!(
+                        "ACME request to {} failed (HTTP 400): {detail}",
+                        diagnostic_endpoint(url)
+                    )
                 } else {
-                    format!("ACME {url} returned HTTP {status}: {detail}")
+                    format!(
+                        "ACME {} returned HTTP {status}: {detail}",
+                        diagnostic_endpoint(url)
+                    )
                 };
                 return Err(AcmeError::Order(message).into());
             }
@@ -1139,9 +1155,11 @@ impl AcmeClient {
                 Ok(p) => format!("{p}"),
                 Err(_) => String::from_utf8_lossy(&body).into_owned(),
             };
-            return Err(
-                AcmeError::Order(format!("ACME {url} returned HTTP {status}: {detail}")).into(),
-            );
+            return Err(AcmeError::Order(format!(
+                "ACME {} returned HTTP {status}: {detail}",
+                diagnostic_endpoint(url)
+            ))
+            .into());
         }
 
         let body = read_body_limited(resp, MAX_JSON_BODY_BYTES, "ACME JSON")
@@ -1213,7 +1231,7 @@ impl AcmeClient {
 
         debug!(
             status = %acct_resp.status,
-            account_url = %account_url,
+            account_url = %diagnostic_endpoint(&account_url),
             "ACME account registered"
         );
 
@@ -1376,7 +1394,7 @@ impl AcmeClient {
 
         debug!(
             status = %order.status,
-            order_url = %order_url,
+            order_url = %diagnostic_endpoint(&order_url),
             "ACME order created"
         );
 
@@ -1394,7 +1412,7 @@ impl AcmeClient {
         account_url: &str,
         authz_url: &str,
     ) -> Result<AcmeAuthorization> {
-        debug!(authz_url, "fetching authorization");
+        debug!(authz_url = %diagnostic_endpoint(authz_url), "fetching authorization");
 
         // POST-as-GET (empty payload).
         let (authz, _): (AcmeAuthorization, _) = self
@@ -1419,7 +1437,7 @@ impl AcmeClient {
         account_url: &str,
         challenge_url: &str,
     ) -> Result<AcmeChallenge> {
-        debug!(challenge_url, "accepting challenge");
+        debug!(challenge_url = %diagnostic_endpoint(challenge_url), "accepting challenge");
 
         // POST an empty JSON object `{}` to signal readiness.
         let payload = "{}";
@@ -1465,7 +1483,7 @@ impl AcmeClient {
         authz_url: &str,
         timeout: Duration,
     ) -> Result<AcmeAuthorization> {
-        debug!(authz_url, ?timeout, "polling authorization");
+        debug!(authz_url = %diagnostic_endpoint(authz_url), ?timeout, "polling authorization");
 
         let started = tokio::time::Instant::now();
         let mut interval = Duration::from_secs(2);
@@ -1478,7 +1496,7 @@ impl AcmeClient {
 
             match authz.status.as_str() {
                 "valid" => {
-                    debug!(authz_url, "authorization is valid");
+                    debug!(authz_url = %diagnostic_endpoint(authz_url), "authorization is valid");
                     return Ok(authz);
                 }
                 "invalid" => {
@@ -1545,7 +1563,7 @@ impl AcmeClient {
         csr_der: &[u8],
         recognize_not_ready: bool,
     ) -> Result<Option<AcmeOrder>> {
-        debug!(finalize_url, "finalizing order");
+        debug!(finalize_url = %diagnostic_endpoint(finalize_url), "finalizing order");
 
         #[derive(Serialize)]
         struct FinalizeRequest {
@@ -1675,7 +1693,7 @@ impl AcmeClient {
         order_url: &str,
         timeout: Duration,
     ) -> Result<AcmeOrder> {
-        debug!(order_url, ?timeout, "polling order");
+        debug!(order_url = %diagnostic_endpoint(order_url), ?timeout, "polling order");
 
         let started = tokio::time::Instant::now();
         let mut interval = Duration::from_secs(2);
@@ -1689,7 +1707,7 @@ impl AcmeClient {
 
             match order.status.as_str() {
                 "valid" => {
-                    debug!(order_url, "order is valid");
+                    debug!(order_url = %diagnostic_endpoint(order_url), "order is valid");
                     return Ok(order);
                 }
                 "invalid" => {
@@ -1808,12 +1826,12 @@ impl AcmeClient {
                         enqueue_alternate_chains(links, &mut seen, &mut pending, limit);
                     }
                     _ => warn!(
-                        url,
+                        url = %diagnostic_endpoint(&url),
                         "ignoring alternate chain with an invalid or different leaf certificate"
                     ),
                 },
                 Ok(Err(error)) => {
-                    warn!(url, %error, "ignoring unavailable alternate certificate chain")
+                    warn!(url = %diagnostic_endpoint(&url), %error, "ignoring unavailable alternate certificate chain")
                 }
                 Err(_) => {
                     debug!(
@@ -1833,7 +1851,7 @@ impl AcmeClient {
         account_url: &str,
         cert_url: &str,
     ) -> Result<(String, Vec<String>)> {
-        debug!(cert_url, "downloading certificate");
+        debug!(cert_url = %diagnostic_endpoint(cert_url), "downloading certificate");
         let mut response = self
             .acme_post(account_key, Some(account_url), cert_url, None)
             .await?;
@@ -1855,7 +1873,10 @@ impl AcmeClient {
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
-            AcmeError::Certificate(format!("failed to read certificate body: {error}"))
+            AcmeError::Certificate(format!(
+                "failed to read certificate body: {}",
+                error.without_url()
+            ))
         })? {
             if chunk.len() > MAX_CERTIFICATE_CHAIN_BYTES - body.len() {
                 return Err(AcmeError::Certificate(
@@ -1868,7 +1889,7 @@ impl AcmeClient {
         let pem = String::from_utf8(body).map_err(|error| {
             AcmeError::Certificate(format!("certificate response is not UTF-8 PEM: {error}"))
         })?;
-        debug!(cert_url, len = pem.len(), "certificate downloaded");
+        debug!(cert_url = %diagnostic_endpoint(cert_url), len = pem.len(), "certificate downloaded");
         Ok((pem, links))
     }
 
@@ -1976,7 +1997,7 @@ impl AcmeClient {
         self.transport
             .validate_url(&url)
             .map_err(|error| AcmeError::Certificate(error.to_string()))?;
-        debug!(url = %url, "fetching ACME Renewal Information (ARI)");
+        debug!(url = %diagnostic_endpoint(&url), "fetching ACME Renewal Information (ARI)");
 
         let resp = self.http.get(&url).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -1988,13 +2009,11 @@ impl AcmeClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME ARI error")
+            let _body = read_body_limited(resp, MAX_ERROR_BODY_BYTES, "ACME ARI error")
                 .await
                 .map_err(|e| AcmeError::Certificate(e.to_string()))?;
-            let detail = String::from_utf8_lossy(&body);
             warn!(
                 status = %status,
-                detail = %detail,
                 "ARI request returned non-success status"
             );
             if status.is_server_error() {
@@ -2034,7 +2053,7 @@ impl AcmeClient {
             }
         }
 
-        debug!(?info, "ACME Renewal Information fetched");
+        debug!(retry_after = ?info.retry_after, "ACME Renewal Information fetched");
 
         Ok(Some(info))
     }

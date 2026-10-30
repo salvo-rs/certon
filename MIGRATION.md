@@ -1,5 +1,15 @@
 # Migrating to CertManager and Policy
 
+ACME endpoint diagnostics now show only the HTTP origin (scheme, host and
+port), omitting user information, private paths, query strings and fragments.
+Client/issuer/account Debug output follows the same rule; issued-certificate
+metadata and stored-resource issuer data are redacted in Debug output.
+Actual request URLs, JWS protected URLs,
+returned metadata and persistent account identities retain their original
+values. ACME problem details supplied by the CA remain available for diagnosis;
+this change does not sanitize arbitrary provider text or application logging.
+Optional ARI HTTP error diagnostics retain the status without logging the body.
+
 `client_credentials` and `client_config` now select a time-valid client identity
 that is not locally known to be revoked, falling back to usable cached or
 stored siblings. Every construction reads persisted revocation intent, including

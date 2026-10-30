@@ -692,7 +692,7 @@ impl std::fmt::Debug for CertificateResource {
             .field("certificate_pem_len", &self.certificate_pem.len())
             .field("private_key_pem", &"[REDACTED]")
             .field("private_key_pem_len", &self.private_key_pem.len())
-            .field("issuer_data", &self.issuer_data)
+            .field("issuer_data", &"[REDACTED]")
             .field("issuer_key", &self.issuer_key)
             .finish()
     }
