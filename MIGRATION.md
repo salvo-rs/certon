@@ -1,5 +1,35 @@
 # Migrating to CertManager and Policy
 
+`certon::start_maintenance(&manager)` now starts with the cache's normalized
+`CacheOptions::renew_check_interval` and `ocsp_check_interval` and follows
+`CertCache::set_options` while running. Updates are asynchronous and may coalesce
+to the latest pair. Each changed timer waits a full new interval from adoption;
+changing one interval preserves the other timer's phase. Reapplying the same
+intervals, or changing only capacity or event callbacks, does not reset either
+timer. Startup and panic recovery read the latest pair. Zero durations and
+durations outside the monotonic clock's range use the corresponding defaults
+(600 seconds for renewal, 3600 seconds for OCSP).
+
+Lower-level `maintain::start_maintenance` and
+`maintain::start_maintenance_with_policy` continue using their explicit
+`MaintenanceConfig` intervals; cache option updates do not override them.
+These updates change periodic scans, including their shared revocation-marker
+checks. Independent ARI notifications, OCSP due-index deadlines, active jobs,
+and stop/cleanup retain their existing behavior. A changed interval does not
+itself request an immediate scan.
+
+For high-level maintenance, permanent renewal failures also use the latest
+normalized renewal interval as their retry floor. Increasing it extends an
+existing deadline to at least the original failure completion time plus that
+interval; decreasing it never shortens an already recorded future deadline.
+Failure history and the original completion anchor survive option updates.
+Admission and execution recheck the latest floor, including work queued before
+an update. An already running callback finishes normally and uses the latest
+interval if it then reports a permanent failure. Transient retry deadlines are
+unchanged. A subsequent failed attempt starts a new completion anchor and uses
+the interval current at that completion. Explicit low-level maintenance keeps
+its fixed configured floor.
+
 Ordinary maintenance renewal attempts now retain a retry deadline for each
 current issuer and DER leaf after failure (including interrupted marker or
 storage preflight work). Transient failure delays are 60, 120, 240, then at most

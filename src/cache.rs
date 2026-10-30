@@ -127,8 +127,11 @@ pub struct SubjectIssuer {
 /// Configuration options for [`CertCache`].
 ///
 /// Once a cache has been created with certain options, they can be updated
-/// at runtime via [`CertCache::set_options`]. Interval values of zero are
-/// automatically replaced with their defaults.
+/// at runtime via [`CertCache::set_options`]. Zero intervals and durations
+/// outside the monotonic clock range are replaced with their defaults.
+/// [`crate::start_maintenance`] follows these intervals; explicit
+/// [`crate::maintain::MaintenanceConfig`] values take precedence at lower-level
+/// maintenance entry points.
 #[derive(Clone)]
 pub struct CacheOptions {
     /// How often to check certificates for renewal.
@@ -227,6 +230,7 @@ pub struct CertCache {
     // critical section. No user callback or cryptographic operation runs here.
     state: RwLock<CacheState>,
     options: RwLock<CacheOptions>,
+    maintenance_intervals: watch::Sender<crate::maintain::MaintenanceIntervals>,
     stop_tx: watch::Sender<bool>,
     done_tx: watch::Sender<bool>,
     maintenance_count: Mutex<usize>,
@@ -806,12 +810,17 @@ impl CertCache {
         let (stop_tx, _) = watch::channel(false);
         let (done_tx, _) = watch::channel(true);
         let options = normalize_options(options);
+        let intervals = crate::maintain::MaintenanceIntervals::new(
+            options.renew_check_interval,
+            options.ocsp_check_interval,
+        );
         Arc::new(Self {
             state: RwLock::new(CacheState {
                 capacity: options.capacity,
                 ..Default::default()
             }),
             options: RwLock::new(options),
+            maintenance_intervals: watch::channel(intervals).0,
             stop_tx,
             done_tx,
             maintenance_count: Mutex::new(0),
@@ -821,7 +830,10 @@ impl CertCache {
         })
     }
 
-    /// Update cache options; zero intervals are replaced with their defaults.
+    /// Update cache options; zero or unrepresentable intervals use defaults.
+    /// High-level maintenance adopts the latest interval pair asynchronously.
+    /// Only a changed timer restarts, waiting one full new period from adoption;
+    /// unchanged intervals and capacity/callback updates preserve its phase.
     /// A finite capacity immediately evicts managed entries until the cache
     /// fits or only protected unmanaged entries remain. Removal callbacks run
     /// after releasing the configuration and certificate locks.
@@ -840,7 +852,22 @@ impl CertCache {
                 };
                 events.push(event);
             }
-            std::mem::replace(&mut *configured, options.clone())
+            let previous = std::mem::replace(&mut *configured, options.clone());
+            let intervals = crate::maintain::MaintenanceIntervals::new(
+                options.renew_check_interval,
+                options.ocsp_check_interval,
+            );
+            // Publish Copy data in the same order as authoritative options.
+            // Dropping the old callback below can block or re-enter set_options.
+            self.maintenance_intervals.send_if_modified(|current| {
+                if *current == intervals {
+                    false
+                } else {
+                    *current = intervals;
+                    true
+                }
+            });
+            previous
         };
         // Dropping the previous callback/configuration can run user-owned
         // destructors, so it must not retain either cache lock either.
@@ -857,6 +884,12 @@ impl CertCache {
     /// Subscribe to shutdown. Check the current value before waiting for changes.
     pub fn subscribe_stop(&self) -> watch::Receiver<bool> {
         self.stop_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_maintenance_intervals(
+        &self,
+    ) -> watch::Receiver<crate::maintain::MaintenanceIntervals> {
+        self.maintenance_intervals.subscribe()
     }
 
     pub(crate) fn subscribe_ari_schedule(&self) -> tokio::sync::broadcast::Receiver<AriChange> {
@@ -2113,12 +2146,12 @@ fn compare_certificates(
 
 /// Ensure option intervals have sensible default values.
 fn normalize_options(mut opts: CacheOptions) -> CacheOptions {
-    if opts.renew_check_interval.is_zero() {
-        opts.renew_check_interval = DEFAULT_RENEW_CHECK_INTERVAL;
-    }
-    if opts.ocsp_check_interval.is_zero() {
-        opts.ocsp_check_interval = DEFAULT_OCSP_CHECK_INTERVAL;
-    }
+    let intervals = crate::maintain::MaintenanceIntervals::new(
+        opts.renew_check_interval,
+        opts.ocsp_check_interval,
+    );
+    opts.renew_check_interval = intervals.renew;
+    opts.ocsp_check_interval = intervals.ocsp;
     opts
 }
 

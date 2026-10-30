@@ -305,6 +305,12 @@ pub fn obtain_in_background(domains: &[String]) -> tokio::task::JoinHandle<Resul
 /// - Checks all managed certificates in the config's cache for renewal.
 /// - Refreshes OCSP staples for cached certificates.
 ///
+/// Uses the cache's current [`CacheOptions`] renewal and OCSP intervals and
+/// follows [`CertCache::set_options`] updates. A changed timer waits one full
+/// new interval from adoption; the other timer and independent ARI/OCSP
+/// deadlines retain their schedules. Low-level maintenance entry points use
+/// their explicit [`MaintenanceConfig`] instead.
+///
 /// The returned [`tokio::task::JoinHandle`] can be used to monitor the
 /// maintenance task. To stop maintenance, call [`CertCache::stop`] on
 /// the config's cache, which signals the task to exit gracefully.
@@ -323,14 +329,6 @@ pub fn obtain_in_background(domains: &[String]) -> tokio::task::JoinHandle<Resul
 /// # }
 /// ```
 pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
-    let cache = config.cache.clone();
-    let maint_config = MaintenanceConfig {
-        renew_check_interval: maintain::DEFAULT_RENEW_CHECK_INTERVAL,
-        ocsp_check_interval: maintain::DEFAULT_OCSP_CHECK_INTERVAL,
-        ocsp: config.policy.ocsp.clone(),
-        storage: config.storage.clone(),
-    };
-
     let renew_func = maintenance_renewal(config);
 
     let manager = Arc::new(config.detached("maintenance-ocsp"));
@@ -339,15 +337,7 @@ pub fn start_maintenance(config: &CertManager) -> tokio::task::JoinHandle<()> {
         let manager = Arc::clone(&observed_manager);
         Box::pin(async move { manager.renew_observed_revocation(&domain, &leaf).await })
     });
-    maintain::start_maintenance_with_observed_renewal(
-        cache,
-        maint_config,
-        renew_func,
-        config.certificates.clone(),
-        config.policy.renewal_window_ratio,
-        Some(observed),
-        Some(manager),
-    )
+    maintain::start_maintenance_following_cache(manager, renew_func, observed)
 }
 
 fn maintenance_renewal(config: &CertManager) -> Arc<maintain::ReasonedRenewFn> {
