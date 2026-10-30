@@ -516,3 +516,54 @@ fn email_configuration_rejects_duplicate_domains_and_list_injection() {
             .is_err()
     );
 }
+
+#[test]
+fn email_domains_keep_dns_syntax_and_wildcard_identity_without_dns_solver() {
+    let directory = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn Storage> = Arc::new(crate::FileStorage::new(directory.path()));
+    let issuer = ZeroSslApiIssuer::new(API_KEY, storage.clone())
+        .with_validation_email("Example.COM.", "admin@example.com")
+        .unwrap()
+        .with_validation_email("*.Example.COM.", "hostmaster@example.com")
+        .unwrap();
+    assert_eq!(
+        issuer
+            .selected_validation_emails(&["*.EXAMPLE.com".into(), "example.com".into()])
+            .unwrap(),
+        ["hostmaster@example.com", "admin@example.com"]
+    );
+    let longest = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(61),
+    ]
+    .join(".");
+    assert_eq!(longest.len(), 253);
+    assert!(
+        ZeroSslApiIssuer::new(API_KEY, storage.clone())
+            .with_validation_email(&longest, EMAILS[0])
+            .is_ok()
+    );
+    for domain in [
+        "".to_owned(),
+        "localhost".into(),
+        "bad/domain.com".into(),
+        "bad..example.com".into(),
+        "example.com..".into(),
+        "-bad.example.com".into(),
+        "bad-.example.com".into(),
+        "_bad.example.com".into(),
+        "*.*.example.com".into(),
+        "例子.example.com".into(),
+        format!("{}.example.com", "a".repeat(64)),
+        format!("{longest}d"),
+    ] {
+        assert!(
+            ZeroSslApiIssuer::new(API_KEY, storage.clone())
+                .with_validation_email(&domain, EMAILS[0])
+                .is_err(),
+            "invalid configured domain: {domain}"
+        );
+    }
+}

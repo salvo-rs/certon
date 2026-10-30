@@ -1001,15 +1001,29 @@ impl ZeroSslApiIssuer {
     }
 
     fn validation_domain(domain: &str) -> Result<String> {
-        if !crate::dns_util::is_valid_domain(domain) {
+        // Keep this pure syntax check independent of the optional DNS solver.
+        // Validate the existing DNS grammar, retaining wildcard identity in
+        // the returned key rather than aliasing it to the base domain.
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
+        let hostname = domain.strip_prefix("*.").unwrap_or(domain);
+        if hostname.is_empty()
+            || hostname.len() > 253
+            || hostname.split('.').count() < 2
+            || !hostname.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+        {
             return Err(Error::Config(
                 "invalid ZeroSSL email validation domain".into(),
             ));
         }
-        Ok(domain
-            .strip_suffix('.')
-            .unwrap_or(domain)
-            .to_ascii_lowercase())
+        Ok(domain.to_ascii_lowercase())
     }
 
     fn selected_validation_emails(&self, domains: &[String]) -> Result<Vec<String>> {
