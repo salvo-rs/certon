@@ -82,7 +82,10 @@ impl std::fmt::Debug for AcmeAccount {
         f.debug_struct("AcmeAccount")
             .field("status", &self.status)
             .field("contact", &self.contact)
-            .field("location", &self.location)
+            .field(
+                "location",
+                &crate::http::diagnostic_endpoint(&self.location),
+            )
             .field("terms_of_service_agreed", &self.terms_of_service_agreed)
             .field("private_key_pem", &"[REDACTED]")
             .field("private_key_pem_len", &self.private_key_pem.len())
@@ -632,7 +635,7 @@ pub(crate) async fn save_account_for_email(
 
     debug!(
         email = %email,
-        ca = ca_url,
+        ca = %crate::http::diagnostic_endpoint(ca_url),
         "saved ACME account to storage"
     );
 
@@ -735,7 +738,7 @@ pub async fn get_or_create_account(
         Some(account) => {
             debug!(
                 email = email,
-                ca = ca_url,
+                ca = %crate::http::diagnostic_endpoint(ca_url),
                 "using existing ACME account from storage"
             );
             Ok((account, false))
@@ -743,7 +746,7 @@ pub async fn get_or_create_account(
         None => {
             info!(
                 email = email,
-                ca = ca_url,
+                ca = %crate::http::diagnostic_endpoint(ca_url),
                 "creating new ACME account (no existing account found in storage)"
             );
             let email = email.to_owned();
@@ -793,7 +796,7 @@ pub(crate) async fn delete_account_for_email(
 
     debug!(
         email = %email,
-        ca = ca_url,
+        ca = %crate::http::diagnostic_endpoint(ca_url),
         "deleted local ACME account data"
     );
 

@@ -289,7 +289,7 @@ impl std::fmt::Debug for IssuedCertificate {
             .field("certificate_pem_len", &self.certificate_pem.len())
             .field("private_key_pem", &"[REDACTED]")
             .field("private_key_pem_len", &self.private_key_pem.len())
-            .field("metadata", &self.metadata)
+            .field("metadata", &"[REDACTED]")
             .finish()
     }
 }
@@ -416,8 +416,8 @@ pub struct AcmeIssuer {
 impl std::fmt::Debug for AcmeIssuer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcmeIssuer")
-            .field("ca", &self.ca)
-            .field("test_ca", &self.test_ca)
+            .field("ca", &crate::http::diagnostic_endpoint(&self.ca))
+            .field("test_ca", &crate::http::diagnostic_endpoint(&self.test_ca))
             .field("email", &self.email)
             .field("agreed", &self.agreed)
             .field("disable_http_challenge", &self.disable_http_challenge)
@@ -726,7 +726,7 @@ impl AcmeIssuer {
         if let Some(client) = guard.as_ref() {
             return Ok(Arc::clone(client));
         }
-        info!(ca = %ca_url, "initialising ACME client");
+        info!(ca = %crate::http::diagnostic_endpoint(ca_url), "initialising ACME client");
         let mut http = crate::http::client_builder();
         if let Some(roots) = &self.trusted_roots {
             let root = reqwest::Certificate::from_der(roots)
@@ -816,7 +816,7 @@ impl AcmeIssuer {
             // Register the account with the CA.
             info!(
                 email = %self.email,
-                ca = %ca_url,
+                ca = %crate::http::diagnostic_endpoint(ca_url),
                 "registering new ACME account with CA"
             );
 
@@ -835,12 +835,12 @@ impl AcmeIssuer {
             save_account_for_email(self.storage.as_ref(), ca_url, &self.email, &acct).await?;
 
             info!(
-                location = %acct.location,
+                location = %crate::http::diagnostic_endpoint(&acct.location),
                 "ACME account registered and saved"
             );
         } else {
             debug!(
-                location = %acct.location,
+                location = %crate::http::diagnostic_endpoint(&acct.location),
                 "using existing ACME account"
             );
         }
@@ -957,7 +957,7 @@ impl AcmeIssuer {
         debug!(
             attempt = attempt,
             domains = ?domains,
-            ca = %ca_url,
+            ca = %crate::http::diagnostic_endpoint(ca_url),
             "ACME issuance attempt"
         );
 
@@ -967,7 +967,7 @@ impl AcmeIssuer {
         if !waited.is_zero() {
             debug!(
                 waited_ms = waited.as_millis(),
-                ca = %ca_url,
+                ca = %crate::http::diagnostic_endpoint(ca_url),
                 "waited for per-CA rate limiter"
             );
         }
@@ -983,8 +983,8 @@ impl AcmeIssuer {
 
         info!(
             domains = ?domains,
-            ca = %ca_url,
-            account = %acct.location,
+            ca = %crate::http::diagnostic_endpoint(ca_url),
+            account = %crate::http::diagnostic_endpoint(&acct.location),
             "starting ACME certificate issuance"
         );
 
@@ -1010,7 +1010,7 @@ impl AcmeIssuer {
             Ok(NewOrderOutcome::Created(order, url)) => (*order, url),
             Ok(NewOrderOutcome::AccountDoesNotExist) => {
                 warn!(
-                    ca = %ca_url,
+                    ca = %crate::http::diagnostic_endpoint(ca_url),
                     "account does not exist on CA, deleting local account and retrying"
                 );
                 self.delete_account_and_clear_cache(ca_url, &acct, use_test_ca)
@@ -1035,7 +1035,7 @@ impl AcmeIssuer {
         };
 
         debug!(
-            order_url = %order_url,
+            order_url = %crate::http::diagnostic_endpoint(&order_url),
             status = %order.status,
             authorizations = order.authorizations.len(),
             "ACME order created"
@@ -1183,7 +1183,7 @@ impl AcmeIssuer {
                 .await?
         };
 
-        info!(domains = ?domains, ca = %ca_url, cert_url = %cert_url, "certificate issued successfully");
+        info!(domains = ?domains, ca = %crate::http::diagnostic_endpoint(ca_url), cert_url = %crate::http::diagnostic_endpoint(&cert_url), "certificate issued successfully");
 
         let metadata = serde_json::json!({
             "ca": ca_url,

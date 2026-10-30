@@ -20,6 +20,38 @@ pub(crate) const MAX_JSON_BODY_BYTES: usize = 1024 * 1024;
 /// Error details are diagnostic data, so they have a smaller memory/log budget.
 pub(crate) const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
+/// Keep the transport origin useful without logging credentials, tenant paths,
+/// query tokens or fragments. Never use this value to construct a request.
+pub(crate) fn diagnostic_endpoint(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.has_host() => {
+            url.origin().ascii_serialization()
+        }
+        _ => "<invalid or non-HTTP endpoint>".into(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_endpoint_keeps_only_http_origin() {
+    assert_eq!(
+        diagnostic_endpoint(
+            "https://user:password@example.com:8443/private/key?token=secret#fragment"
+        ),
+        "https://example.com:8443"
+    );
+    assert_eq!(
+        diagnostic_endpoint("http://[::1]:8080/private"),
+        "http://[::1]:8080"
+    );
+    for invalid in ["not a URL?secret", "file:///private/key", "data:secret"] {
+        assert_eq!(
+            diagnostic_endpoint(invalid),
+            "<invalid or non-HTTP endpoint>"
+        );
+    }
+}
+
 /// Read a response incrementally, enforcing the limit even for chunked bodies.
 /// `context` must be a static operation label, never a URL containing credentials.
 pub(crate) async fn read_body_limited(
