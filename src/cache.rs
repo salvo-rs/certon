@@ -937,6 +937,28 @@ impl CertCache {
             .map(|entry| entry.certificate.clone())
     }
 
+    pub(crate) fn has_managed_leaf(&self, issuer: &str, leaf: &str) -> bool {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        state.chains_by_leaf.get(leaf).is_some_and(|hashes| {
+            hashes.iter().any(|hash| {
+                state.certificates.get(hash).is_some_and(|entry| {
+                    entry.certificate.managed && entry.certificate.issuer_key == issuer
+                })
+            })
+        })
+    }
+
+    /// Renewal retry identities reuse hashes prepared during publication.
+    pub(crate) fn renewal_snapshot(&self) -> Vec<(Arc<Certificate>, Option<String>)> {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        state
+            .managed_hashes
+            .iter()
+            .filter_map(|hash| state.certificates.get(hash))
+            .map(|entry| (entry.certificate.clone(), entry.leaf_hash.clone()))
+            .collect()
+    }
+
     pub(crate) fn subscribe_ari(&self) -> watch::Receiver<u64> {
         self.ari_changed.subscribe()
     }

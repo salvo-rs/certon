@@ -1,5 +1,32 @@
 # Migrating to CertManager and Policy
 
+Ordinary maintenance renewal attempts now retain a retry deadline for each
+current issuer and DER leaf after failure (including interrupted marker or
+storage preflight work). Transient failure delays are 60, 120, 240, then at most
+300 seconds from completion, using the monotonic clock. Callback errors classified
+as permanent by the existing retry policy wait at least the normalized renewal
+check interval (normally 600 seconds), so disabling ARI does not make those failures
+retry more aggressively than the periodic scan. Other certificates' ARI selected times
+still admit their first attempts promptly; they no longer retry an already
+failed leaf. The retry timer also wakes maintenance without waiting for a new
+ARI recommendation or the normal periodic scan. Same-leaf metadata updates and
+alternate chains preserve the deadline. A different replacement leaf starts
+independently. Success clears the failure record; removed or unmanaged leaves
+are discarded on the next scan or their in-flight completion. Queued work
+cancelled before execution does not count as a failed attempt. Shutdown and
+maintenance restart discard this process-local state.
+
+The existing execution/admission limits remain shared across these attempts.
+Old and new leaves for one name can have separate jobs; the built-in manager
+continues to serialize its transactions with the domain lifecycle lock. Custom
+renewal callbacks still receive the observed name and must recheck their own
+current resource after asynchronous waits, and publish their replacement on
+success. A callback that reports success without replacing a still-due leaf
+can be invoked again on a later renewal wakeup. Independent periodic revocation
+marker scans and forced OCSP revocation recovery are not gated by this ordinary
+renewal backoff. This state belongs only to each automatic maintenance loop;
+explicit renewal and background management retain their own retry policies.
+
 ACME endpoint diagnostics now show only the HTTP origin (scheme, host and
 port), omitting user information, private paths, query strings and fragments.
 Client/issuer/account Debug output follows the same rule; issued-certificate

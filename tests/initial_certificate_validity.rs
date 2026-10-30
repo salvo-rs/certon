@@ -657,6 +657,11 @@ async fn invalid_overlapping_managed_leaf_keeps_its_coverage_for_maintenance() {
             valid.cert_chain[0].as_ref()
         );
         fixture.issuer.fail.store(false, Ordering::SeqCst);
+        // The failed maintenance attempt keeps its monotonic retry deadline
+        // even after the CA recovers. Certificate validity still uses UTC.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !outcomes.lock().unwrap().contains(&true) {
                 tokio::time::sleep(Duration::from_millis(1)).await;

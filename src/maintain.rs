@@ -23,7 +23,7 @@
 //! avoids circular dependencies while still allowing the `CertManager` to wire up
 //! its `renew_cert` method as the renewal implementation.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -42,6 +42,8 @@ use crate::storage::Storage;
 
 #[cfg(test)]
 mod parallel_ocsp_tests;
+#[cfg(test)]
+mod renewal_backoff_tests;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -59,6 +61,189 @@ const REVOCATION_READ_CONCURRENCY: usize = 8;
 const OCSP_REFRESH_CONCURRENCY: usize = 8;
 const FORCED_RENEWAL_CONCURRENCY: usize = 4;
 const FORCED_RENEWAL_BACKLOG: usize = 64;
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct RenewalIdentity {
+    issuer: String,
+    leaf: String,
+    metadata_only: bool,
+}
+
+impl RenewalIdentity {
+    #[cfg(test)]
+    fn new(cert: &Certificate) -> Self {
+        Self::with_leaf(cert, crate::storage::certificate_leaf_hash(cert))
+    }
+
+    fn with_leaf(cert: &Certificate, leaf: Option<String>) -> Self {
+        Self {
+            issuer: cert.issuer_key.clone(),
+            metadata_only: leaf.is_none(),
+            leaf: leaf.unwrap_or_else(|| cert.hash.clone()),
+        }
+    }
+
+    fn current(&self, cache: &CertCache) -> bool {
+        if self.metadata_only {
+            cache
+                .managed_certificate(&self.leaf)
+                .is_some_and(|cert| cert.issuer_key == self.issuer)
+        } else {
+            cache.has_managed_leaf(&self.issuer, &self.leaf)
+        }
+    }
+
+    fn job_suffix(&self) -> String {
+        crate::storage::storage_identity_hash(&format!(
+            "{}\0{}\0{}",
+            self.issuer, self.metadata_only, self.leaf,
+        ))
+    }
+}
+
+struct RenewalRetry {
+    failures: u8,
+    retry_at: Option<tokio::time::Instant>,
+    running: bool,
+    token: Arc<()>,
+    minimum_delay: Duration,
+}
+
+struct RenewalBackoff {
+    entries: Mutex<HashMap<RenewalIdentity, RenewalRetry>>,
+    changed: tokio::sync::Notify,
+    renew_interval: Duration,
+}
+
+impl Default for RenewalBackoff {
+    fn default() -> Self {
+        Self::new(DEFAULT_RENEW_CHECK_INTERVAL)
+    }
+}
+
+impl RenewalBackoff {
+    fn new(renew_interval: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            changed: tokio::sync::Notify::new(),
+            renew_interval,
+        }
+    }
+    fn prune(&self, live: &HashSet<RenewalIdentity>) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|identity, _| live.contains(identity));
+    }
+
+    fn suspend_if_elapsed(&self, identity: &RenewalIdentity) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = entries.get_mut(identity)
+            && entry
+                .retry_at
+                .is_some_and(|at| at <= tokio::time::Instant::now())
+        {
+            entry.retry_at = None;
+        }
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|entry| !entry.running)
+            .filter_map(|entry| entry.retry_at)
+            .min()
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        cache: &Arc<CertCache>,
+        identity: RenewalIdentity,
+    ) -> Option<RenewalAttempt> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let entry = entries
+            .entry(identity.clone())
+            .or_insert_with(|| RenewalRetry {
+                failures: 0,
+                retry_at: None,
+                running: false,
+                token: Arc::new(()),
+                minimum_delay: Duration::ZERO,
+            });
+        if entry.running
+            || entry
+                .retry_at
+                .is_some_and(|at| at > tokio::time::Instant::now())
+        {
+            return None;
+        }
+        entry.running = true;
+        entry.token = Arc::new(());
+        Some(RenewalAttempt {
+            backoff: self.clone(),
+            cache: Arc::downgrade(cache),
+            identity,
+            token: entry.token.clone(),
+            started: false,
+            success: false,
+            minimum_delay: Duration::ZERO,
+        })
+    }
+}
+
+struct RenewalAttempt {
+    backoff: Arc<RenewalBackoff>,
+    cache: std::sync::Weak<CertCache>,
+    identity: RenewalIdentity,
+    token: Arc<()>,
+    started: bool,
+    success: bool,
+    minimum_delay: Duration,
+}
+
+impl Drop for RenewalAttempt {
+    fn drop(&mut self) {
+        let current = self
+            .cache
+            .upgrade()
+            .is_some_and(|cache| self.identity.current(&cache));
+        let mut entries = self
+            .backoff
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(entry) = entries.get_mut(&self.identity)
+            && Arc::ptr_eq(&entry.token, &self.token)
+        {
+            if self.success || !current || (!self.started && entry.failures == 0) {
+                entries.remove(&self.identity);
+            } else {
+                entry.running = false;
+                if self.started {
+                    entry.failures = entry.failures.saturating_add(1);
+                    entry.minimum_delay = self.minimum_delay;
+                }
+                // Unexecuted cancellation preserves the failure level, but
+                // must not rearm a timer whose deadline is already past.
+                let seconds = 60 * (1u64 << entry.failures.saturating_sub(1).min(3));
+                entry.retry_at = Some(
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(seconds.min(300)).max(entry.minimum_delay),
+                );
+            }
+        }
+        drop(entries);
+        self.backoff.changed.notify_one();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MaintenanceConfig
@@ -447,10 +632,22 @@ async fn maintenance_loop(
     // for admission for a long time without starving the OCSP ticker.
     let renewals = async {
         let mut ari_changed = cache.subscribe_ari();
+        let backoff = Arc::new(RenewalBackoff::new(renew_interval));
         loop {
+            // Subscribe before inspecting deadlines. Completion only asks us
+            // to recalculate this timer; it does not rescan every certificate.
+            let changed = backoff.changed.notified();
+            let retry_at = backoff.deadline();
             let periodic = tokio::select! {
                 _ = renew_ticker.tick() => true,
                 _ = ari_changed.changed() => false,
+                _ = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => false,
+                _ = changed => continue,
             };
             debug!("maintenance: running renewal check");
             // The global scan is independent of renewal progress. Each bounded
@@ -461,7 +658,7 @@ async fn maintenance_loop(
             if periodic {
                 let _ = renewal_marker_requests.try_send(());
             }
-            check_renewals_with_policy(&cache, &policy, &job_queue).await;
+            check_renewals_with_backoff(&cache, &policy, &job_queue, &backoff).await;
         }
     };
     let revocations = async {
@@ -654,12 +851,46 @@ async fn read_revocation(
 /// certificate in storage has already been renewed by another instance
 /// (e.g. in a multi-instance deployment). If the stored certificate does
 /// not need renewal, it is reloaded into the cache instead of re-issuing.
+#[cfg(test)]
+async fn wait_for_renewal_jobs(jobs: &JobQueue) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !jobs.is_empty().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+#[cfg(test)]
 async fn check_renewals_with_policy(
     cache: &Arc<CertCache>,
     policy: &RenewalPolicy,
     job_queue: &JobQueue,
 ) {
-    let managed_certs = cache.maintenance_snapshot(true);
+    check_renewals_with_backoff(
+        cache,
+        policy,
+        job_queue,
+        &Arc::new(RenewalBackoff::default()),
+    )
+    .await;
+}
+
+async fn check_renewals_with_backoff(
+    cache: &Arc<CertCache>,
+    policy: &RenewalPolicy,
+    job_queue: &JobQueue,
+    backoff: &Arc<RenewalBackoff>,
+) {
+    let (managed_certs, identities): (Vec<_>, Vec<_>) = cache
+        .renewal_snapshot()
+        .into_iter()
+        .map(|(cert, leaf)| {
+            let identity = RenewalIdentity::with_leaf(&cert, leaf);
+            (cert, identity)
+        })
+        .unzip();
+    backoff.prune(&identities.iter().cloned().collect());
 
     if managed_certs.is_empty() {
         debug!("maintenance: no managed certificates to check for renewal");
@@ -671,7 +902,7 @@ async fn check_renewals_with_policy(
         "maintenance: checking managed certificates for renewal",
     );
 
-    for cert in &managed_certs {
+    for (cert, identity) in managed_certs.iter().zip(identities) {
         if cert.not_before <= chrono::Utc::now()
             && !crate::ari::needs_renewal(
                 cert,
@@ -682,6 +913,7 @@ async fn check_renewals_with_policy(
                     .is_some_and(|manager| manager.policy.disable_ari),
             )
         {
+            backoff.suspend_if_elapsed(&identity);
             continue;
         }
 
@@ -692,6 +924,7 @@ async fn check_renewals_with_policy(
         let domain = match cert.names.first() {
             Some(name) => name.clone(),
             None => {
+                backoff.suspend_if_elapsed(&identity);
                 warn!(
                     hash = %cert.hash,
                     "maintenance: managed certificate has no names; skipping renewal"
@@ -702,38 +935,61 @@ async fn check_renewals_with_policy(
 
         // Admission and execution cover storage preflight as well as issuance.
         // A slow store for one domain cannot serialize all other due domains.
-        let job_name = format!("renew_{}", domain);
+        let job_name = format!("renew_{}_{}", domain, identity.job_suffix());
+        let Some(attempt) = backoff.reserve(cache, identity) else {
+            continue;
+        };
         let cache = Arc::clone(cache);
         let policy = policy.clone();
         let snapshot = Arc::clone(cert);
 
         job_queue
             .submit(job_name, move || async move {
-                let Some(current) = current_renewal_candidate(&cache, &snapshot, &domain, &policy) else { return; };
+                // Capture the RAII owner, not just its boolean fields.
+                let mut attempt = attempt;
+                // From this point cancellation is a failed attempt too. A
+                // failed marker/backend preflight must not amplify ARI wakes.
+                attempt.started = true;
+                let Some(current) = current_renewal_candidate(&cache, &snapshot, &domain, &policy) else {
+                    attempt.success = true;
+                    return;
+                };
                 if !renewal_marker_allows(&cache, policy.revocations.as_ref(), &current, &domain).await {
                     return;
                 }
                 // The marker read can await a backend while management or
                 // eligibility changes. Do not begin preflight for stale work.
-                let Some(current) = current_renewal_candidate(&cache, &current, &domain, &policy) else { return; };
+                let Some(current) = current_renewal_candidate(&cache, &current, &domain, &policy) else {
+                    attempt.success = true;
+                    return;
+                };
                 // Check cross-instance replacements only after taking an
                 // execution slot. Publication rechecks management atomically.
                 if try_reload_from_storage(
                     &cache, policy.certificates.as_ref(), policy.revocations.as_ref(),
                     &current, &domain, policy.ratio,
                     policy.ari_manager.as_ref().is_some_and(|manager| manager.policy.disable_ari),
-                ).await || current_renewal_candidate(&cache, &current, &domain, &policy).is_none() {
+                ).await {
+                    attempt.success = true;
+                    return;
+                }
+                if current_renewal_candidate(&cache, &current, &domain, &policy).is_none() {
+                    attempt.success = true;
                     return;
                 }
                 info!(domain = %domain, hash = %current.hash, expired = current.expired(), "maintenance: certificate needs renewal");
                 match (policy.renew)(domain.clone(), RenewalReason::Expiring).await {
                     Ok(()) => {
+                        attempt.success = true;
                         info!(
                             domain = %domain,
                             "maintenance: certificate renewed successfully",
                         );
                     }
                     Err(e) => {
+                        if !crate::async_jobs::should_retry(&e) {
+                            attempt.minimum_delay = attempt.backoff.renew_interval;
+                        }
                         error!(
                             domain = %domain,
                             error = %e,
@@ -2265,7 +2521,7 @@ mod tests {
         };
         let jobs = JobQueue::new("custom-ratio");
         check_renewals_with_policy(&cache, &policy, &jobs).await;
-        jobs.wait("renew_example.com").await;
+        wait_for_renewal_jobs(&jobs).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2299,7 +2555,7 @@ mod tests {
         };
         let jobs = JobQueue::new("reload");
         check_renewals_with_policy(&cache, &policy, &jobs).await;
-        jobs.wait("renew_example.com").await;
+        wait_for_renewal_jobs(&jobs).await;
         let current = cache.get_all().await;
         assert_eq!(current.len(), 1);
         assert_ne!(current[0].hash, old.hash);
