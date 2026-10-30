@@ -215,7 +215,7 @@ impl Server {
                     _ => { status = 404; String::new() }
                 };
                 let reply = format!(
-                    "HTTP/1.1 {status} Test\r\nReplay-Nonce: nonce\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Test\r\nReplay-Nonce: bm9uY2U\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = socket.write_all(reply.as_bytes()).await;
