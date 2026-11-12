@@ -64,7 +64,7 @@ p521 = { version = "0.14", features = ["ecdsa"] }
 ecdsa = "0.17"
 elliptic-curve = { version = "0.14", features = ["sec1"] }
 signature = "3"
-rsa = { version = "0.9", features = ["sha2"], optional = true }
+rsa = { version = "0.10", features = ["sha2"], optional = true }
 
 # Encoding
 base64 = "0.23"
